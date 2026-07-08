@@ -63,7 +63,7 @@ Dex_Elevator/
 │   └── robot/              # RobotArm interface + RealMan adapter + Sim (headless)
 ├── yolo/                   # ButtonDetector + floor-label reader (stub)
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
-├── initialization/         # calibration entry scripts (intrinsics, extrinsics, validate)
+├── initialization/         # calibration + eval scripts (intrinsics, extrinsics, validate, localization eval)
 ├── configs/                # cameras.yaml, pipeline.yaml
 └── data/                   # weights/, calibration/ (gitignored)
 ```
@@ -86,19 +86,27 @@ The RealMan / Orbbec / Ultralytics SDKs are optional at import time — the modu
 degrade cleanly when a SDK is absent (so this imports on a dev laptop), and
 hardware code runs on the robot.
 
-## Usage — hand-eye calibration (the first real step)
+## Usage — hand-eye calibration
 
-Run on the robot (`ssh dex4`) with the RealMan SDK env:
+Run on the robot (`ssh dex4`) with the RealMan SDK env
+(`~/miniconda3/envs/richtech-v3/bin/python`). The robot is **headless** (no
+monitor), so add `--web` to stream a live MJPEG preview and open it in a browser
+on the same LAN — e.g. from the Mac at `http://<robot-ip>:8010/`. Capture with the
+page's Capture / Delete / Finish buttons (or keys `c`/`d`).
 
 ```bash
 # 0. list connected cameras / confirm which is 335 vs 335L
 python -m core.camera.orbbec
 
-# 1. intrinsics for the chest camera
-python initialization/calibrate_intrinsics.py --camera cam_chest
+# 1. intrinsics for the chest camera (hold the ChArUco board, cover the frame)
+python initialization/calibrate_intrinsics.py --camera cam_chest --web
 
-# 2. eye-to-hand extrinsic: ChArUco board on the right hand, drag-teach 10+ poses
-python initialization/run_calibration.py --camera cam_chest
+# 2. eye-to-hand extrinsic: board bolted to the bare flange (LinkerHand removed),
+#    drag-teach to 10+ varied poses
+python initialization/run_calibration.py --camera cam_chest --web
+
+# 3. (optional) end-to-end localization accuracy at fresh poses
+python initialization/eval_localization.py --camera cam_chest --web
 ```
 
 See `calibration/README.md` and `initialization/README.md` for details, and
@@ -106,13 +114,18 @@ See `calibration/README.md` and `initialization/README.md` for details, and
 
 ## Status
 
-Working: RealMan adapter, eye-to-hand calibration flow, press geometry, Orbbec
-serial/name device selection, the orchestrator skeleton — all import + unit-checks
-pass headless.
+**Hand-eye calibration DONE & validated** (chest 335 ↔ right arm): intrinsics
+(RMS 0.31 px) + eye-to-hand extrinsic (consistency 2.05 mm, validation PASS). An
+end-to-end check (`eval_localization.py`) measured the camera→base-frame position
+error at **~2.3 mm mean (3.6 mm max)** over fresh poses — well within button
+tolerance. Saved matrices are in `data/calibration/` (see
+`cam_chest_calibration_summary.txt`).
+
+Also working: RealMan adapter, press geometry, Orbbec serial/name selection, the
+`--web` browser capture UI, the orchestrator skeleton — all import + checks pass headless.
 
 Still to do (marked in-code):
 - Train the **button YOLO** on captured data → `data/weights/buttons.pt`.
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
 - **Measure the panel plane** and press poses in `configs/pipeline.yaml` (placeholders).
-- Force-limited press on hardware (RealMan `rm_force_position_move_pose`).
-- Set the LinkerHand "pointing" pose.
+- Force-limited press (RealMan `rm_force_position_move_pose`); the LinkerHand pointing pose + its fingertip TCP.

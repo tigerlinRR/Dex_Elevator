@@ -42,10 +42,12 @@ Run hardware commands **on the robot** (`ssh dex4`) with the RealMan env.
 python -m core.camera.orbbec
 
 # Calibration (once, per camera, in order): intrinsics -> extrinsics -> validate.
-# Live window: [c] capture  [d] delete last  [Esc] finish.  Add --headless over SSH.
-python initialization/calibrate_intrinsics.py --camera cam_chest        # 1. intrinsics
-python initialization/run_calibration.py      --camera cam_chest        # 2. eye-to-hand (drag-teach)
-python initialization/validate_calibration.py --camera cam_chest        # 3. re-validate saved artifacts
+# The robot is HEADLESS: add --web to stream an MJPEG preview to a browser on the
+# LAN (http://192.168.11.41:8010/); capture via the page buttons or keys c/d.
+python initialization/calibrate_intrinsics.py --camera cam_chest --web   # 1. intrinsics (hold board)
+python initialization/run_calibration.py      --camera cam_chest --web   # 2. eye-to-hand (board on flange, drag-teach)
+python initialization/validate_calibration.py --camera cam_chest         # 3. re-validate saved artifacts
+python initialization/eval_localization.py    --camera cam_chest --web   # end-to-end localization accuracy (fresh poses)
 
 # No test suite or linter is configured yet.
 ```
@@ -128,6 +130,12 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   (else the SDK opens whichever it enumerates first).
 - **Lift look-then-move**: settle the lift → measure with the camera → press. Don't
   move the lift/base between measuring and pressing (the measurement goes stale).
+- **Headless robot / preview**: the robot has no monitor and the Mac has no XQuartz,
+  so use `--web` (MJPEG to a browser on the LAN, `http://192.168.11.41:8010/`) for
+  any capture — a local OpenCV window or `ssh -Y` shows nothing.
+- **Calibration board mount**: bolt the ChArUco board to the bare **flange** (remove
+  the LinkerHand — its fingertip TCP isn't defined in the controller). `base_T_camera`
+  is end-effector-independent, so the hand is remounted afterward with no re-calibration.
 
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
 
