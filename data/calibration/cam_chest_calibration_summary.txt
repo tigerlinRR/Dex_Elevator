@@ -1,0 +1,16 @@
+=== EYE-TO-HAND EXTRINSIC: base_T_camera  (right-arm base <- chest 335) ===
+4x4 (meters):
+[[ 0.01822  0.01292  0.99975  0.07731]
+ [-0.99956 -0.02319  0.01852  0.00572]
+ [ 0.02343 -0.99965  0.0125   0.54572]
+ [ 0.       0.       0.       1.     ]]
+translation (mm): x=77.3  y=5.7  z=545.7
+method=PARK  samples=28  trans_residual=2.05 mm  rot_residual=0.516 deg
+
+=== INTRINSICS (chest 335) ===
+K:
+[[695.28   0.   643.93]
+ [  0.   695.52 356.17]
+ [  0.     0.     1.  ]]
+dist [k1,k2,p1,p2,k3]: [ 0.01955 -0.07704 -0.00056  0.0004   0.05205]
+resolution: 1280x720  rms=0.3125 px

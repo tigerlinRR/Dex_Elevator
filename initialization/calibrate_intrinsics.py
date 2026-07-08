@@ -29,7 +29,7 @@ from pathlib import Path
 import cv2
 
 from calibration.board import CharucoBoard
-from calibration.capture_ui import live_capture_loop
+from calibration.capture_ui import live_capture_loop, web_capture_loop
 from calibration.intrinsic import (
     calibrate_intrinsics_from_images,
     intrinsics_from_camera,
@@ -60,6 +60,10 @@ def main() -> None:
     parser.add_argument("--dictionary", default="DICT_5X5_100", help="cv2.aruco DICT_* name")
     parser.add_argument("--target-images", type=int, default=20, help="suggested # of views")
     parser.add_argument("--headless", action="store_true", help="no preview window (prompt-based)")
+    parser.add_argument("--web", action="store_true",
+                        help="serve a browser preview (MJPEG) instead of a local window — for a "
+                             "headless robot; open http://<robot-ip>:<web-port>/ on any machine on the LAN")
+    parser.add_argument("--web-port", type=int, default=8010, help="port for the --web preview")
     parser.add_argument("--no-validate", action="store_true", help="skip post-calibration validation")
     args = parser.parse_args()
 
@@ -118,10 +122,16 @@ def main() -> None:
                     old.unlink()
             print("Move the board to cover the frame (corners + tilts; mostly angled "
                   f"close-ups), aim for {args.target_images}+ views.")
-            live_capture_loop(
-                camera=camera, board=board, on_capture=on_capture, on_delete=on_delete,
-                get_hud=get_hud, window=f"{args.camera} — intrinsics", force_headless=args.headless,
-            )
+            if args.web:
+                web_capture_loop(
+                    camera=camera, board=board, on_capture=on_capture, on_delete=on_delete,
+                    get_hud=get_hud, port=args.web_port,
+                )
+            else:
+                live_capture_loop(
+                    camera=camera, board=board, on_capture=on_capture, on_delete=on_delete,
+                    get_hud=get_hud, window=f"{args.camera} — intrinsics", force_headless=args.headless,
+                )
             if len(frames) < 5:
                 print(f"Only {len(frames)} views — need >= 5. Aborting (nothing saved).")
                 return

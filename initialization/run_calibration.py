@@ -35,7 +35,7 @@ from pathlib import Path
 import cv2
 
 from calibration.board import CharucoBoard
-from calibration.capture_ui import live_capture_loop
+from calibration.capture_ui import live_capture_loop, web_capture_loop
 from calibration.extrinsic import ExtrinsicCalibrationSession
 from calibration.io import CALIB_DIR
 from calibration.validate import save_report, validate_extrinsics
@@ -70,6 +70,10 @@ def main() -> None:
     parser.add_argument("--from-samples", metavar="DIR",
                         help="re-solve offline from previously saved samples (no camera/robot)")
     parser.add_argument("--headless", action="store_true", help="no preview window (prompt-based)")
+    parser.add_argument("--web", action="store_true",
+                        help="serve a browser preview (MJPEG) instead of a local window — for a "
+                             "headless robot; open http://<robot-ip>:<web-port>/ on any machine on the LAN")
+    parser.add_argument("--web-port", type=int, default=8010, help="port for the --web preview")
     parser.add_argument("--no-validate", action="store_true", help="skip post-calibration validation")
     parser.add_argument("--manual", action=argparse.BooleanOptionalAction, default=True,
                         help="enable the arm's drag-teach (zero-gravity) mode to hand-guide it "
@@ -173,10 +177,16 @@ def main() -> None:
             handle.camera.start()
             try:
                 print(f"Guide the arm to varied poses (aim for {args.target_samples}+).")
-                live_capture_loop(
-                    camera=handle.camera, board=board, on_capture=on_capture, on_delete=on_delete,
-                    get_hud=get_hud, window=f"{args.camera} — extrinsics", force_headless=args.headless,
-                )
+                if args.web:
+                    web_capture_loop(
+                        camera=handle.camera, board=board, on_capture=on_capture, on_delete=on_delete,
+                        get_hud=get_hud, port=args.web_port,
+                    )
+                else:
+                    live_capture_loop(
+                        camera=handle.camera, board=board, on_capture=on_capture, on_delete=on_delete,
+                        get_hud=get_hud, window=f"{args.camera} — extrinsics", force_headless=args.headless,
+                    )
             finally:
                 handle.camera.stop()
         finally:

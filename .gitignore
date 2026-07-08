@@ -290,3 +290,14 @@ scratch/
 
 # Third-party / vendor reference docs — kept local, not published to the repo
 乘梯相关接口.pdf
+
+# Local-only Chinese README (personal reference; keep in sync with README.md)
+README.zh-CN.md
+
+# Version the small calibration RESULTS (the matrices + reports), but NOT the
+# bulky raw captures under *_intrinsics_images/ and *_samples/.
+!data/calibration/cam_chest.npy
+!data/calibration/cam_chest_intrinsics.npz
+!data/calibration/cam_chest.calib.npz
+!data/calibration/cam_chest_extrinsic_validation.json
+!data/calibration/cam_chest_calibration_summary.txt

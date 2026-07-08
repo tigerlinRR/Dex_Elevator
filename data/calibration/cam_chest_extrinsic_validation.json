@@ -1,0 +1,24 @@
+{
+  "part": "extrinsics",
+  "status": "pass",
+  "metrics": {
+    "num_samples": 28,
+    "trans_resid_mean_mm": 2.05,
+    "trans_resid_max_mm": 6.473,
+    "rot_resid_mean_deg": 0.5164,
+    "rot_resid_max_deg": 1.6902,
+    "holdout_worst_mm": 7.19,
+    "crossmethod_converged": [
+      "DANIILIDIS",
+      "HORAUD",
+      "PARK",
+      "TSAI"
+    ],
+    "crossmethod_spread_mm": 0.31
+  },
+  "messages": [
+    "[PASS] translation consistency 2.05 mm (rot 0.516 deg)",
+    "[PASS] 4 methods agree within 0.31 mm"
+  ],
+  "plots": []
+}

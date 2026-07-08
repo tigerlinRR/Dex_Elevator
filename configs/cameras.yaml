@@ -17,8 +17,8 @@
 cameras:
   - id: cam_chest
     role: chest             # torso-mounted Gemini 335, faces the panel — BUTTON CAMERA
-    serial: null            # set once known; until then match by name below
-    match_name: "335"       # Gemini 335 (name ends with "335", not "335L")
+    serial: "CP0E8530000V"  # Gemini 335 (chest) — enumerated on dex4
+    match_name: "335"       # fallback if serial changes: name ends with "335", not "335L"
     width: 1280
     height: 720
     fps: 30
@@ -27,8 +27,8 @@ cameras:
 
   - id: cam_head
     role: head              # head-mounted Gemini 335L — navigation/scene (not pressing)
-    serial: null
-    match_name: "335L"      # Gemini 335L
+    serial: "CP2G853000BS"  # Gemini 335L (head) — enumerated on dex4
+    match_name: "335L"      # fallback: name ends with "335L"
     width: 1280
     height: 720
     fps: 30
