@@ -1,0 +1,14 @@
+# Core runtime
+numpy>=1.24
+pyyaml>=6.0
+opencv-contrib-python>=4.8   # cv2 + cv2.aruco (eye-to-hand calibration)
+
+# Perception
+ultralytics>=8.0             # YOLO button detection
+
+# Calibration validation plots (optional — numeric report works without it)
+matplotlib>=3.7
+
+# Hardware SDKs (installed on the robot, not from PyPI here):
+#   pyorbbecsdk  -> https://github.com/orbbec/pyorbbecsdk   (Orbbec Gemini 335/335L, v2 wheel)
+#   Robotic_Arm  -> RealMan RM arm SDK, in the robot's richtech-v3 env

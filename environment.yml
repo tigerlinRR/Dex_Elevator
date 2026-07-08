@@ -1,0 +1,38 @@
+# Conda environment for the Dex_Elevator calibration + vision stack (dev / laptop).
+#
+# Create / update (run from the repo root so the editable install resolves):
+#   conda env create -f environment.yml      # or: conda env update -f environment.yml --prune
+#   conda activate dex_elevator
+#
+# Fallback: if `conda env create` aborts in its pip step with a cross-compiler
+# activation error (e.g. "...x86_64-conda-linux-gnu-addr2line" — a broken hook in
+# the BASE env, not this project), create the env and install with the env's
+# Python directly (which doesn't source those activation hooks):
+#   conda create -n dex_elevator python=3.11 -y
+#   ENVPY=~/miniconda3/envs/dex_elevator/bin/python
+#   $ENVPY -m pip install -e ".[calibration]" "numpy<2" "opencv-contrib-python==4.10.0.84"
+#
+# Orbbec Gemini 335 / 335L (Gemini 330 series -> needs pyorbbecsdk **v2**; PyPI
+# only has a broken v1 macOS wheel). Install the v2 release wheel for your Python
+# WITHOUT its heavy example deps (open3d/flask/pandas/...), AFTER the env exists.
+# It pins numpy<2 — which is why the stack is pinned to numpy 1.x (opencv-contrib
+# >= 4.11 would force numpy>=2 and conflict):
+#   $ENVPY -m pip install --no-deps \
+#     https://github.com/orbbec/pyorbbecsdk/releases/download/v2.1.1/pyorbbecsdk2-2.1.1-cp311-cp311-linux_x86_64.whl
+# USB device access then needs udev rules — see the pyorbbecsdk repo (udev_rules/).
+#
+# YOLO (optional, pulls torch):  pip install -e ".[vision]"
+# RealMan RM arm SDK: packaged as `Robotic_Arm`; on the robot it lives in the
+# `richtech-v3` conda env. Run arm/calibration code there (ssh dex4).
+name: dex_elevator
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip>=23
+  - pip:
+      # numpy<2 + an aruco-capable opencv that supports it, so the stack stays
+      # compatible with pyorbbecsdk v2 (which requires numpy<2).
+      - "numpy<2"
+      - "opencv-contrib-python==4.10.0.84"
+      - "-e .[calibration]"

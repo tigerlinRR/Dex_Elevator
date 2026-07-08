@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dex_elevator"
+version = "0.1.0"
+description = "Vision-guided elevator button-pressing for the DEX robot (RealMan arm + Orbbec)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "opencv-contrib-python>=4.8",   # contrib build ships cv2.aruco for calibration
+]
+
+[project.optional-dependencies]
+vision = ["ultralytics>=8.0"]      # YOLO button detection
+calibration = ["matplotlib>=3.7"]  # validation residual/coverage plots (optional; numbers work headless)
+# pyorbbecsdk: install from source (https://github.com/orbbec/pyorbbecsdk)
+# RealMan SDK: `Robotic_Arm` package (on the robot's richtech-v3 env)
+
+[tool.setuptools]
+packages = ["core", "core.camera", "core.robot", "yolo", "calibration"]

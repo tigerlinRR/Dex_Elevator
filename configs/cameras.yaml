@@ -1,0 +1,36 @@
+# DEX robot cameras. Two Orbbec units are on the robot (ssh dex4, lsusb):
+#   * Gemini 335   (usb 2bc5:0800) — CHEST/torso, faces the elevator panel = BUTTON CAMERA
+#   * Gemini 335L  (usb 2bc5:0804) — HEAD, navigation/scene (not used for pressing yet)
+#
+# Device selection (core/camera/orbbec.py):
+#   * `serial:`     — exact serial (most robust; no device open needed). Preferred.
+#   * `match_name:` — pick the device whose reported name ENDS WITH this string;
+#                     "335" vs "335L" disambiguates the two models WITHOUT knowing
+#                     serials. Used only when `serial` is unset.
+# List connected devices (name + serial) with:
+#   python -m core.camera.orbbec
+#
+# Calibration is done ONCE per camera and shared from data/calibration/:
+#   intrinsics_file  -> Part 1: K + distortion   (initialization/calibrate_intrinsics.py)
+#   extrinsic_file   -> Part 2: base_T_camera    (initialization/run_calibration.py)
+# The chest camera's extrinsic is base_T_camera to the RIGHT arm (the pressing arm).
+cameras:
+  - id: cam_chest
+    role: chest             # torso-mounted Gemini 335, faces the panel — BUTTON CAMERA
+    serial: null            # set once known; until then match by name below
+    match_name: "335"       # Gemini 335 (name ends with "335", not "335L")
+    width: 1280
+    height: 720
+    fps: 30
+    intrinsics_file: cam_chest_intrinsics.npz   # data/calibration/cam_chest_intrinsics.npz (K + dist)
+    extrinsic_file: cam_chest.npy               # data/calibration/cam_chest.npy (base_T_camera, RIGHT arm)
+
+  - id: cam_head
+    role: head              # head-mounted Gemini 335L — navigation/scene (not pressing)
+    serial: null
+    match_name: "335L"      # Gemini 335L
+    width: 1280
+    height: 720
+    fps: 30
+    intrinsics_file: cam_head_intrinsics.npz
+    extrinsic_file: cam_head.npy

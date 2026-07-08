@@ -1,0 +1,28 @@
+# DEX elevator button-pressing config.
+# See core/elevator_pipeline.py, core/press.py, core/robot/realman.py; CLAUDE.md for architecture.
+
+arm:
+  make: realman
+  side: right              # the button-pressing arm (192.168.11.43)
+  ip: "192.168.11.43"
+  port: 8080
+  max_speed_pct: 20        # SAFETY cap during bring-up; raise once motion is validated
+
+button_yolo:
+  weights: data/weights/buttons.pt   # TODO: train on the robot's ~/dataset; single class `button`
+  conf: 0.25
+  device: cuda
+  imgsz: 1280
+
+elevator:
+  camera_id: cam_chest
+  # Panel plane in the RIGHT-arm base frame — MEASURE once at the docked pose.
+  #   point  = any point on the panel face (m)
+  #   normal = OUTWARD panel normal (panel -> robot)
+  panel:
+    point:  [0.45, 0.00, 0.20]     # PLACEHOLDER (m) — measure on the real cell
+    normal: [-1.0, 0.0, 0.0]       # PLACEHOLDER — outward panel normal (toward robot)
+  press:
+    standoff: 0.06         # m backed off the panel before/after pressing
+    push_depth: 0.010      # m advanced past the face to actuate the button
+    up_hint: [0.0, 0.0, 1.0]
