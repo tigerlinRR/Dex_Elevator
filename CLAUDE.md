@@ -2,6 +2,8 @@
 
 Guidance for Claude Code (claude.ai/code) when working in this repository.
 
+**Current build status, results, and next steps: @PROGRESS.md** (auto-imported — read it first to see where we are).
+
 ## What this is
 
 Vision-guided pipeline for the Richtech **DEX** robot to **press elevator buttons**
