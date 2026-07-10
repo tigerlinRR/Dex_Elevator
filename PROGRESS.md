@@ -3,6 +3,23 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
+## ⏸ Stop point (2026-07-10) — migrating to a new AGX Orin DEX
+This DEX (Jetson **Thor**) has a **faulty right arm (error 4104)** — powered off to stop the
+alarm, not resolved — and is being **replaced by a new AGX Orin-based DEX**. So all **hardware
+work is paused for the new machine**: hand-eye calibration (must be redone on the new robot),
+LinkerHand fingertip TCP, known-point / force-limited press, panel-plane measurement.
+
+**Software is all saved & portable:**
+- Code + docs: GitHub `main` up to date (multi-class button YOLO + pipeline + browser validation server).
+- Trained `buttons.pt` (yolo11m, multi-class) backed up to the dev Mac (`*.pt` is gitignored, so not on GitHub).
+- Original sun-moon dataset is on the dev Mac.
+
+**New machine (AGX Orin) — how to resume:**
+1. rsync the code; install ultralytics/torch (Jetson wheels) in its conda env.
+2. **Redo hand-eye calibration** (`initialization/` scripts are ready) — camera/arm mounting changed, mandatory.
+3. Orin is weaker than Thor: `yolo11m` real-time will likely need a **TensorRT engine** or a drop to `yolo11s`.
+4. Then the hardware line: LinkerHand fingertip TCP → known-point press → force-limited press → panel plane → full pipeline + base docking.
+
 ## Done & validated
 - **Framework** (interface-first; imports on a laptop with SDKs absent, runs on the robot):
   - `core/robot/realman.py` — RealMan RM adapter: connect, `get_tcp_pose`, `move_to_pose`,
