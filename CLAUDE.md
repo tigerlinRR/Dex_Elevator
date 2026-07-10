@@ -62,6 +62,7 @@ its pinned `numpy<2`). Bootstrap from public **CC BY** Roboflow exports.
 PYU=~/miniconda3/envs/ultralytics/bin/python
 PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"        # multi-class -> data/datasets/buttons/
 PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --model yolo11m.pt --imgsz 640         # -> data/weights/buttons.pt
+PYTHONPATH=~/Dex_Elevator $PYU yolo/predict_server.py --port 8011                           # browser check: http://<robot-ip>:8011/
 ```
 
 ## Architecture

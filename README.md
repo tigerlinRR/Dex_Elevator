@@ -126,6 +126,8 @@ PY=~/miniconda3/envs/ultralytics/bin/python
 PYTHONPATH=~/Dex_Elevator $PY yolo/prepare_dataset.py --src "<export_dir>"   # or --zip a.zip
 # 2. train (use yolo11m — nano is too weak for 368-class floor ID) → data/weights/buttons.pt
 PYTHONPATH=~/Dex_Elevator $PY yolo/train_buttons.py --model yolo11m.pt --imgsz 640
+# 3. (optional) browser check — upload an image, see boxes + floor labels
+PYTHONPATH=~/Dex_Elevator $PY yolo/predict_server.py --port 8011   # open http://<robot-ip>:8011/
 ```
 
 ## Status

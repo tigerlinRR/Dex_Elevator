@@ -70,8 +70,9 @@ $PY initialization/eval_localization.py    --camera cam_chest --web
 
 # Button YOLO — train in the `ultralytics` env (richtech-v3 has no torch):
 PYU=~/miniconda3/envs/ultralytics/bin/python
-PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"  # -> data/datasets/buttons/
-PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --imgsz 640                       # -> data/weights/buttons.pt
+PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"  # multi-class -> data/datasets/buttons/
+PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --model yolo11m.pt --imgsz 640    # -> data/weights/buttons.pt
+PYTHONPATH=~/Dex_Elevator $PYU yolo/predict_server.py --port 8011                      # 浏览器验证 http://192.168.11.41:8011/
 ```
 `--web` serves a browser preview at `http://192.168.11.41:8010/` (robot has no monitor).
 Push code to the robot: rsync from the Mac (repo is private, so `git clone` on the robot fails).
