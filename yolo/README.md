@@ -27,10 +27,21 @@ the panel via the eye-to-hand extrinsic.
   press pipeline.
 
 ## Train the button detector
-1. Collect + label button images (the DEX robot already captures raw frames under
-   `~/dataset` on the Jetson). Single class `button` (bbox; segmentation optional).
-2. Train with Ultralytics, e.g. `yolo detect train data=buttons.yaml model=yolo11n.pt`.
-3. Point `configs/pipeline.yaml:button_yolo.weights` at the resulting `.pt`.
+No in-house elevator dataset exists yet, so the **baseline** `button` localizer is
+bootstrapped from public **CC BY** datasets (Roboflow Universe), then fine-tuned on
+our own chest-335 captures later. All source classes are collapsed to the single
+class `button` (localization only). Attribution: `../DATASETS.md`.
+
+1. Download one or more Roboflow **YOLOv8** exports (`.zip`) — e.g.
+   `yolov7ncku/elevator-buttons-scpv6` (CC BY 4.0).
+2. Build the merged, de-duplicated, single-class dataset:
+   `python yolo/prepare_dataset.py --zip a.zip --zip b.zip` → `data/datasets/buttons/`.
+3. Train (YOLO11, on the robot's GPU):
+   `python yolo/train_buttons.py` → copies `best.pt` to `data/weights/buttons.pt`.
+4. `configs/pipeline.yaml:button_yolo.weights` already points there — nothing else to wire.
+
+> `~/dataset` on the Jetson is an **unrelated** task — do NOT train on it, do NOT delete it.
+> The final model needs in-house data: capture our own panel with cam_chest and fine-tune.
 
 ## Contract
 - **Input:** RGB image `(H, W, 3)`.

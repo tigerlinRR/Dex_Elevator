@@ -45,7 +45,7 @@ the vision only needs to give a reliable button pixel and its floor label.
 | Camera (buttons) | **Orbbec Gemini 335** (chest) | `core/camera/orbbec.py` (pyorbbecsdk v2) |
 | Camera (scene) | Orbbec Gemini 335L (head) | navigation; not used for pressing yet |
 | Compute | NVIDIA Jetson Thor (`ssh dex4`) | runs the SDKs + inference |
-| Detection | Ultralytics YOLO | button detector — needs trained weights |
+| Detection | Ultralytics YOLO11 | single-class `button`; baseline trained from public CC BY data (`yolo/`, `DATASETS.md`) |
 | Calibration | intrinsics + eye-to-hand (ChArUco) | once per camera, shared (`calibration/`) |
 | Press geometry | ray ∩ panel-plane | pure geometry, no learned model (`core/press.py`) |
 
@@ -61,7 +61,7 @@ Dex_Elevator/
 │   ├── elevator_pipeline.py# orchestrator: capture → detect → match floor → press
 │   ├── camera/             # Camera interface + Orbbec driver (serial/name select) + manager
 │   └── robot/              # RobotArm interface + RealMan adapter + Sim (headless)
-├── yolo/                   # ButtonDetector + floor-label reader (stub)
+├── yolo/                   # ButtonDetector + floor-label reader (stub) + dataset prep & training (YOLO11)
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
 ├── initialization/         # calibration + eval scripts (intrinsics, extrinsics, validate, localization eval)
 ├── configs/                # cameras.yaml, pipeline.yaml
@@ -112,6 +112,21 @@ python initialization/eval_localization.py --camera cam_chest --web
 See `calibration/README.md` and `initialization/README.md` for details, and
 `CLAUDE.md` for the architecture and gotchas.
 
+## Usage — button detector (YOLO)
+
+No in-house elevator dataset exists yet, so the **baseline** single-class `button`
+detector is bootstrapped from public **CC BY** datasets (Roboflow Universe), then
+fine-tuned on our own cam_chest captures later. Train on the robot in its dedicated
+`ultralytics` conda env (torch + CUDA; `richtech-v3` has no torch). Attribution: `DATASETS.md`.
+
+```bash
+PY=~/miniconda3/envs/ultralytics/bin/python
+# 1. merge Roboflow YOLOv8 export(s) → single class `button`, pHash de-dup
+PYTHONPATH=~/Dex_Elevator $PY yolo/prepare_dataset.py --src "<export_dir>"   # or --zip a.zip
+# 2. train YOLO11 → data/weights/buttons.pt (the pipeline picks this up)
+PYTHONPATH=~/Dex_Elevator $PY yolo/train_buttons.py --imgsz 640
+```
+
 ## Status
 
 **Hand-eye calibration DONE & validated** (chest 335 ↔ right arm): intrinsics
@@ -125,7 +140,8 @@ Also working: RealMan adapter, press geometry, Orbbec serial/name selection, the
 `--web` browser capture UI, the orchestrator skeleton — all import + checks pass headless.
 
 Still to do (marked in-code):
-- Train the **button YOLO** on captured data → `data/weights/buttons.pt`.
+- **Fine-tune the button YOLO** on our own cam_chest captures. A baseline is already
+  trained from public CC BY data (val mAP50 ≈ 0.95) → `data/weights/buttons.pt` (see `yolo/`, `DATASETS.md`).
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
 - **Measure the panel plane** and press poses in `configs/pipeline.yaml` (placeholders).
 - Force-limited press (RealMan `rm_force_position_move_pose`); the LinkerHand pointing pose + its fingertip TCP.

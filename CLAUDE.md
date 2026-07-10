@@ -54,6 +54,16 @@ python initialization/eval_localization.py    --camera cam_chest --web   # end-t
 # No test suite or linter is configured yet.
 ```
 
+Button detector (YOLO) — train in the robot's dedicated **`ultralytics`** conda env
+(torch + CUDA); **not** `richtech-v3` (no torch there, and installing it would break
+its pinned `numpy<2`). Bootstrap from public **CC BY** Roboflow exports.
+
+```bash
+PYU=~/miniconda3/envs/ultralytics/bin/python
+PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"  # -> data/datasets/buttons/
+PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --imgsz 640                       # -> data/weights/buttons.pt
+```
+
 ## Architecture
 
 **Interface-first.** Each stage depends on an abstract base so hardware is
@@ -85,6 +95,14 @@ model). A button is a point target on the known **vertical panel plane**:
 YOLO, single class `button`) → `Detection` list; `centroid_pixel` gives the press
 pixel; `read_floor_label` (**stub**) is the "which floor" reader — the real open
 problem, deliberately decoupled from the geometry so it can be swapped freely.
+
+**Button-YOLO training tooling** (`yolo/prepare_dataset.py`, `yolo/train_buttons.py`,
+`yolo/buttons.yaml`): no in-house dataset exists yet, so the single-class detector is
+bootstrapped from public **CC BY** Roboflow exports — `prepare_dataset.py` merges sources,
+**collapses every class to `button`**, and pHash-dedups into `data/datasets/buttons/`;
+`train_buttons.py` trains YOLO11 → `data/weights/buttons.pt`. Run both in the robot's
+**`ultralytics`** conda env (torch+cuda; `richtech-v3` has no torch). Attribution lives in
+`DATASETS.md`. Fine-tune on our own cam_chest captures later (source data is only 416×416).
 
 **Orchestrator** (`core/elevator_pipeline.py`): capture → detect → match the button
 whose label == requested floor → `press_target_from_pixel` → arm standoff/press/retract.
@@ -141,7 +159,9 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
 
-- Train the button YOLO (single class `button`) → `data/weights/buttons.pt`.
+- Button YOLO: tooling BUILT (`yolo/prepare_dataset.py` + `yolo/train_buttons.py`) and a
+  baseline is bootstrapped from public CC BY data → `data/weights/buttons.pt`. Remaining:
+  fine-tune on our own cam_chest captures.
 - Implement `read_floor_label` (OCR / multi-class / template) — the identification step.
 - Measure `elevator.panel` + press poses; consider a live plane fit later.
 - Force-limited press (`rm_force_position_move_pose`) and the LinkerHand pointing pose.

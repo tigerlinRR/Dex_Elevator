@@ -273,6 +273,13 @@ Log/
 *.bag
 *.mcap
 
+# Raw dataset exports (Roboflow etc.) — downloaded locally, never committed.
+# prepare_dataset.py copies the images it keeps into data/datasets/ (also ignored).
+*.yolov8/
+*.yolov8-obb/
+*.coco/
+*.voc/
+
 # Temporary / scratch / OS / editor files
 *.tmp
 *.temp

@@ -26,7 +26,15 @@ works) to pick up where we are. Engineering status only — keep it current; not
 - Cameras: chest 335 serial `CP0E8530000V`, head 335L `CP2G853000BS` (pinned in `configs/cameras.yaml`).
 
 ## Not done yet (stubs / TODO)
-- [ ] Train button YOLO (single class `button`) on the robot's `~/dataset` → `data/weights/buttons.pt`.
+- [~] **Button YOLO baseline** — tooling BUILT + RUN on dex4 (`yolo/prepare_dataset.py`,
+      `yolo/train_buttons.py`, `yolo/buttons.yaml`, `DATASETS.md`):
+      prepared the CC BY sun-moon export (2019 imgs @416×416, 368 classes) → collapsed to single
+      `button`, pHash de-dup → `data/datasets/buttons/` (1408/403/200); trained YOLO11n in the robot's
+      **`ultralytics`** conda env (torch+cuda) → **val mAP50 ≈ 0.95** → `data/weights/buttons.pt`.
+      Trained at imgsz 640 (source is only 416×416). Attribution in `DATASETS.md`.
+      TODO: fine-tune on our own cam_chest captures once a (mock/real) panel exists; optionally add
+      `yolov7ncku/elevator-buttons-scpv6` (CC BY 4.0 ✓) for diversity.
+      NOTE: `~/dataset` on the Jetson is an **unrelated** task — do NOT train on it, do NOT delete it.
 - [ ] Implement `read_floor_label` (OCR / template / multi-class) — the "which floor" reader.
 - [ ] LinkerHand "pointing" pose + register its **fingertip TCP** (needed to command a press point).
 - [ ] First autonomous press of a KNOWN point (slow, guarded) — biggest untested risk.
@@ -37,7 +45,10 @@ works) to pick up where we are. Engineering status only — keep it current; not
 ## Next-step order
 1. **Motion/press first** (arm is ready, needs no elevator): LinkerHand fingertip TCP →
    known-point press → force-limited press → measure a panel plane.
-2. **Perception in parallel** (uses existing `~/dataset`): train button YOLO → `read_floor_label`.
+2. **Perception** (bootstrap now, no elevator needed): download public CC BY button exports →
+   `yolo/prepare_dataset.py` → `yolo/train_buttons.py` → baseline `buttons.pt` → `read_floor_label`.
+   Fine-tune on our own cam_chest captures once a (mock/real) panel exists.
+   (`~/dataset` on the robot is a different task — not this.)
 3. **Integrate**: full pipeline + base docking.
 
 ## Testing note — no real elevator panel yet (on order)
@@ -54,6 +65,11 @@ $PY -m core.camera.orbbec                                   # list cameras
 $PY initialization/calibrate_intrinsics.py --camera cam_chest --web   # browser preview (headless)
 $PY initialization/run_calibration.py      --camera cam_chest --web
 $PY initialization/eval_localization.py    --camera cam_chest --web
+
+# Button YOLO — train in the `ultralytics` env (richtech-v3 has no torch):
+PYU=~/miniconda3/envs/ultralytics/bin/python
+PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"  # -> data/datasets/buttons/
+PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --imgsz 640                       # -> data/weights/buttons.pt
 ```
 `--web` serves a browser preview at `http://192.168.11.41:8010/` (robot has no monitor).
 Push code to the robot: rsync from the Mac (repo is private, so `git clone` on the robot fails).
