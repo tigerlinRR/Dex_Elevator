@@ -26,14 +26,16 @@ works) to pick up where we are. Engineering status only — keep it current; not
 - Cameras: chest 335 serial `CP0E8530000V`, head 335L `CP2G853000BS` (pinned in `configs/cameras.yaml`).
 
 ## Not done yet (stubs / TODO)
-- [~] **Button YOLO baseline** — tooling BUILT + RUN on dex4 (`yolo/prepare_dataset.py`,
+- [~] **Button YOLO baseline (MULTI-CLASS)** — tooling BUILT + RUN on dex4 (`yolo/prepare_dataset.py`,
       `yolo/train_buttons.py`, `yolo/buttons.yaml`, `DATASETS.md`):
-      prepared the CC BY sun-moon export (2019 imgs @416×416, 368 classes) → collapsed to single
-      `button`, pHash de-dup → `data/datasets/buttons/` (1408/403/200); trained YOLO11n in the robot's
-      **`ultralytics`** conda env (torch+cuda) → **val mAP50 ≈ 0.95** → `data/weights/buttons.pt`.
-      Trained at imgsz 640 (source is only 416×416). Attribution in `DATASETS.md`.
-      TODO: fine-tune on our own cam_chest captures once a (mock/real) panel exists; optionally add
-      `yolov7ncku/elevator-buttons-scpv6` (CC BY 4.0 ✓) for diversity.
+      prepared the CC BY sun-moon export (2019 imgs @416×416, 368 classes, labels **KEPT**) → pHash
+      de-dup → `data/datasets/buttons/` (1408/403/200); trained **YOLO11m** in the robot's
+      **`ultralytics`** conda env (torch+cuda) → `data/weights/buttons.pt`. **Detects AND identifies
+      each floor.** Common-floor val mAP50 ≈ 0.7–0.85 (`1`.85 `2`.85 `3`.78 `4`.85 `5`.74 `G`.70);
+      all-class mean (0.30) is dragged down by ~230 long-tail classes with 1–2 samples. Single test
+      image (L/3/2/1) all identified correctly. imgsz 640; `--collapse` = old single-`button` mode.
+      NOTE: yolo11n was far too weak here (floor mAP50 0.1–0.37) — use yolo11m+.
+      TODO: fine-tune on our own cam_chest captures for higher accuracy; optionally add `yolov7ncku` for diversity.
       NOTE: `~/dataset` on the Jetson is an **unrelated** task — do NOT train on it, do NOT delete it.
 - [ ] Implement `read_floor_label` (OCR / template / multi-class) — the "which floor" reader.
 - [ ] LinkerHand "pointing" pose + register its **fingertip TCP** (needed to command a press point).

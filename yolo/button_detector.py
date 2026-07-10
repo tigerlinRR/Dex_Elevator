@@ -91,14 +91,14 @@ class ButtonDetector:
 
 
 def read_floor_label(rgb: np.ndarray, detection: Detection) -> str:
-    """Read the floor label from a button crop. STUB — returns "".
+    """Floor label for a detected button (e.g. "3", "B1", "G").
 
-    TODO (the identification problem): crop ``rgb`` to ``detection.bbox_xyxy`` and
-    classify the digit/symbol. Options to evaluate on the captured dataset:
-      * a small OCR (PaddleOCR/EasyOCR) fine-tuned on button labels;
-      * a multi-class YOLO where each floor label is its own class;
-      * template matching for a fixed, known panel (simplest for one demo cell).
-    Returning "" means "unknown"; the pipeline treats unlabeled buttons as
-    non-targets until this is implemented.
+    The button detector is **multi-class** — each floor symbol is its own class —
+    so identification comes straight from the detector: this returns
+    ``detection.label`` (the predicted class name). Kept as a seam so a dedicated
+    OCR reader can be swapped in later if a detection-only model is ever used.
+
+    ``rgb`` is unused now (the label is already predicted) but kept in the
+    signature for that future OCR path.
     """
-    return ""
+    return (detection.label or "").strip()

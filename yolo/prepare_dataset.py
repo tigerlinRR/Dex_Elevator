@@ -1,16 +1,18 @@
-"""Build the single-class ``button`` YOLO dataset from one or more Roboflow exports.
+"""Build the elevator-button YOLO dataset from one or more Roboflow exports.
 
-Localization only: **every source class is collapsed to a single class ``button``**
-(id 0). Which-floor identification is a separate problem (:func:`read_floor_label`),
-so the original floor-symbol labels are discarded here.
+By default this is **multi-class**: each floor symbol keeps its own label (``1``,
+``2``, ``B1``, ``G``, ``open``…), so the trained detector both *finds* a button and
+*identifies which floor it is* in one shot. Pass ``--collapse`` to instead flatten
+every class to a single ``button`` (localization only — identification handled
+elsewhere); that mode can merge sources with different taxonomies.
 
-Why this exists: no in-house elevator-button dataset exists yet, so we bootstrap a
-*baseline* detector from public CC BY datasets on Roboflow Universe, then fine-tune
-on our own chest-335 captures later. See ``DATASETS.md`` (repo root) for attribution.
+No in-house elevator dataset exists yet, so we bootstrap from public CC BY datasets
+on Roboflow Universe, then fine-tune on our own chest-335 captures later. See
+``DATASETS.md`` (repo root) for attribution.
 
 Pipeline::
 
-    N source exports  ->  collapse all classes to `button`
+    N source exports  ->  keep original labels (or --collapse to `button`)
                       ->  perceptual-hash de-dup (kills fork/re-export overlap
                           and train/val leakage)
                       ->  merged dataset under data/datasets/buttons/
@@ -20,10 +22,15 @@ Inputs (mix freely, each repeatable):
   --src DIR             an already-extracted YOLO dataset dir (train/valid/test)
   --roboflow WS/PROJ/V  auto-download via REST (needs ROBOFLOW_API_KEY + requests) [best-effort]
 
-``--zip`` is preferred on the robot: it needs nothing beyond cv2/numpy (already in
-the richtech-v3 env), whereas the ``roboflow`` pip package can pull ``numpy>=2`` and
-break that pinned env. If ``--roboflow`` fails, download the export zip from the
-Roboflow UI ("Download Dataset" -> YOLOv8) and pass it with ``--zip``.
+``--zip``/``--src`` are preferred on the robot: they need nothing beyond cv2/numpy
+(already in the training env), whereas the ``roboflow`` pip package can pull
+``numpy>=2``. If ``--roboflow`` fails, download the export zip from the Roboflow UI
+("Download Dataset" -> YOLOv8) and pass it with ``--zip``.
+
+MULTI-CLASS (default) keeps the source's own class ids + names, so it needs a
+**single** source (different datasets number their classes differently; merging by
+id would corrupt labels). Use ``--collapse`` to merge several sources into one
+``button`` class.
 
 De-dup keeps split priority train > val > test: if the same image appears in several
 splits (common when two sources fork one upstream set), the higher-priority copy is
@@ -82,7 +89,7 @@ def hamming(a: int, b: int) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# source discovery / label remap
+# source discovery / class names / label copy
 # --------------------------------------------------------------------------- #
 def locate_root(base: Path) -> Path:
     """Find the dataset root inside an extracted archive (handles a nested folder)."""
@@ -90,6 +97,18 @@ def locate_root(base: Path) -> Path:
         if (c / "data.yaml").exists() or (c / "train").is_dir() or (c / "images").is_dir():
             return c
     return base
+
+
+def read_names(root: Path) -> list[str] | None:
+    """Class names from a source's ``data.yaml`` (list, or dict keyed by id)."""
+    p = Path(root) / "data.yaml"
+    if not p.exists():
+        return None
+    d = yaml.safe_load(p.read_text()) or {}
+    names = d.get("names")
+    if isinstance(names, dict):
+        names = [names[k] for k in sorted(names, key=lambda x: int(x))]
+    return list(names) if names else None
 
 
 def find_pairs(root: Path) -> list[tuple[str, Path, Path | None]]:
@@ -116,11 +135,13 @@ def find_pairs(root: Path) -> list[tuple[str, Path, Path | None]]:
     return pairs
 
 
-def write_remapped_label(src_lbl: Path | None, dst_lbl: Path) -> None:
-    """Copy a YOLO label file with **every class id forced to 0** (``button``).
+def write_label(src_lbl: Path | None, dst_lbl: Path, collapse: bool = False) -> None:
+    """Copy a YOLO label file.
 
-    Works for both bbox (5 tokens) and segmentation (>5 tokens) labels. An empty
-    or missing label becomes an empty file (a valid background image for YOLO).
+    ``collapse=False`` (default) keeps the original class ids (multi-class: each
+    floor symbol stays its own class). ``collapse=True`` forces class 0 (single
+    ``button`` class). Works for bbox (5 tokens) and segmentation (>5 tokens). An
+    empty or missing label becomes an empty file (a valid background image).
     """
     out_lines: list[str] = []
     if src_lbl and src_lbl.exists():
@@ -128,7 +149,8 @@ def write_remapped_label(src_lbl: Path | None, dst_lbl: Path) -> None:
             parts = line.split()
             if len(parts) < 5:
                 continue
-            parts[0] = "0"
+            if collapse:
+                parts[0] = "0"
             out_lines.append(" ".join(parts))
     dst_lbl.write_text("\n".join(out_lines) + ("\n" if out_lines else ""))
 
@@ -180,6 +202,9 @@ def main() -> None:
                     help="already-extracted YOLO dataset dir (repeatable)")
     ap.add_argument("--roboflow", action="append", default=[], metavar="WS/PROJ/VER",
                     help="auto-download via REST; needs ROBOFLOW_API_KEY (repeatable)")
+    ap.add_argument("--collapse", action="store_true",
+                    help="flatten ALL classes to a single `button` (localization only). "
+                         "Default keeps original labels (multi-class: detect + identify).")
     ap.add_argument("--dup-hamming", type=int, default=5,
                     help="pHash Hamming distance treated as a duplicate (0 = exact). Default 5.")
     ap.add_argument("--val-frac", type=float, default=0.15,
@@ -207,6 +232,21 @@ def main() -> None:
             sources.append((_tag(zp.name), locate_root(dest)))
         for d in args.src:
             sources.append((_tag(Path(d).name), locate_root(Path(d))))
+
+        # multi-class (default): keep the single source's own class taxonomy.
+        names = None
+        if not args.collapse:
+            if len(sources) != 1:
+                sys.exit("multi-class needs exactly ONE source (different datasets number "
+                         "their classes differently; merging by id would corrupt labels).\n"
+                         "Use one --src/--zip, or pass --collapse to flatten all to `button`.")
+            names = read_names(sources[0][1])
+            if not names:
+                sys.exit("could not read `names` from the source data.yaml; "
+                         "pass --collapse to train a single-class detector instead.")
+            print(f"multi-class: {len(names)} classes from {sources[0][0]}")
+        else:
+            print("collapse: all classes -> single `button`")
 
         # 2. gather (split, image, label) records across all sources ------- #
         records: list[dict] = []
@@ -261,7 +301,8 @@ def main() -> None:
             split = r["split"]
             name = f'{r["tag"]}__{r["img"].name}'
             shutil.copy2(r["img"], out / "images" / split / name)
-            write_remapped_label(r["lbl"], out / "labels" / split / f"{Path(name).stem}.txt")
+            write_label(r["lbl"], out / "labels" / split / f"{Path(name).stem}.txt",
+                        collapse=args.collapse)
             counts[split] = counts.get(split, 0) + 1
 
         # 5. data.yaml (absolute path -> works regardless of cwd) + provenance
@@ -269,22 +310,23 @@ def main() -> None:
             "path": str(out),
             "train": "images/train",
             "val": "images/val",
-            "nc": 1,
-            "names": ["button"],
+            "nc": len(names) if names else 1,
+            "names": names if names else ["button"],
         }
         if counts.get("test"):
             data_yaml["test"] = "images/test"
         (out / "data.yaml").write_text(yaml.safe_dump(data_yaml, sort_keys=False))
         (out / "SOURCES.json").write_text(json.dumps({
             "sources": [{"tag": t, "root": str(root)} for t, root in sources],
+            "mode": "single-class `button`" if args.collapse else f"multi-class ({len(names)} classes)",
             "dup_hamming": args.dup_hamming,
             "dropped_duplicates": dropped,
             "counts": counts,
-            "note": "all classes collapsed to single class `button` (localization only)",
         }, indent=2))
 
         print("\n=== done ===")
         print(f"  sources           : {', '.join(t for t, _ in sources)}")
+        print(f"  mode              : {'single-class button' if args.collapse else str(len(names)) + '-class (detect+identify)'}")
         print(f"  duplicates dropped : {dropped}")
         print(f"  train / val / test : {counts.get('train', 0)} / "
               f"{counts.get('val', 0)} / {counts.get('test', 0)}")

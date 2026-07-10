@@ -60,8 +60,8 @@ its pinned `numpy<2`). Bootstrap from public **CC BY** Roboflow exports.
 
 ```bash
 PYU=~/miniconda3/envs/ultralytics/bin/python
-PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"  # -> data/datasets/buttons/
-PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --imgsz 640                       # -> data/weights/buttons.pt
+PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"        # multi-class -> data/datasets/buttons/
+PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --model yolo11m.pt --imgsz 640         # -> data/weights/buttons.pt
 ```
 
 ## Architecture
@@ -97,12 +97,14 @@ pixel; `read_floor_label` (**stub**) is the "which floor" reader — the real op
 problem, deliberately decoupled from the geometry so it can be swapped freely.
 
 **Button-YOLO training tooling** (`yolo/prepare_dataset.py`, `yolo/train_buttons.py`,
-`yolo/buttons.yaml`): no in-house dataset exists yet, so the single-class detector is
-bootstrapped from public **CC BY** Roboflow exports — `prepare_dataset.py` merges sources,
-**collapses every class to `button`**, and pHash-dedups into `data/datasets/buttons/`;
-`train_buttons.py` trains YOLO11 → `data/weights/buttons.pt`. Run both in the robot's
-**`ultralytics`** conda env (torch+cuda; `richtech-v3` has no torch). Attribution lives in
-`DATASETS.md`. Fine-tune on our own cam_chest captures later (source data is only 416×416).
+`yolo/buttons.yaml`): no in-house dataset exists yet, so the detector is bootstrapped from
+public **CC BY** Roboflow exports. **Multi-class by default** — each floor symbol keeps its own
+label so the model **detects AND identifies** which floor (`prepare_dataset.py` keeps the source
+labels + pHash-dedups into `data/datasets/buttons/`; `--collapse` is an opt-in single-`button`
+mode). `train_buttons.py` trains YOLO11 → `data/weights/buttons.pt` — **use `--model yolo11m.pt`**;
+nano is far too weak for 368-class floor ID (floor mAP50 0.1–0.37 vs yolo11m 0.7–0.85). Run both in
+the robot's **`ultralytics`** conda env (torch+cuda; `richtech-v3` has no torch). Attribution in
+`DATASETS.md`. Fine-tune on our own cam_chest captures later for higher accuracy.
 
 **Orchestrator** (`core/elevator_pipeline.py`): capture → detect → match the button
 whose label == requested floor → `press_target_from_pixel` → arm standoff/press/retract.
@@ -159,9 +161,9 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
 
-- Button YOLO: tooling BUILT (`yolo/prepare_dataset.py` + `yolo/train_buttons.py`) and a
-  baseline is bootstrapped from public CC BY data → `data/weights/buttons.pt`. Remaining:
-  fine-tune on our own cam_chest captures.
+- Button YOLO: tooling BUILT + a **multi-class** baseline trained (yolo11m — detects AND
+  identifies each floor) → `data/weights/buttons.pt`. Remaining: fine-tune on our own
+  cam_chest captures for higher accuracy.
 - Implement `read_floor_label` (OCR / multi-class / template) — the identification step.
 - Measure `elevator.panel` + press poses; consider a live plane fit later.
 - Force-limited press (`rm_force_position_move_pose`) and the LinkerHand pointing pose.
