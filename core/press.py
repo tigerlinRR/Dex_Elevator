@@ -136,12 +136,92 @@ def press_waypoints(
     )
 
 
-def fit_panel_plane_from_depth(*args, **kwargs):
-    """TODO: estimate ``(plane_point, outward_normal)`` from the panel-region depth.
+def fit_panel_plane_from_depth(
+    frame,                                 # CameraFrame (needs .depth + .intrinsics)
+    base_T_camera: np.ndarray,             # 4x4 eye-to-hand extrinsic
+    roi: tuple[int, int, int, int],        # (u0, v0, u1, v1) pixel box on the PANEL
+    *,
+    step: int = 2,                         # pixel stride (2 keeps it ~1 ms, plenty of points)
+    z_range: tuple[float, float] = (0.25, 1.5),   # plausible panel distance, meters
+    inlier_tol: float = 0.004,             # 4 mm — buttons stand proud of the faceplate
+    iterations: int = 100,                 # caps the search; it early-exits far sooner
+    min_inlier_frac: float = 0.5,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Fit the panel plane LIVE from the depth map. Returns ``(point, outward_normal)``
+    in the robot base frame, or ``None`` if the fit is not trustworthy.
 
-    For a docked pose the panel plane can be measured once and kept in config
-    (simplest, most robust). A live plane fit (RANSAC over the panel ROI's depth
-    points, mapped to the base frame) would let the base dock less precisely.
-    Not needed for first bring-up — kept as a stub.
+    Measure this on every approach rather than storing it in config: the mobile base
+    docks with centimetres of error, so a hard-coded plane is wrong the moment the
+    base stops anywhere but the exact pose it was measured at. Fitting is cheap.
+
+    ``roi`` should cover the flat faceplate — e.g. the union of the button detections,
+    grown a little. Don't hand it the whole frame: the wall behind the panel is a
+    different (usually parallel) plane and would contaminate the fit.
+
+    RANSAC first (the raised buttons are outliers by design), then a least-squares
+    refit on the inliers via SVD. The normal is oriented to point from the panel
+    back toward the camera, i.e. OUTWARD — which is what
+    :func:`press_target_from_pixel` expects.
     """
-    raise NotImplementedError("panel-plane fitting is a follow-up; measure the plane for now.")
+    depth = getattr(frame, "depth", None)
+    if depth is None or not np.any(depth):
+        return None
+    u0, v0, u1, v1 = (int(x) for x in roi)
+    h, w = depth.shape[:2]
+    u0, u1 = max(0, u0), min(w, u1)
+    v0, v1 = max(0, v0), min(h, v1)
+    if u1 - u0 < 4 or v1 - v0 < 4:
+        return None
+
+    # Vectorised deprojection — a Python loop over the ROI costs ~0.7 s, this ~1 ms.
+    zmin, zmax = z_range
+    vs, us = np.mgrid[v0:v1:step, u0:u1:step]
+    zs = depth[vs, us].astype(np.float64)
+    keep = (zs > zmin) & (zs < zmax)
+    if keep.sum() < 50:
+        return None
+    u_f, v_f, z_f = us[keep].astype(np.float64), vs[keep].astype(np.float64), zs[keep]
+    intr = frame.intrinsics
+    P = np.stack([(u_f - intr.cx) * z_f / intr.fx,
+                  (v_f - intr.cy) * z_f / intr.fy,
+                  z_f], axis=1)
+    P_base = P @ base_T_camera[:3, :3].T + base_T_camera[:3, 3]
+
+    rng = np.random.RandomState(0)          # deterministic: same frame -> same plane
+    sub = P_base                            # scoring all points costs only ~25 ms
+    best_count, best = 0, None
+    for _ in range(iterations):
+        idx = rng.choice(len(sub), 3, replace=False)
+        a, b, c = sub[idx]
+        n = np.cross(b - a, c - a)
+        nrm = np.linalg.norm(n)
+        if nrm < 1e-9:
+            continue
+        n = n / nrm
+        count = int((np.abs((sub - a) @ n) < inlier_tol).sum())
+        if count > best_count:
+            best_count, best = count, (a, n)
+            # A faceplate is mostly planar, so a good hypothesis shows up within a
+            # handful of rounds. Bail out rather than grinding through `iterations`.
+            if best_count > 0.90 * len(sub):
+                break
+    if best is None or best_count < min_inlier_frac * len(sub):
+        return None
+
+    a, n = best
+    inliers = P_base[np.abs((P_base - a) @ n) < inlier_tol]
+    centroid = inliers.mean(axis=0)
+    # Least-squares plane through the inliers: the normal is the eigenvector of the
+    # 3x3 scatter matrix with the smallest eigenvalue.
+    # NOT np.linalg.svd(inliers - centroid): for an Nx3 input that builds the full
+    # NxN left-singular matrix (N ~ 10k here) and costs ~125 ms — it dominated this
+    # whole function. eigh on the 3x3 covariance is mathematically equivalent and
+    # runs in microseconds.
+    centred = inliers - centroid
+    normal = np.linalg.eigh(centred.T @ centred)[1][:, 0]
+    normal = normal / np.linalg.norm(normal)
+
+    # Orient OUTWARD (panel -> camera). base_T_camera's translation is the camera origin.
+    if normal @ (base_T_camera[:3, 3] - centroid) < 0:
+        normal = -normal
+    return centroid, normal

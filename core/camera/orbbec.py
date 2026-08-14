@@ -26,11 +26,13 @@ except ImportError:  # pragma: no cover
 
 try:
     from pyorbbecsdk import (  # type: ignore
+        AlignFilter,
         Config,
         Context,
         OBAlignMode,
         OBFormat,
         OBSensorType,
+        OBStreamType,
         Pipeline,
     )
 
@@ -90,6 +92,7 @@ class OrbbecCamera(Camera):
         self.fps = fps
         self._pipeline: Pipeline | None = None
         self._depth_enabled = False
+        self._align = None      # AlignFilter, built in start() when depth is on
         # Pre-loaded (Part 1) intrinsics shared from the calibration file; when
         # set, this is authoritative and we do NOT re-read the SDK factory values.
         self._intrinsics: CameraIntrinsics | None = intrinsics
@@ -168,10 +171,17 @@ class OrbbecCamera(Camera):
 
         # Depth + alignment are best-effort: intrinsic calibration needs only
         # color, so a depth/align failure must not block it.
+        #
+        # Alignment MUST go through AlignFilter, not Config.set_align_mode(): on
+        # pyorbbecsdk v2 the latter is silently ignored — depth keeps coming out at
+        # the depth sensor's own 848x480 while colour is 1280x720, so indexing the
+        # depth map with a colour pixel lands somewhere else entirely (and there is
+        # no error to tell you). With the filter, depth comes back at 1280x720,
+        # pixel-aligned to colour.
         try:
             depth_profiles = self._pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
             config.enable_stream(depth_profiles.get_default_video_stream_profile())
-            config.set_align_mode(OBAlignMode.SW_MODE)
+            self._align = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
             self._depth_enabled = True
         except Exception as e:  # pragma: no cover - hardware/firmware dependent
             print(f"[{self.camera_id}] depth/align unavailable ({e}); color-only.")
@@ -256,6 +266,11 @@ class OrbbecCamera(Camera):
         for _ in range(retries):  # warm-up frames can be dropped right after start
             frames = self._pipeline.wait_for_frames(1000)
             if frames is not None:
+                if self._align is not None:
+                    aligned = self._align.process(frames)
+                    if aligned is not None:
+                        frames = (aligned.as_frame_set()
+                                  if hasattr(aligned, "as_frame_set") else aligned)
                 color_frame = frames.get_color_frame()
                 if color_frame is not None:
                     break

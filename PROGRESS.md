@@ -43,12 +43,36 @@ before trying to install torch/ultralytics.
 
 **HAND-EYE CALIBRATION IS DONE on this machine (2026-08-14)** — see the section below for numbers.
 
-**Still open on the new machine:**
-1. Route fix + Tailscale (the installed one belongs to `tony.h@` and is offline).
-2. `yolo11m` on Orin will likely need a **TensorRT engine** or a drop to `yolo11s`;
-   torch/ultralytics are not installed there yet and the robot has no internet.
-3. The hardware line: LinkerHand fingertip TCP → known-point press → force-limited press →
-   panel plane → full pipeline + base docking.
+**Stop point (2026-08-14): everything is in place for a first press except the wrist
+orientation.** Resuming Monday. Next actions, in order:
+
+1. **Wrist orientation.** Parked by hand, the fingertip pointed 46.9° off the panel's
+   inward normal — pressing like that would skid across the face rather than push.
+   Reachability is orientation-limited too: sweeping roll about the approach axis at
+   the panel, only 3 of 12 directions had an IK solution, so the press orientation has
+   to be picked from what IK accepts. Turn the wrist (by hand is safest) to within
+   ~15° of the normal, then the remaining correction is a **31.5 mm translation** —
+   small and low-risk.
+2. **First press, in stages.** standoff 50 → 30 → 10 mm with `push_depth=0`,
+   photographing at each step, then add depth. Never been done; biggest untested risk.
+   The photo at 10 mm also resolves the last open number: the fingertip TCP's z has a
+   17 mm disagreement between the URDF derivation and the visual measurement (x/y agree
+   to 0.5–1.8 mm). Take the LARGER z until settled — too small overshoots into the panel.
+3. **YOLO** — deliberately last. It only automates "which pixel is the button", and
+   that pixel can be supplied by hand today. Wiring it earlier would confound
+   perception errors with geometry errors. Needs torch/ultralytics fetched on the Mac
+   and rsync-ed over (robot has no internet), then likely a TensorRT engine or `yolo11s`.
+4. Route fix + Tailscale (the installed one belongs to `tony.h@` and is offline).
+5. Force-limited press, full pipeline, base docking.
+
+**Practical notes for Monday:**
+- The mock panel is a real elevator faceplate on a fire-extinguisher cabinet; the `1`
+  button is the green one, 4th row left. Panel sits ~0.68 m in front of / 0.25 m right
+  of the arm base, vertical to within 1.4°.
+- **Don't let the hand into the plane-fit ROI** — it dragged the fit by 23 mm. Use the
+  faceplate's left half until YOLO supplies a proper button-box ROI.
+- Lighting matters: the first captures came out at mean brightness 40–50 and the button
+  labels were unreadable. With the room light on it was fine.
 
 **Left/right arm VERIFIED (2026-08-14).** `.32`/`.33` are identical RM_65s, so the mapping was
 confirmed physically: with both arms polled, hand-pushing the right arm moved `.33` by 34.21°
@@ -98,6 +122,23 @@ not servo-locked — it hand-drags freely, which suits the drag-teach capture in
     A *single* bad pose (`sample002`, 34 mm off — captured before the arm settled) was degrading
     the whole extrinsic solve by 3x. Find them by reconstructing `flange_T_board` per sample and
     looking at the spread; the bad ones stick out by an order of magnitude.
+- **LinkerHand O6 under control (2026-08-14)** — `core/hand/linkerhand.py`, driven as a
+  Modbus RTU slave on the right arm's tool-side RS485 (`port=1, slave=0x27`, 115200,
+  24 V via `rm_set_tool_voltage(3)`). `POSES["point"]` verified on hardware: index
+  extended, other four curled, reaches target in ~2 s. Fingertip TCP taken from
+  LinkerBot's official O6 URDF + STL meshes → `[11.88, 28.08, 172.87] mm` from the
+  flange face; the same computation reproduces the manual's 177 mm middle-fingertip
+  figure to 0.1 mm. Note the fingertip is 28 mm OFF the hand's centre axis — a pure-z
+  TCP would miss a 20 mm button by more than its own diameter.
+- **Panel plane now fitted LIVE** — `fit_panel_plane_from_depth` implemented (was a
+  stub): RANSAC + least-squares over the depth ROI, **4.8 ms**, repeats to **1.1 mm**
+  frame-to-frame, 93 % inliers, 1.0 mm residual. The stored plane in
+  `configs/pipeline.yaml` is now reference-only.
+- **Full pixel → 3D geometry chain verified on the real panel.** Projecting the 9
+  button pixels through `ray ∩ plane` gives a **column-to-column spacing of 56.6 mm
+  that is identical across all five rows** (row pitch 43.4 mm). Consistency at that
+  level across independent rows is only possible if the hand-eye extrinsic, the plane
+  fit and the ray-plane maths are all correct simultaneously.
 - **Deployed on the Orin unit** at `~/Dex_Elevator` (rsync from the Mac — repo is private),
   editable-installed into the **system python3** via `pip install --user -e .`.
   `initialization/bringup_check.py` passes: libs, configs, ChArUco board, chest-camera capture

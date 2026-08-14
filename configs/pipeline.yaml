@@ -8,6 +8,32 @@ arm:
   port: 8080
   max_speed_pct: 20        # SAFETY cap during bring-up; raise once motion is validated
 
+# LinkerHand O6 on the right arm's tool connector (core/hand/linkerhand.py).
+# Verified on hardware 2026-08-14. The arm is a GEN-3 controller, so the hand is
+# reached with rm_set_modbus_mode/rm_write_registers, not the gen-4 modbus_rtu API.
+hand:
+  make: linkerhand_o6
+  port: 1                  # 1 = tool-board RS485 (0 = controller RS485)
+  slave: 0x27              # Modbus slave address (same as ADAM's right hand)
+  baudrate: 115200
+  speed: 200               # per-joint speed register (0-255)
+  press_pose: point        # index extended, rest curled — the pressing posture
+  # Index-fingertip TCP offset from the flange face, in the HAND's base frame
+  # (meters). Derived from LinkerBot's official O6 URDF + STL meshes:
+  #   github.com/linker-bot/linkerhand-urdf -> O6/right
+  #   FK at joint angles 0 (= `point`: 255 means "open"/straight) through
+  #   rh_index_mcp_pitch -> rh_index_dip, then the farthest vertex of
+  #   index_distal.STL. hand_base_link's mesh starts at z=0, i.e. its origin IS
+  #   the flange mounting face.
+  # Cross-check: the same computation gives 176.90 mm for the MIDDLE fingertip,
+  # against 177 mm in the official product manual — 0.1 mm agreement.
+  # NOTE the x/y: the index finger is NOT on the hand's centre axis (28 mm off in
+  # y). Treating this as a pure z offset would miss the button by ~3 cm.
+  # x/y are in the HAND frame — they rotate with however the hand is bolted to the
+  # flange (4x M3 on a 20x20 pattern allows 90-degree increments), so confirm the
+  # mounting clocking before trusting them. z is unaffected by that rotation.
+  fingertip_offset: [0.01188, 0.02808, 0.17287]
+
 button_yolo:
   weights: data/weights/buttons.pt   # TODO: train on the robot's ~/dataset; single class `button`
   conf: 0.25
@@ -16,12 +42,19 @@ button_yolo:
 
 elevator:
   camera_id: cam_chest
-  # Panel plane in the RIGHT-arm base frame — MEASURE once at the docked pose.
-  #   point  = any point on the panel face (m)
-  #   normal = OUTWARD panel normal (panel -> robot)
+  # Panel plane in the RIGHT-arm base frame: (point on the face, OUTWARD normal).
+  #
+  # DO NOT rely on these values. The plane is measured LIVE on every approach with
+  # core.press.fit_panel_plane_from_depth() — the mobile base docks with centimetres
+  # of error, so a stored plane is wrong as soon as the base stops anywhere else.
+  # The live fit takes ~5 ms and repeats to ~1 mm, so there is no reason to cache it.
+  # These entries are only a sanity-check fallback / a record of a known-good dock.
+  #
+  # Measured 2026-08-14 in front of the mock panel (93% inliers, 1.0 mm residual,
+  # panel vertical to within 1.4 deg):
   panel:
-    point:  [0.45, 0.00, 0.20]     # PLACEHOLDER (m) — measure on the real cell
-    normal: [-1.0, 0.0, 0.0]       # PLACEHOLDER — outward panel normal (toward robot)
+    point:  [0.6818, -0.2508, 0.5661]   # reference only — live fit overrides
+    normal: [-0.9997, 0.0072, 0.0248]   # reference only — live fit overrides
   press:
     standoff: 0.06         # m backed off the panel before/after pressing
     push_depth: 0.010      # m advanced past the face to actuate the button

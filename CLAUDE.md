@@ -110,8 +110,24 @@ model). A button is a point target on the known **vertical panel plane**:
   ray∩plane; robust to small/low-contrast buttons where depth is noisy). Approach
   axis (tool +Z) = inward panel normal.
 - `press_waypoints`: STANDOFF → PRESS (advance `push_depth` past the face) → RETRACT.
-- The panel plane `(point, outward_normal)` in the base frame is measured once for
-  the docked pose (config); `fit_panel_plane_from_depth` is a stub for a live fit.
+- `fit_panel_plane_from_depth`: **measures the panel plane LIVE** from the depth ROI
+  (RANSAC + least-squares refit, ~5 ms, repeats to ~1 mm). **Always fit; never trust
+  the plane in the config** — the base docks with centimetres of error, so a stored
+  plane is wrong the moment it stops anywhere else. Pass an ROI covering the
+  faceplate only: the wall behind is a second, parallel plane, and **anything else in
+  the ROI (notably the robot's own hand) drags the fit** — measured 23 mm of error
+  with the hand in frame. Once YOLO is wired, use the button detections' bounding
+  box as the ROI, which excludes the hand automatically.
+
+**Dexterous hand (`core/hand/linkerhand.py`)** — LinkerHand O6 as a Modbus RTU slave on
+the RIGHT arm's tool-side RS485, sharing the arm's connection. Bring-up:
+`rm_set_tool_voltage(3)` (24 V) then `rm_set_modbus_mode(1, 115200, timeout)`.
+Registers: read 0..5 = current joint positions, **write 0..5 = TARGET positions**
+(same addresses, different meaning), 12..17 = speed; 0 = closed, 255 = open.
+`POSES["point"]` (index extended, rest curled) is the pressing posture. `probe()`
+sweeps ports/slaves read-only to locate the device — verified `port=1, slave=0x27`.
+The fingertip TCP is `hand.fingertip_offset` in `configs/pipeline.yaml`, derived from
+LinkerBot's official O6 URDF + STL meshes (github.com/linker-bot/linkerhand-urdf).
 
 **Button detection** (`yolo/button_detector.py`): `ButtonDetector` (Ultralytics
 YOLO, single class `button`) → `Detection` list; `centroid_pixel` gives the press
@@ -199,6 +215,31 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 - **Capture only after the arm has fully settled.** Both outliers in the 2026-08 run
   (`sample002`, and the 8.3 mm point in the localization eval) were poses captured while the arm
   was still micro-swinging after being hand-guided. Let go, wait, then hit Capture.
+- **This is a GEN-3 RealMan controller** (`rm_get_robot_info()` → `robot_controller_version: 3`).
+  The gen-4 API family returns `-4` ("三代控制器不支持该接口"): use `rm_set_modbus_mode` /
+  `rm_write_registers` / `rm_read_multiple_holding_registers` (which take
+  `rm_peripheral_read_write_params_t`), NOT `rm_set_tool_rs485_mode` /
+  `rm_write_modbus_rtu_registers`. Also: the multi-register write `rm_write_registers`
+  **returns 0 but silently does nothing** here — write registers one at a time with
+  `rm_write_single_register`. And reads come back as raw BYTES (num*2, big-endian per
+  register), not register values.
+- **`get_tcp_pose()` is NOT the flange.** A tool frame is already configured on this
+  robot (`rm_get_current_tool_frame()` → z = 130 mm, payload 0.356 kg ≈ the hand), so
+  poses are reported at a point 130 mm beyond the flange. Also the `base` frame is not
+  the arm's own base — the current TCP reads 1317 mm from the origin, far beyond the
+  RM-65's ~650 mm reach — so **never sanity-check reach by taking the norm of a base-frame
+  position**; ask the controller with `rm_algo_inverse_kinematics` instead.
+- **Depth must be aligned with AlignFilter, not `Config.set_align_mode()`.** On
+  pyorbbecsdk v2 the latter is silently ignored: depth keeps coming out at the depth
+  sensor's native 848x480 while colour is 1280x720, so indexing the depth map with a
+  colour pixel silently reads a completely different part of the scene (this produced
+  a plausible-looking but 2x-wrong TCP measurement). `core/camera/orbbec.py` now builds
+  `AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)` and runs every frameset
+  through it; depth comes back at 1280x720, pixel-aligned.
+- **Never `np.linalg.svd` an Nx3 matrix to get a plane normal.** For N ~ 10k numpy
+  builds the full NxN left-singular matrix: it cost 125 ms and was 96% of
+  `fit_panel_plane_from_depth`'s runtime. Use `np.linalg.eigh` on the 3x3 covariance —
+  same answer, microseconds (the whole fit went 649 ms → 4.8 ms).
 - **Orbbec colour format: MJPG, not RGB.** The Gemini 335 advertises uncompressed RGB at
   1280x720@30 but never delivers a frame on it — `wait_for_frames` just times out, which
   looks exactly like a broken camera. `_FORMAT_PREFERENCE` in `core/camera/orbbec.py`
@@ -227,8 +268,15 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   need a TensorRT engine (exported on the Orin itself — engines are not portable) or a drop
   to `yolo11s` for real-time. Then: fine-tune on our own cam_chest captures.
 - Implement `read_floor_label` (OCR / multi-class / template) — the identification step.
-- Measure `elevator.panel` + press poses; consider a live plane fit later.
-- Force-limited press (`rm_force_position_move_pose`) and the LinkerHand pointing pose.
+- **Wrist orientation for pressing.** The fingertip must approach along the panel's
+  inward normal; parked by hand it sat 46.9° off, which would skid instead of press.
+  Reachability is also orientation-limited: at the panel, sweeping the roll about the
+  approach axis found only 3 of 12 directions solvable by IK — so the press pose has
+  to be chosen from what IK accepts, not assumed.
+- **First actual press.** Geometry, plane fit, TCP and hand pose are all in place and
+  cross-checked, but the arm has never been commanded to a button. Approach in stages
+  (standoff 50 → 30 → 10 mm, `push_depth=0` first) and re-photograph at each step.
+- Force-limited press (`rm_force_position_move_pose`).
 
 Runtime artifacts are gitignored (weights, calibration outputs, captures under
 `data/**`). Don't commit them.
