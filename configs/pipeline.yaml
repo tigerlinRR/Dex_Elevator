@@ -3,8 +3,8 @@
 
 arm:
   make: realman
-  side: right              # the button-pressing arm (192.168.11.43)
-  ip: "192.168.11.43"
+  side: right              # the button-pressing arm (192.168.11.33 on the Orin unit)
+  ip: "192.168.11.33"      # left/right VERIFIED 2026-08-14 (hand-push test)
   port: 8080
   max_speed_pct: 20        # SAFETY cap during bring-up; raise once motion is validated
 

@@ -18,13 +18,26 @@ lift absorb the docking error, so the base doesn't move during a press.
 
 ## Environment / hardware (important, non-obvious)
 
-The robot is an NVIDIA **Jetson Thor**, reachable at `ssh dex4` (`192.168.11.41`,
-user `jetson`). Hardware, verified on the device — do NOT assume an xArm:
+The robot is an NVIDIA **Jetson AGX Orin Developer Kit** (JetPack 6.2 / R36.4.4, CUDA
+12.6, 61 GB RAM), reachable at **`ssh dex5-wired`** (`192.168.11.31`, user `jetson`).
+An older **Jetson Thor** unit (`dex4`, `192.168.11.41`) is retired — ignore it, and do
+not reuse its calibration artifacts. Hardware, verified on the device — do NOT assume an xArm:
 
-- **Arms: dual RealMan RM** (SDK imports as `Robotic_Arm`, class `RoboticArm`).
-  LEFT `192.168.11.42`, RIGHT `192.168.11.43`, port `8080`. **Pressing uses the
-  right arm.** The RealMan SDK lives in the robot's `richtech-v3` conda env
-  (`~/miniconda3/envs/richtech-v3/bin/python`).
+- **Arms: dual RealMan RM 65** (SDK imports as `Robotic_Arm`, class `RoboticArm`).
+  LEFT `192.168.11.32`, RIGHT `192.168.11.33`, port `8080`. **Pressing uses the
+  right arm.** Left/right **VERIFIED 2026-08-14**: hand-pushing the right arm while
+  polling both moved `.33` by 34.21° and `.32` by 0.01°.
+- **Python is the SYSTEM `python3` (3.10.12), not conda.** It already has numpy 1.21.5,
+  **cv2 4.8.0 with `aruco.CharucoDetector` + `calibrateHandEye`**, and pyyaml. Everything
+  else is `pip install --user`: `Robotic_Arm` 1.1.6, `pyorbbecsdk` 2.1.2 (built from
+  source in `~/pyorbbecsdk`), and this repo (`pip install --user -e .`). This machine's
+  `richtech-v3` env is NOT usable here (no RealMan/Orbbec SDK, CPU-only torch) — leave it alone.
+- **This is a SHARED machine.** The home dir holds unrelated projects (ZED, VR teleop,
+  LinkerHand gripper endurance). Touch only `~/Dex_Elevator`, `~/pyorbbecsdk`, `~/.local`.
+- **The Jetson has NO internet** (default route → dead gateway `192.168.11.1`; its WiFi
+  reaches DNS but no external host). `pip`/`apt`/`git clone` fail on the robot — download
+  on the dev Mac and rsync the artifacts over.
+- **`sudo` requires a password**, so any root step has to be handed to the user.
 - **Torso lift column** (RealMan lift API, mm) raises/lowers the upper body. The
   chest camera and arm bases ride it together, so `base_T_camera` stays constant.
 - **LinkerHand** dexterous hand as end-effector (driven by its own bridge, not the
@@ -37,22 +50,30 @@ user `jetson`). Hardware, verified on the device — do NOT assume an xArm:
 
 ## Common commands
 
-Run hardware commands **on the robot** (`ssh dex4`) with the RealMan env.
+Run hardware commands **on the robot** (`ssh dex5-wired`) with the plain system
+`python3` — there is no env to activate.
 
 ```bash
+# Readiness self-test FIRST: libs, configs, board, camera capture, arm pose (read-only).
+python3 initialization/bringup_check.py
+
 # list connected Orbbec devices (name + serial) — confirms 335 vs 335L
-python -m core.camera.orbbec
+python3 -m core.camera.orbbec
 
 # Calibration (once, per camera, in order): intrinsics -> extrinsics -> validate.
 # The robot is HEADLESS: add --web to stream an MJPEG preview to a browser on the
-# LAN (http://192.168.11.41:8010/); capture via the page buttons or keys c/d.
-python initialization/calibrate_intrinsics.py --camera cam_chest --web   # 1. intrinsics (hold board)
-python initialization/run_calibration.py      --camera cam_chest --web   # 2. eye-to-hand (board on flange, drag-teach)
-python initialization/validate_calibration.py --camera cam_chest         # 3. re-validate saved artifacts
-python initialization/eval_localization.py    --camera cam_chest --web   # end-to-end localization accuracy (fresh poses)
+# LAN (http://192.168.11.31:8010/); capture via the page buttons or keys c/d.
+python3 initialization/calibrate_intrinsics.py --camera cam_chest --web   # 1. intrinsics (hold board)
+python3 initialization/run_calibration.py      --camera cam_chest --web   # 2. eye-to-hand (board on flange, drag-teach)
+python3 initialization/validate_calibration.py --camera cam_chest         # 3. re-validate saved artifacts
+python3 initialization/eval_localization.py    --camera cam_chest --web   # end-to-end localization accuracy (fresh poses)
 
 # No test suite or linter is configured yet.
 ```
+
+**The `--web` preview only works if the browser can route to the Jetson.** The dev Mac is
+on `192.168.40.x` and cannot reach the Jetson's WiFi subnet (`192.168.10.x`), so today
+calibration needs the **Ethernet cable** between Mac and robot (Mac becomes `192.168.11.50`).
 
 Button detector (YOLO) — train in the robot's dedicated **`ultralytics`** conda env
 (torch + CUDA); **not** `richtech-v3` (no torch there, and installing it would break
@@ -154,17 +175,57 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 - **Lift look-then-move**: settle the lift → measure with the camera → press. Don't
   move the lift/base between measuring and pressing (the measurement goes stale).
 - **Headless robot / preview**: the robot has no monitor and the Mac has no XQuartz,
-  so use `--web` (MJPEG to a browser on the LAN, `http://192.168.11.41:8010/`) for
+  so use `--web` (MJPEG to a browser on the LAN, `http://192.168.11.31:8010/`) for
   any capture — a local OpenCV window or `ssh -Y` shows nothing.
 - **Calibration board mount**: bolt the ChArUco board to the bare **flange** (remove
   the LinkerHand — its fingertip TCP isn't defined in the controller). `base_T_camera`
   is end-effector-independent, so the hand is remounted afterward with no re-calibration.
+- **ALWAYS outlier-reject after calibrating — a single bad view/pose costs 3x accuracy.**
+  Measured on the 2026-08 run: intrinsics RMS 0.698 → **0.383 px** by dropping 25 of 88 views;
+  extrinsic consistency 1.85 → **0.67 mm** and leave-one-out worst 33.6 → **1.81 mm** by dropping
+  ONE pose out of 41 (`sample002`, captured before the arm had settled). The danger is that the
+  headline numbers still look acceptable, because the mean hides the tail — always look at the
+  *max* and the per-item distribution, not just RMS/consistency.
+  - Intrinsics: `cv2.calibrateCameraExtended` returns `perViewErrors`; drop views above
+    ~2x the median, then re-run. Cache the detected corners first — detection is the slow part
+    (~8 min for 88 views), after which trying different rejection thresholds is instant.
+  - Extrinsics: reconstruct `flange_T_board = inv(base_T_gripper) @ X @ cam_T_target` for every
+    sample. The board is rigid, so these must all agree; bad poses stick out by an order of
+    magnitude (0.6 mm median vs 34 mm for the bad one). This doubles as a measurement of how
+    rigidly the board is actually bolted on.
+  - Verify with a *held-out* metric (leave-one-out, or train/test split), never RMS alone —
+    rejecting views always improves RMS, so RMS cannot tell you whether you improved or overfit.
+  - Keep the rejects (`*_rejected/` dirs) and pre-rejection backups for traceability.
+- **Capture only after the arm has fully settled.** Both outliers in the 2026-08 run
+  (`sample002`, and the 8.3 mm point in the localization eval) were poses captured while the arm
+  was still micro-swinging after being hand-guided. Let go, wait, then hit Capture.
+- **Orbbec colour format: MJPG, not RGB.** The Gemini 335 advertises uncompressed RGB at
+  1280x720@30 but never delivers a frame on it — `wait_for_frames` just times out, which
+  looks exactly like a broken camera. `_FORMAT_PREFERENCE` in `core/camera/orbbec.py`
+  therefore puts `MJPG` (the device's own default) first. Don't "optimise" it back.
+- **`capture()` needs a lot of retries.** With depth enabled the 335 emits ~11
+  depth-only framesets before colour syncs in (only ~0.5 s total — it is a frameset
+  *count*, not a timeout), so `retries` defaults to 40. At 10 it fails intermittently.
+- **Building `pyorbbecsdk` has two traps.** (1) `pip install .` fails until CMake has
+  been run first (`mkdir build && cmake -Dpybind11_DIR=$(python3 -m pybind11 --cmakedir) ..
+  && make -j && make install`). (2) The install drops the package's `__init__.py`, and
+  that file calls `version("pyorbbecsdk2")` which raises because the local build registers
+  no such distribution — both are patched in place under `~/.local/.../pyorbbecsdk/`.
+- **Beware `UNKNOWN-0.0.0` collisions.** The system setuptools is 59.6 (< 61) so it
+  ignores `pyproject.toml`'s `[project]` table and registers editable installs as
+  `UNKNOWN-0.0.0`. pyorbbecsdk landed under the same name, so installing this repo
+  editable *uninstalled pyorbbecsdk's `.so`*. If the camera suddenly reports
+  `No module named 'pyorbbecsdk.pyorbbecsdk'`, restore it with
+  `cp -r ~/pyorbbecsdk/install/lib/pyorbbecsdk/. ~/.local/lib/python3.10/site-packages/pyorbbecsdk/`.
 
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
 
 - Button YOLO: tooling BUILT + a **multi-class** baseline trained (yolo11m — detects AND
-  identifies each floor) → `data/weights/buttons.pt`. Remaining: fine-tune on our own
-  cam_chest captures for higher accuracy.
+  identifies each floor) → `data/weights/buttons.pt` (already deployed on the Orin).
+  **Not runnable on the Orin yet**: torch/ultralytics are not installed there and the robot
+  has no internet, so the wheels must be fetched on the dev Mac and rsync-ed over. Expect to
+  need a TensorRT engine (exported on the Orin itself — engines are not portable) or a drop
+  to `yolo11s` for real-time. Then: fine-tune on our own cam_chest captures.
 - Implement `read_floor_label` (OCR / multi-class / template) — the identification step.
 - Measure `elevator.panel` + press poses; consider a live plane fit later.
 - Force-limited press (`rm_force_position_move_pose`) and the LinkerHand pointing pose.

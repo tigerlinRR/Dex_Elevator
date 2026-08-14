@@ -44,8 +44,10 @@ except ImportError:  # pragma: no cover - SDK is an optional runtime dep
     _SDK_AVAILABLE = False
 
 
-# Known arm endpoints on the DEX robot.
-ARM_IPS = {"left": "192.168.11.42", "right": "192.168.11.43"}
+# Known arm endpoints on the DEX robot (AGX Orin unit; the older Thor unit used
+# .42/.43). Left/right VERIFIED 2026-08-14 by hand-pushing the right arm while
+# polling both: .33 moved 34.21 deg, .32 moved 0.01 deg.
+ARM_IPS = {"left": "192.168.11.32", "right": "192.168.11.33"}
 
 
 class RealmanArm(RobotArm):

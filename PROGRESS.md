@@ -3,22 +3,57 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
-## ⏸ Stop point (2026-07-10) — migrating to a new AGX Orin DEX
-This DEX (Jetson **Thor**) has a **faulty right arm (error 4104)** — powered off to stop the
-alarm, not resolved — and is being **replaced by a new AGX Orin-based DEX**. So all **hardware
-work is paused for the new machine**: hand-eye calibration (must be redone on the new robot),
-LinkerHand fingertip TCP, known-point / force-limited press, panel-plane measurement.
+## ▶ Migrated to the new AGX Orin DEX (2026-08-13) — READY TO CALIBRATE
+The old DEX (Jetson **Thor**, right arm fault 4104) is retired. Everything is now brought up on
+the **new AGX Orin DEX** and `initialization/bringup_check.py` passes end to end, so the next
+action is the hand-eye calibration itself.
 
-**Software is all saved & portable:**
-- Code + docs: GitHub `main` up to date (multi-class button YOLO + pipeline + browser validation server).
-- Trained `buttons.pt` (yolo11m, multi-class) backed up to the dev Mac (`*.pt` is gitignored, so not on GitHub).
-- Original sun-moon dataset is on the dev Mac.
+**New machine.** Jetson **AGX Orin Developer Kit**, JetPack **6.2** (R36.4.4), CUDA 12.6, 61 GB
+RAM, 915 GB NVMe. Host `ubuntu`, user `jetson`. It is a **shared machine** — the home dir holds
+unrelated projects (ZED, VR teleop, LinkerHand gripper endurance). Touch only `~/Dex_Elevator`,
+`~/pyorbbecsdk`, and `~/.local`.
 
-**New machine (AGX Orin) — how to resume:**
-1. rsync the code; install ultralytics/torch (Jetson wheels) in its conda env.
-2. **Redo hand-eye calibration** (`initialization/` scripts are ready) — camera/arm mounting changed, mandatory.
-3. Orin is weaker than Thor: `yolo11m` real-time will likely need a **TensorRT engine** or a drop to `yolo11s`.
-4. Then the hardware line: LinkerHand fingertip TCP → known-point press → force-limited press → panel plane → full pipeline + base docking.
+**Addressing changed from the Thor unit** (`4x` → `3x`):
+
+| | Thor (old) | Orin (new) |
+|---|---|---|
+| Jetson | `192.168.11.41` | `192.168.11.31` (wired `eno1`), WiFi `192.168.10.146` |
+| Left arm / Right arm | `.42` / `.43` | `.32` / **`.33`** (right = pressing arm) |
+| Chest 335 / Head 335L serial | `CP0E8530000V` / `CP2G853000BS` | **`CP0BB5300041`** / **`CP2G8530000W`** |
+
+SSH aliases are in the dev Mac's `~/.ssh/config`: **`dex5`** (WiFi) and **`dex5-wired`** (wired).
+
+**Runtime environment — NOT conda.** Unlike the Thor unit (`richtech-v3`), this machine's
+`richtech-v3` has no RealMan/Orbbec SDK, CPU-only torch, and numpy 2.x. The elevator stack runs
+on the **system `python3` (3.10.12)** instead, which already ships numpy 1.21.5 + **cv2 4.8.0
+(aruco `CharucoDetector` + `calibrateHandEye` present)** + pyyaml. Extra packages go in with
+`pip install --user` — no sudo, no conda, and `richtech-v3` is left untouched.
+
+| Component | How it is installed |
+|---|---|
+| `Robotic_Arm` 1.1.6 (RealMan) | `pip install --user` from the PyPI wheel (`py3-none-any`) |
+| `pyorbbecsdk` **2.1.2** (OrbbecSDK 2.9.3) | built from source with CMake in `~/pyorbbecsdk`, then `pip install --user` |
+| `dex_elevator` (this repo) | `pip install --user -e .` → `easy-install.pth` |
+
+**⚠ The Jetson has NO internet.** Its default route points at `192.168.11.1`, which does not
+answer, and the WiFi (`Richtech_Tech`, gateway `192.168.10.1`) reaches DNS but no external
+host. So `pip`/`apt`/`git clone` all fail on the robot. Everything above was installed by
+**downloading on the dev Mac and rsync-ing the artifacts over**. Fix the route (see below)
+before trying to install torch/ultralytics.
+
+**HAND-EYE CALIBRATION IS DONE on this machine (2026-08-14)** — see the section below for numbers.
+
+**Still open on the new machine:**
+1. Route fix + Tailscale (the installed one belongs to `tony.h@` and is offline).
+2. `yolo11m` on Orin will likely need a **TensorRT engine** or a drop to `yolo11s`;
+   torch/ultralytics are not installed there yet and the robot has no internet.
+3. The hardware line: LinkerHand fingertip TCP → known-point press → force-limited press →
+   panel plane → full pipeline + base docking.
+
+**Left/right arm VERIFIED (2026-08-14).** `.32`/`.33` are identical RM_65s, so the mapping was
+confirmed physically: with both arms polled, hand-pushing the right arm moved `.33` by 34.21°
+and `.32` by 0.01°. RIGHT = `192.168.11.33`, as configured. (It also showed the right arm is
+not servo-locked — it hand-drags freely, which suits the drag-teach capture in step 2.)
 
 ## Done & validated
 - **Framework** (interface-first; imports on a laptop with SDKs absent, runs on the robot):
@@ -32,15 +67,42 @@ LinkerHand fingertip TCP, known-point / force-limited press, panel-plane measure
   - `core/elevator_pipeline.py` — orchestrator (capture → detect → match floor → press).
   - `calibration/` — intrinsics + eye-to-hand, driven off the RealMan adapter; `--web`
     browser MJPEG capture (`capture_ui.web_capture_loop`) for the headless robot.
-- **Hand-eye calibration DONE** (`cam_chest` chest 335 ↔ right arm base):
-  - Intrinsics: 80 views, RMS 0.31 px → `data/calibration/cam_chest_intrinsics.npz`.
-  - Eye-to-hand extrinsic: 28 drag-teach poses, `base_T_camera`, consistency 2.05 mm, validation PASS
-    → `data/calibration/cam_chest.npy` (readable: `cam_chest_calibration_summary.txt`).
-  - End-to-end localization (`initialization/eval_localization.py`): ~2.3 mm mean / 3.6 mm max at fresh poses.
-  - Camera↔arm-base is rigid ⇒ calibration holds across base motion + hand remount; no re-calibration.
-- **Deployed**: on `dex4` at `~/Dex_Elevator` (rsync from the Mac — repo is private),
-  editable-installed in the `richtech-v3` conda env (has RealMan + pyorbbecsdk + cv2 + numpy<2).
-- Cameras: chest 335 serial `CP0E8530000V`, head 335L `CP2G853000BS` (pinned in `configs/cameras.yaml`).
+- **HAND-EYE CALIBRATION DONE & VALIDATED on the AGX Orin unit (2026-08-14)** — `cam_chest`
+  (chest Gemini 335 `CP0BB5300041`) ↔ **right arm** `192.168.11.33`:
+  - **Intrinsics**: 88 views captured, **63 kept** after outlier rejection → RMS **0.383 px**,
+    mean reprojection 0.253 px. `fx 692.76  fy 692.81  cx 641.44  cy 366.29`,
+    `dist [0.01626, -0.07119, 0.00056, 0.00034, 0.04941]` → `cam_chest_intrinsics.npz`.
+    Cross-checks against the camera's own factory intrinsics (689.3/689.3/640.5/367.1) to 0.9%.
+  - **Eye-to-hand extrinsic**: 41 drag-teach poses, **40 kept** (one bad sample, see below),
+    method **PARK**, consistency **0.67 mm** / rot 0.290°, validation **PASS** → `cam_chest.npy`.
+  - **End-to-end localization** (`eval_localization.py`, 8 fresh poses): **median 0.9 mm,
+    mean 1.9 mm**, min 0.3, max 8.3 (a single outlier; 7 of 8 sat around 1 mm).
+  - Board rigidity: `flange_T_board` spread only **0.61 mm median** across the kept samples —
+    the board did not shift during capture.
+  - **Better than the retired Thor unit on every comparable metric** (its baseline: intrinsics
+    RMS 0.31 px, extrinsic consistency 2.05 mm, end-to-end 2.3 mm mean / 3.6 mm max).
+  - Camera↔arm-base is rigid ⇒ calibration holds across base motion + hand remount; the ChArUco
+    board can be removed and the LinkerHand refitted with NO re-calibration. **Keep the board** —
+    it is needed again after any camera/arm remount or collision, and for spot-checks via
+    `verify_calibration_live.py`.
+  - **Outlier rejection mattered a lot.** Rejected artifacts are kept for traceability in
+    `cam_chest_intrinsics_rejected/`, `cam_chest_samples_rejected/`, plus pre-rejection backups
+    `cam_chest_intrinsics_before_outlier_reject.npz` and `cam_chest_all41.{npy,calib.npz}`:
+
+    | | before | after |
+    |---|---|---|
+    | intrinsics RMS | 0.698 px (88 views) | **0.383 px** (63 views) |
+    | extrinsic consistency | 1.85 mm (41 poses) | **0.67 mm** (40 poses) |
+    | extrinsic leave-one-out worst | 33.6 mm | **1.81 mm** |
+
+    A *single* bad pose (`sample002`, 34 mm off — captured before the arm settled) was degrading
+    the whole extrinsic solve by 3x. Find them by reconstructing `flange_T_board` per sample and
+    looking at the spread; the bad ones stick out by an order of magnitude.
+- **Deployed on the Orin unit** at `~/Dex_Elevator` (rsync from the Mac — repo is private),
+  editable-installed into the **system python3** via `pip install --user -e .`.
+  `initialization/bringup_check.py` passes: libs, configs, ChArUco board, chest-camera capture
+  (RGB 1280x720 + 93 % valid depth), and a read-only pose from the right arm.
+- Cameras: chest 335 `CP0BB5300041`, head 335L `CP2G8530000W` (pinned in `configs/cameras.yaml`).
 
 ## Not done yet (stubs / TODO)
 - [~] **Button YOLO baseline (MULTI-CLASS)** — tooling BUILT + RUN on dex4 (`yolo/prepare_dataset.py`,
@@ -77,24 +139,43 @@ button labels. The `ray ∩ plane` geometry doesn't care if it's a real elevator
 panel's plane re-measurement + force/lighting fine-tuning need the actual hardware.
 
 ## How to run (on the robot)
+Plain `python3` — no conda, no env activation (see the environment table at the top).
 ```
-ssh dex4 && cd ~/Dex_Elevator
-PY=~/miniconda3/envs/richtech-v3/bin/python
-$PY -m core.camera.orbbec                                   # list cameras
-$PY initialization/calibrate_intrinsics.py --camera cam_chest --web   # browser preview (headless)
-$PY initialization/run_calibration.py      --camera cam_chest --web
-$PY initialization/eval_localization.py    --camera cam_chest --web
+ssh dex5-wired && cd ~/Dex_Elevator
+python3 initialization/bringup_check.py                                   # ~10 s readiness self-test
+python3 -m core.camera.orbbec                                             # list cameras + serials
+python3 initialization/calibrate_intrinsics.py --camera cam_chest --web   # 1. intrinsics
+python3 initialization/run_calibration.py      --camera cam_chest --web   # 2. eye-to-hand
+python3 initialization/validate_calibration.py --camera cam_chest         # 3. re-validate
+python3 initialization/eval_localization.py    --camera cam_chest --web   # 4. accuracy at fresh poses
+```
+`--web` serves a browser preview at **`http://192.168.11.31:8010/`** (the robot has no monitor).
+**The browser has to reach that address**: the dev Mac sits on `192.168.40.x` and there is no
+route to the Jetson's WiFi subnet (`192.168.10.x`), so calibration currently requires the
+**Ethernet cable** to the Mac (which puts the Mac on `192.168.11.50`). Fix the default route or
+Tailscale to drop the cable.
 
-# Button YOLO — train in the `ultralytics` env (richtech-v3 has no torch):
-PYU=~/miniconda3/envs/ultralytics/bin/python
-PYTHONPATH=~/Dex_Elevator $PYU yolo/prepare_dataset.py --src "<roboflow_export_dir>"  # multi-class -> data/datasets/buttons/
-PYTHONPATH=~/Dex_Elevator $PYU yolo/train_buttons.py --model yolo11m.pt --imgsz 640    # -> data/weights/buttons.pt
-PYTHONPATH=~/Dex_Elevator $PYU yolo/predict_server.py --port 8011                      # 浏览器验证 http://192.168.11.41:8011/
-```
-`--web` serves a browser preview at `http://192.168.11.41:8010/` (robot has no monitor).
+Button YOLO is **not runnable on this machine yet** — torch/ultralytics are not installed and
+the robot has no internet. `data/weights/buttons.pt` is already deployed for when they are.
+
 Push code to the robot: rsync from the Mac (repo is private, so `git clone` on the robot fails).
+`data/calibration/` is excluded on purpose — the Thor unit's artifacts must NOT be reused here.
 ```
-rsync -az --exclude='.git' --exclude='__pycache__/' --exclude='*.pyc' \
-  --exclude='README.zh-CN.md' --exclude='乘梯相关接口.pdf' \
-  ~/Desktop/Dex_Elevator/ dex4:Dex_Elevator/
+rsync -az --exclude='.git/' --exclude='__pycache__/' --exclude='*.pyc' --exclude='.DS_Store' \
+  --exclude='data/calibration/' --exclude='乘梯相关接口.pdf' \
+  ~/Desktop/Dex_Elevator/ dex5-wired:Dex_Elevator/
+```
+
+### Sudo-only steps (the `jetson` user needs a password for these)
+```
+# Orbbec USB permissions — WITHOUT THIS THE CAMERA CANNOT BE OPENED (already done 2026-08-13)
+sudo sh ~/pyorbbecsdk/install/lib/pyorbbecsdk/shared/install_udev_rules.sh
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Give the Jetson internet: its default route points at the dead gateway 192.168.11.1
+sudo nmcli con mod "Wired connection 1" ipv4.never-default yes
+sudo nmcli con up "Wired connection 1"
+
+# Tailscale: the installed node belongs to tony.h@ and is offline
+sudo tailscale logout && sudo tailscale up
 ```

@@ -77,7 +77,17 @@ def _detector_params(accurate: bool):
         p.adaptiveThreshWinSizeMax = 75
         p.adaptiveThreshWinSizeStep = 4
         p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        p.cornerRefinementWinSize = 20
+        # 5, NOT 20. A 20 px refinement window makes neighbouring markers' search
+        # areas overlap once the board covers less than ~40% of the frame; the
+        # marker corners get dragged onto the wrong edges and ChArUco interpolation
+        # then yields ZERO corners — while detectMarkers still happily reports
+        # ~60 markers, so it looks like a board/lighting problem, not a parameter
+        # one. Measured on a 60-image set: win20 gave 0 corners on 54 of 60 images
+        # (the 6 survivors were simply the closest shots); win10/5/3 and
+        # REFINE_NONE all gave the full 46-102 corners on every one of them.
+        # Final ChArUco corner accuracy comes from _refine()'s cornerSubPix pass
+        # anyway, which is why shrinking this costs nothing.
+        p.cornerRefinementWinSize = 5
         p.cornerRefinementMaxIterations = 100
         p.cornerRefinementMinAccuracy = 0.01
         p.detectInvertedMarker = True

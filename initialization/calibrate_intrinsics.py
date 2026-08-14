@@ -65,6 +65,10 @@ def main() -> None:
                              "headless robot; open http://<robot-ip>:<web-port>/ on any machine on the LAN")
     parser.add_argument("--web-port", type=int, default=8010, help="port for the --web preview")
     parser.add_argument("--no-validate", action="store_true", help="skip post-calibration validation")
+    parser.add_argument("--resume", action="store_true",
+                        help="load the views already in the capture dir and keep shooting from "
+                             "there, instead of wiping them. Use this to add coverage to an "
+                             "existing set, or to recover a session whose process died.")
     args = parser.parse_args()
 
     out = args.out or f"{args.camera}_intrinsics.npz"
@@ -116,8 +120,19 @@ def main() -> None:
             calib = intrinsics_from_camera(camera)
             print("Using Orbbec factory intrinsics.")
         else:
-            # Start fresh so a re-run doesn't mix with stale images.
-            if images_dir.exists():
+            if args.resume and images_dir.exists():
+                # Re-load previous views so more can be added to them. Disk holds
+                # BGR (see on_capture); frames[] is RGB. New views keep numbering
+                # from len(frames), so nothing is overwritten.
+                for p in sorted(images_dir.glob("img*.png")):
+                    bgr = cv2.imread(str(p))
+                    if bgr is None:
+                        continue
+                    frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                    saved.append(p)
+                print(f"resumed {len(frames)} existing view(s) from {images_dir}")
+            elif images_dir.exists():
+                # Start fresh so a re-run doesn't mix with stale images.
                 for old in images_dir.glob("img*.png"):
                     old.unlink()
             print("Move the board to cover the frame (corners + tilts; mostly angled "

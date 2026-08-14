@@ -39,8 +39,13 @@ except ImportError:  # pragma: no cover - SDK is an optional runtime dep
     _SDK_AVAILABLE = False
 
 
-# Color formats we can decode to RGB, in preference order (most direct first).
-_FORMAT_PREFERENCE = ("RGB", "BGR", "MJPG", "YUYV", "RGBA", "BGRA")
+# Color formats we can decode to RGB, in preference order.
+# MJPG first, deliberately: the Gemini 335 ADVERTISES uncompressed RGB at
+# 1280x720@30 but never delivers a frame on it (wait_for_frames just times out),
+# while MJPG — the device's own default profile — starts in ~0.5 s. Preferring
+# the "most direct" format therefore picks a legal-but-dead profile. cv2 decodes
+# MJPG cheaply and the compression is harmless for ChArUco corner detection.
+_FORMAT_PREFERENCE = ("MJPG", "RGB", "BGR", "YUYV", "RGBA", "BGRA")
 
 # One process-wide SDK Context (it owns the device manager). It must outlive any
 # DeviceList/Device handed out by query_devices() — a per-call Context gets GC'd
@@ -239,7 +244,10 @@ class OrbbecCamera(Camera):
         return self._intrinsics
 
     # -- capture ------------------------------------------------------------
-    def capture(self, retries: int = 10) -> CameraFrame:
+    def capture(self, retries: int = 40) -> CameraFrame:
+        # 40, not 10: with depth enabled the Gemini 335 delivers ~11 depth-only
+        # framesets before colour syncs in (still only ~0.5 s total, so this is a
+        # frameset count, not a timeout). Colour-only streams hit on the first try.
         if self._pipeline is None:
             raise RuntimeError("Camera not started; call start() first.")
 
