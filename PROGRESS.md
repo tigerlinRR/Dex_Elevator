@@ -27,6 +27,40 @@ the button pixels come from Hough circles, not YOLO. Both were held constant on 
 a failed press could only be a geometry or motion problem. That paid off — every failure this
 session was diagnosable.
 
+### The robot is standalone, and YOLO now runs on its GPU (2026-08-20)
+
+Nothing on the dev Mac is involved at run time — camera, arm, hand, pressing and button
+detection all execute on the Orin. The Mac is only a terminal.
+
+Button inference was moved off Ultralytics onto a **TensorRT FP16 engine**
+(`yolo/trt_detector.py`), which changed it from "offline check only" to real-time:
+
+| | per frame | |
+|---|---|---|
+| Ultralytics + the Orin's CPU-only torch | 491 ms | 2.0 FPS |
+| **TensorRT FP16, end to end** | **43 ms** | **23 FPS** |
+| — of which GPU compute | 6.4 ms | 157 FPS |
+
+23 FPS against a 30 FPS camera means **continuous perception is no longer performance-bound**:
+tracking the panel while the base moves, and visual servoing, are both open now. The parked-base
+restriction stays only because the perception ACCURACY problem below is unsolved.
+
+**The point of the design: torch was never touched.** `torch` on the Orin is the generic
+aarch64 **CPU-only** wheel, and it lives in the shared `~/.local` where `~/mmdetection`
+(a colleague's project) imports the same install — swapping in NVIDIA's JetPack build would
+change another project's environment underneath it. JetPack already ships TensorRT 10.3 with
+working Python bindings, and TensorRT does not involve torch, so the route is
+`buttons.pt -> ONNX -> .engine` with torch used only for the one-off export.
+
+| added | where | effect on other projects |
+|---|---|---|
+| `onnx` + `protobuf 5.28` | unpacked (not pip-installed) into `~/Dex_Elevator/.pydeps-onnx`, on `PYTHONPATH` only when exporting | **none** — verified that a clean cwd and `~/mmdetection` still see protobuf 3.12.4 |
+| `cuda-python` 12.6.2 | `~/.local` (`pip install --user --no-deps`) | none — new package, no conflicts |
+| numpy 2.2.6 | **NOT installed** | `onnx` wanted it; it would have broken cv2 4.8 and pyorbbecsdk |
+
+The engine (`data/weights/buttons_fp16.engine`, 44.5 MB, 612 s to build) is **per-GPU and not
+portable** — rebuild it after any machine or TensorRT change. Commands are in the module docstring.
+
 The old DEX (Jetson **Thor**, right arm fault 4104) is retired; everything below runs on the
 **AGX Orin DEX**.
 
@@ -57,11 +91,22 @@ on the **system `python3` (3.10.12)** instead, which already ships numpy 1.21.5 
 | `pyorbbecsdk` **2.1.2** (OrbbecSDK 2.9.3) | built from source with CMake in `~/pyorbbecsdk`, then `pip install --user` |
 | `dex_elevator` (this repo) | `pip install --user -e .` → `easy-install.pth` |
 
-**⚠ The Jetson has NO internet.** Its default route points at `192.168.11.1`, which does not
-answer, and the WiFi (`Richtech_Tech`, gateway `192.168.10.1`) reaches DNS but no external
-host. So `pip`/`apt`/`git clone` all fail on the robot. Everything above was installed by
-**downloading on the dev Mac and rsync-ing the artifacts over**. Fix the route (see below)
-before trying to install torch/ultralytics.
+**⚠ The Jetson has NO internet, and the Ethernet cable is the ONLY way in.** Re-checked
+2026-08-20: the default route points at `192.168.11.1`, which does not answer, **and its WiFi
+is associated with a printer's access point** (`Brother HL-L3275`, `192.222.10.133/24`) — that
+is the actual reason there is no internet. The `Richtech_Tech` / `192.168.10.146` address in
+earlier notes is **stale and does not respond**. The robot scans only that one SSID, and
+`nmcli dev wifi rescan` returns `not authorized`, so re-pointing it needs the user's password.
+
+So `pip`/`apt`/`git clone` all fail on the robot; everything above was installed by
+**downloading on the dev Mac and rsync-ing the artifacts over**. And **pulling the Mac's cable
+cuts off all remote access** — the robot itself keeps running, but no scripts, captures or
+`--web` preview. To go cable-free, either put the robot's WiFi on the same network as the Mac
+or fix Tailscale (both need sudo — see the bottom of this file).
+
+Watch out when checking this from the Mac: its `en0` is `192.168.11.50` with a **/16** netmask,
+so `route -n get 192.168.10.x` reports "via en0" for addresses that are not reachable at all.
+Test with a real connection attempt, never a route lookup.
 
 **HAND-EYE CALIBRATION IS DONE on this machine (2026-08-14)** — see the section below for numbers.
 
@@ -95,11 +140,33 @@ candidate.
 
 ### Next, in order
 
-1. **Fine-tune YOLO on our own cam_chest captures.** The CC BY baseline labels our embossed
-   metal buttons `empty` — the public data is backlit plastic panels, ours are brushed steel with
-   raised digits. Hough circles stand in for now (`yolo/button_circles.py`), which finds *where*
-   the buttons are but not *which floor*, so the label→button mapping is currently a hard-coded
-   grid. That mapping is the one remaining hard-coded thing and it must go.
+1. **Fine-tune YOLO on our own cam_chest captures.** Re-measured 2026-08-20, per button, on a
+   live frame — the baseline is **right on every marking that is actually legible** and wrong
+   only where the marking is barely in the image:
+
+   | button | marking | model says |
+   |---|---|---|
+   | `A` | yellow alarm bell (colour) | `alarm` **0.97** ✓ |
+   | `close` / `open` | arrow symbols | `close` **0.98** / `open` **0.93** ✓ |
+   | `2` | digit, happens to be legible | `2` **0.86** ✓ |
+   | blank disc | none | `empty` **0.98** ✓ (correct — nothing to read) |
+   | `5` `6` `3` `4` | laser-etched into brushed steel | `empty` / `12` / `15` / `37` ✗ |
+   | `1` | green star overlapping the digit | `15` ✗ |
+
+   So this is **not** a metal-vs-plastic domain gap; it is a marking-contrast problem. Ruled
+   out by measurement, not assumption: exposure (swept 50–190, best 3/8, and the low end is
+   *worst* at 0/8), upscaling (imgsz 640/1280/1920 — 1920 is worse), CLAHE, and unsharp
+   masking (makes every button `empty`). Fine-tuning on our own captures is the remaining
+   lever — **light DIRECTION is**. Turning the room light off and re-sweeping exposure took
+   per-button contrast from **18.2 to 26.0 (+43 %)** and 3/8 to 4/8, and made `5`/`6`/`3`/`4`
+   legible to a human for the first time. The digits are a shadow feature, so a broad overhead
+   source fills the etch and erases them. **Fit a grazing light to the robot** — a real lobby's
+   ceiling lighting is exactly the bad case and we do not control it; "turn the room light off"
+   is a diagnostic, not a plan. Then capture and fine-tune under that light.
+   Hough circles stand in meanwhile (`yolo/button_circles.py`), which finds *where* the
+   buttons are but not *which floor*, so the label→button mapping is a hard-coded grid. That
+   mapping is the one remaining hard-coded thing and it must go.
+   **Speed is already solved** — see the TensorRT section above; this is purely an accuracy item.
 2. **Press after driving.** Everything is already live-measured per approach (plane fit + button
    3D), so re-docking should work without code changes — but it has never been tried.
 3. Two-stage path for the awkward buttons: `close` is reachable from only 14 of 24 rolls and `2`
@@ -208,6 +275,19 @@ not servo-locked — it hand-drags freely, which suits the drag-teach capture in
     even at 2 mm push. Circle centres fixed it at 2 mm; 3 mm is the production value.
   - Buttons are located ONCE per sequence and cached (base and panel are static mid-sequence);
     re-detecting per button only added failure chances.
+- **GPU button inference (2026-08-20)** — `yolo/trt_detector.py`, TensorRT FP16, 43 ms/frame
+  (23 FPS) vs 491 ms on the CPU-only torch, with no change to the shared torch install.
+  Two results worth keeping, both of which contradicted a reasonable prediction:
+  - **Zero-copy is not automatically right on a Jetson.** Mapped host buffers remove the
+    copies, but the GPU then reads/writes *uncached* memory and its compute goes 6.4 -> 13.2 ms.
+    Against `cudaMalloc` + pinned staging it is a near-tie (43.2 vs 44.9 ms, A/B'd twice
+    interleaved) — the prediction that pinned+device would win clearly was wrong. Only plain
+    pageable `cudaMemcpy` is clearly bad (42 ms of pure copying for 17 MB of tensors).
+  - **Jetson benchmarks must be warmed up.** The CPU governor is `schedutil` and the GPU idles
+    at 306 MHz, so the first thing measured in a process pays for the clock ramp — this
+    produced a step-by-step profile summing to 10 ms for a call that took 26 ms. Discard
+    120-150 iterations, and instrument the real call rather than timing steps in isolation
+    (isolated timings are optimistic: the real loop's per-frame writes evict the cache).
 - Cameras: chest 335 `CP0BB5300041`, head 335L `CP2G8530000W` (pinned in `configs/cameras.yaml`).
 
 ## Not done yet (stubs / TODO)
@@ -275,8 +355,18 @@ route to the Jetson's WiFi subnet (`192.168.10.x`), so calibration currently req
 **Ethernet cable** to the Mac (which puts the Mac on `192.168.11.50`). Fix the default route or
 Tailscale to drop the cable.
 
-Button YOLO is **not runnable on this machine yet** — torch/ultralytics are not installed and
-the robot has no internet. `data/weights/buttons.pt` is already deployed for when they are.
+Button YOLO runs **on the GPU** through TensorRT directly (`yolo/trt_detector.py`),
+43 ms/frame:
+
+```
+python3 -c "import sys; sys.path.insert(0,'.'); import cv2
+from yolo.trt_detector import TrtButtonDetector
+d = TrtButtonDetector(); print(d.detect(cv2.imread('some_frame.png')))"
+```
+
+The system torch/ultralytics are present but **CPU-only** (491 ms/frame) — they are used only
+for the offline `buttons.pt -> ONNX` export, never in the loop. Rebuild the engine after any
+machine change (it is not portable); commands are in the module docstring.
 
 Push code to the robot: rsync from the Mac (repo is private, so `git clone` on the robot fails).
 `data/calibration/` is excluded on purpose — the Thor unit's artifacts must NOT be reused here.
@@ -292,7 +382,12 @@ rsync -az --exclude='.git/' --exclude='__pycache__/' --exclude='*.pyc' --exclude
 sudo sh ~/pyorbbecsdk/install/lib/pyorbbecsdk/shared/install_udev_rules.sh
 sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# Give the Jetson internet: its default route points at the dead gateway 192.168.11.1
+# Give the Jetson internet AND let it be reached without the Ethernet cable.
+# Its WiFi is currently on a PRINTER's access point (Brother HL-L3275, 192.222.10.133),
+# it scans only that SSID, and a user-level rescan is refused ("not authorized").
+sudo nmcli dev wifi list                                    # can it even see the office WiFi?
+sudo nmcli dev wifi connect "<SSID>" password "<password>"
+# and stop the dead wired gateway from being the default route:
 sudo nmcli con mod "Wired connection 1" ipv4.never-default yes
 sudo nmcli con up "Wired connection 1"
 

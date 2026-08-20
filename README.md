@@ -50,6 +50,7 @@ the vision only needs to give a reliable button pixel and its floor label.
 | Camera (scene) | Orbbec Gemini 335L (head) | navigation; not used for pressing yet |
 | Compute | NVIDIA Jetson AGX Orin (`ssh dex5-wired`) | JetPack 6.2 / CUDA 12.6; runs the SDKs + inference |
 | Detection | Ultralytics YOLO11m | multi-class (per floor: `1`,`2`,`B1`,`G`…) — detects AND identifies; trained from CC BY data (`yolo/`, `DATASETS.md`) |
+| Inference | **TensorRT FP16** on the Orin's GPU | 43 ms/frame (23 FPS) via `yolo/trt_detector.py`; the machine's torch is CPU-only and is deliberately left alone |
 | Calibration | intrinsics + eye-to-hand (ChArUco) | once per camera, shared (`calibration/`) |
 | Press geometry | ray ∩ panel-plane | pure geometry, no learned model (`core/press.py`) |
 
@@ -66,7 +67,7 @@ Dex_Elevator/
 │   ├── camera/             # Camera interface + Orbbec driver (serial/name select) + manager
 │   └── robot/              # RobotArm interface + RealMan adapter + Sim (headless)
 │   └── hand/               # LinkerHand O6 over the arm's tool-side Modbus RS485
-├── yolo/                   # ButtonDetector + Hough-circle button finder + dataset prep & training (YOLO11)
+├── yolo/                   # ButtonDetector, TensorRT GPU detector, Hough-circle finder, dataset prep & training
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
 ├── initialization/         # bring-up check, calibration + eval scripts, and press_buttons.py (the presser)
 ├── configs/                # cameras.yaml, pipeline.yaml
@@ -165,6 +166,29 @@ PYTHONPATH=~/Dex_Elevator $PY yolo/train_buttons.py --model yolo11m.pt --imgsz 6
 PYTHONPATH=~/Dex_Elevator $PY yolo/predict_server.py --port 8011   # open http://<robot-ip>:8011/
 ```
 
+## Usage — GPU inference (TensorRT)
+
+On the Orin, `torch` is the generic aarch64 **CPU-only** wheel, so Ultralytics needs 491 ms per
+frame. It is deliberately not replaced — that install is shared with another project on the
+machine. Instead the model runs through JetPack's own TensorRT, which does not involve torch:
+
+```python
+from yolo.trt_detector import TrtButtonDetector
+det = TrtButtonDetector()          # data/weights/buttons_fp16.engine
+dets = det.detect(bgr)             # 43 ms/frame — same Detection list as ButtonDetector
+```
+
+Build the engine once **per machine** (engines are tuned for the specific GPU and are not
+portable; ~10 min):
+
+```bash
+PYTHONPATH=~/Dex_Elevator/.pydeps-onnx python3 -c \
+  'from ultralytics import YOLO; YOLO("data/weights/buttons.pt").export(
+       format="onnx", imgsz=640, opset=17, simplify=False, dynamic=False)'
+/usr/src/tensorrt/bin/trtexec --onnx=data/weights/buttons.onnx \
+    --saveEngine=data/weights/buttons_fp16.engine --fp16
+```
+
 ## Status
 
 **Pressing works (2026-08-20).** From a fixed home pose the robot locates the panel and its
@@ -202,6 +226,14 @@ degrading the extrinsic solve 3x; rejected views/samples are kept alongside for 
 LinkerHand to the plunger **with no re-calibration** — but keep the ChArUco board for future
 remounts and spot-checks.
 
+**Button detection runs on the GPU (2026-08-20)** — 43 ms/frame (23 FPS) end-to-end through a
+TensorRT FP16 engine, against 491 ms for Ultralytics on the machine's CPU-only torch. At 23 FPS
+against a 30 FPS camera, continuous perception is no longer performance-bound; the parked-base
+restriction now exists only because of detection *accuracy*, not speed.
+
+The robot is **fully standalone** — camera, arm, hand, pressing and detection all run on the
+Orin, with the dev Mac acting only as a terminal.
+
 Also working: `initialization/bringup_check.py` (10 s readiness self-test), live panel-plane
 fitting (4.8 ms, repeats to 1.1 mm), LinkerHand O6 control on both arms, Orbbec serial/name
 selection, the `--web` browser capture UI.
@@ -211,10 +243,15 @@ mapping was confirmed by hand-pushing the right arm while polling both — `.33`
 34.21°, `.32` moved 0.01°. RIGHT = `192.168.11.33`.
 
 Still to do:
-- **Fine-tune the button YOLO on our own cam_chest captures.** The CC BY baseline (yolo11m,
-  multi-class, common-floor val mAP50 ≈ 0.7–0.85) labels our embossed brushed-steel buttons
-  `empty`, so the label→button mapping in `press_buttons.py` is still a hard-coded grid. That
-  mapping is the last hard-coded thing and it needs to go.
+- **Fine-tune the button YOLO on our own cam_chest captures** — the remaining accuracy work.
+  Measured per button on our panel, the CC BY baseline is right on every marking that is
+  legible (`alarm` 0.97, `close` 0.98, `open` 0.93, `2` 0.86, blank disc correctly `empty`)
+  and wrong only where the marking is barely in the image (the laser-etched `5`/`6`/`3`/`4`).
+  Exposure is not the lever — **light direction is**: killing the room light raised per-button
+  contrast 18.2 → 26.0 and made those digits human-legible for the first time, because an
+  etched digit is a shadow feature that broad overhead light fills in. So: fit a grazing light
+  to the robot, then capture and fine-tune under it. Until then the label→button mapping in
+  `press_buttons.py` stays a hard-coded grid — the last hard-coded thing in the system.
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
 - **Press after driving and re-docking** — everything is already measured live per approach, but
   it has never been tried.

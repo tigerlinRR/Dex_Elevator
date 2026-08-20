@@ -27,16 +27,40 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
   LEFT `192.168.11.32`, RIGHT `192.168.11.33`, port `8080`. **Pressing uses the
   right arm.** Left/right **VERIFIED 2026-08-14**: hand-pushing the right arm while
   polling both moved `.33` by 34.21° and `.32` by 0.01°.
-- **Python is the SYSTEM `python3` (3.10.12), not conda.** It already has numpy 1.21.5,
+- **Python is the SYSTEM `python3` (3.10.12), not conda.** It has **numpy 1.26.4** and
   **cv2 4.8.0 with `aruco.CharucoDetector` + `calibrateHandEye`**, and pyyaml. Everything
   else is `pip install --user`: `Robotic_Arm` 1.1.6, `pyorbbecsdk` 2.1.2 (built from
-  source in `~/pyorbbecsdk`), and this repo (`pip install --user -e .`). This machine's
-  `richtech-v3` env is NOT usable here (no RealMan/Orbbec SDK, CPU-only torch) — leave it alone.
+  source in `~/pyorbbecsdk`), `cuda-python` 12.6.2, and this repo (`pip install --user -e .`).
+  This machine's `richtech-v3` env is NOT usable here (no RealMan/Orbbec SDK, CPU-only
+  torch) — leave it alone.
+- **The robot is FULLY STANDALONE.** Camera, arm, hand, pressing and GPU button
+  detection all run on the Orin with nothing on the dev Mac involved. The Mac is only
+  a terminal (and the only route to it is the Ethernet cable — see the network note).
+- **YOLO inference is TensorRT, not torch** (`yolo/trt_detector.py`). `torch` IS present
+  (2.10.0, ultralytics 8.4.121) but it is the generic aarch64 **CPU-only** wheel, so
+  Ultralytics gets 491 ms/frame. **Do not swap in NVIDIA's JetPack torch**: that install
+  lives in the shared `~/.local` and `~/mmdetection` imports it. JetPack's own TensorRT
+  10.3 (+ `cuda-python`) reaches 43 ms/frame end-to-end without touching torch at all.
+- **`onnx` lives OUTSIDE the package path on purpose** — unpacked into
+  `~/Dex_Elevator/.pydeps-onnx` and put on `PYTHONPATH` only for the one-off ONNX export.
+  It needs protobuf >= 3.20 while the system has 3.12.4 in `/usr/lib/python3/dist-packages`,
+  and installing a newer protobuf into `~/.local` would shadow it for **every** project on
+  this shared machine. Verified isolated: from a clean cwd, and inside `~/mmdetection`,
+  `protobuf` still reports 3.12.4.
 - **This is a SHARED machine.** The home dir holds unrelated projects (ZED, VR teleop,
   LinkerHand gripper endurance). Touch only `~/Dex_Elevator`, `~/pyorbbecsdk`, `~/.local`.
-- **The Jetson has NO internet** (default route → dead gateway `192.168.11.1`; its WiFi
-  reaches DNS but no external host). `pip`/`apt`/`git clone` fail on the robot — download
-  on the dev Mac and rsync the artifacts over.
+- **The Jetson has NO internet, and only the Ethernet cable reaches it.** Verified
+  2026-08-20: the default route points at the dead gateway `192.168.11.1`, and its WiFi is
+  **associated with a printer's access point** (`Brother HL-L3275`, `192.222.10.133/24`) —
+  which is the real reason there is no internet. The `192.168.10.146` / `Richtech_Tech`
+  address in older notes is **stale**. The robot also scans only that one SSID and
+  `nmcli dev wifi rescan` returns `not authorized`, so re-pointing the WiFi needs the user.
+  Consequence: **unplugging the Mac's cable cuts off all remote access** (the robot keeps
+  running fine on its own). `pip`/`apt`/`git clone` fail on the robot — download on the dev
+  Mac and rsync the artifacts over.
+  - Careful reading routes on the Mac: its `en0` is `192.168.11.50` with a **/16** netmask,
+    so `route get 192.168.10.x` cheerfully answers "via en0" for addresses that are not
+    reachable at all. Test with an actual connection, not a route lookup.
 - **`sudo` requires a password**, so any root step has to be handed to the user.
 - **Torso lift column** (RealMan lift API, mm) raises/lowers the upper body. The
   chest camera and arm bases ride it together, so `base_T_camera` stays constant.
@@ -154,6 +178,26 @@ YOLO, single class `button`) → `Detection` list; `centroid_pixel` gives the pr
 pixel; `read_floor_label` (**stub**) is the "which floor" reader — the real open
 problem, deliberately decoupled from the geometry so it can be swapped freely.
 
+**GPU button detection** (`yolo/trt_detector.py`) — `TrtButtonDetector` returns the same
+`Detection` list as `ButtonDetector`, but runs the model through a **TensorRT FP16 engine**
+instead of Ultralytics, because this Orin's torch is CPU-only (see the environment note).
+Measured: **43 ms/frame end-to-end (23 FPS)** vs 491 ms on CPU; the GPU part alone is 6.4 ms.
+That is fast enough for continuous perception (tracking the panel while the base moves,
+visual servoing), so being restricted to a parked base is no longer a performance limit.
+Building the engine is a two-step, **per-machine** offline job — engines are tuned for the
+specific GPU and are NOT portable, and it takes ~10 min:
+
+```bash
+PYTHONPATH=~/Dex_Elevator/.pydeps-onnx python3 -c \
+  'from ultralytics import YOLO; YOLO("data/weights/buttons.pt").export(
+       format="onnx", imgsz=640, opset=17, simplify=False, dynamic=False)'
+/usr/src/tensorrt/bin/trtexec --onnx=data/weights/buttons.onnx \
+    --saveEngine=data/weights/buttons_fp16.engine --fp16
+```
+
+Class names do not survive into the engine — `export_names()` writes them to
+`data/weights/buttons_names.json` alongside it.
+
 **Button-YOLO training tooling** (`yolo/prepare_dataset.py`, `yolo/train_buttons.py`,
 `yolo/buttons.yaml`): no in-house dataset exists yet, so the detector is bootstrapped from
 public **CC BY** Roboflow exports. **Multi-class by default** — each floor symbol keeps its own
@@ -225,6 +269,45 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   button was unreachable — single-button retests proved otherwise. Use
   `RealmanArm.move_joints_sync` / `move_line_sync`, which poll joints/TCP until
   arrival, retry 3x, and settle 0.35 s between moves.
+- **Never trust a Jetson benchmark that has not been warmed up.** The CPU governor is
+  `schedutil` and the GPU idles at 306 MHz, so **whatever is measured first in a process
+  pays for the clock ramp and everything after it looks faster**. This produced two wrong
+  numbers in one session, including a step-by-step profile whose parts summed to 10 ms for
+  a call that measured 26 ms. Discard 120-150 iterations before recording, and if the parts
+  do not add up to the whole, instrument the real call's own lines rather than timing the
+  steps in isolation — isolated timings are also systematically optimistic, because the
+  real loop's 4.9 MB/frame of writes evicts the cache that the isolated test kept warm
+  (`letterbox` measured 0.8 ms alone, 2.6 ms in place).
+- **Zero-copy is NOT automatically right on a Jetson.** Host and device share physical
+  memory, so mapped host buffers look like a free win — but the GPU then reads and writes
+  **uncached** memory, and its compute went 6.4 -> 13.2 ms. Against `cudaMalloc` + pinned
+  staging copies it is a near-tie (43.2 vs 44.9 ms end-to-end, A/B'd twice interleaved);
+  plain pageable `cudaMemcpy` is the only clearly bad option (42 ms just in copies for
+  17 MB of tensors). Both paths are kept behind `zero_copy=` in `trt_detector.py`.
+- **The public-data YOLO baseline is not "bad on our panel" — it is bad on LOW-CONTRAST
+  markings specifically.** Measured per button on a live cam_chest frame: `alarm` 0.97,
+  `close` 0.98, `open` 0.93, `2` 0.86, and the unmarked disc correctly `empty` 0.98 — but the
+  etched `5/6/3/4` come back as `empty`/`12`/`15`/`37`, and `1` (a green star overlapping the
+  digit) as `15`. **Whatever a human can read in the frame, the model reads correctly**; the
+  failures are buttons whose marking is barely present in the image. So do NOT describe the
+  baseline as "labels our buttons empty" — that misdiagnoses it as a metal-vs-plastic domain
+  gap when the real variable is marking contrast.
+  - **Exposure is NOT the lever; the LIGHT DIRECTION is.** Swept 50-190 (gain 16, room
+    light on): per-button contrast rises monotonically with exposure (11.0 -> 19.8) but the
+    correct count never exceeds 3/8, and the LOW end is worst (0/8 at exposure 50). Then
+    **turning the room light off** and re-sweeping: contrast **18.2 -> 26.0 (+43 %)** and
+    4/8 correct, with `5`/`6`/`3`/`4` becoming legible to a human for the first time. The
+    digits are laser-etched into brushed steel — a shadow feature, not an albedo one — so a
+    broad overhead source fills the etch from every direction and erases them, and no global
+    exposure can put them back. **A robot-mounted grazing light is the durable fix** (a real
+    lobby's ceiling lighting is exactly the bad case and we do not control it); "turn the
+    room light off" is a diagnostic, not a deployment plan.
+  - Also not levers, all measured: upscaling the crop (imgsz 640/1280/1920 on the same
+    175x335 crop — 1920 makes it *worse*, 6 detections -> 2), CLAHE (clip 2/4: digits still
+    wrong), and unsharp masking (turns every button into `empty` at 0.45-0.95).
+  - When testing crops, remember Ultralytics resizes to `imgsz`: upscaling a crop 4x and then
+    passing `imgsz=640` scales it straight back down. An early test "compared" native vs 4x
+    and got identical numbers for exactly this reason.
 - **Aim at the button CENTRE before touching `push_depth`.** A press that fails to
   actuate looks like "not enough force" but is usually "off centre": 2 mm on the
   chamfer does nothing, 2 mm on the centre nearly works. Fix the aim first, then the
@@ -300,11 +383,11 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
 
 - Button YOLO: tooling BUILT + a **multi-class** baseline trained (yolo11m — detects AND
-  identifies each floor) → `data/weights/buttons.pt` (already deployed on the Orin).
-  **Not runnable on the Orin yet**: torch/ultralytics are not installed there and the robot
-  has no internet, so the wheels must be fetched on the dev Mac and rsync-ed over. Expect to
-  need a TensorRT engine (exported on the Orin itself — engines are not portable) or a drop
-  to `yolo11s` for real-time. Then: fine-tune on our own cam_chest captures.
+  identifies each floor) → `data/weights/buttons.pt`, and **running on the Orin's GPU** via
+  `yolo/trt_detector.py` (TensorRT FP16, 43 ms/frame). Speed is DONE. Accuracy is not:
+  **measured on our panel 2026-08-20**, it is correct on every high-contrast marking and
+  useless on the low-contrast etched digits. Fine-tuning on our own cam_chest captures —
+  under a grazing light — is the remaining work.
 - Implement `read_floor_label` (OCR / multi-class / template) — the identification step.
 - **Wrist orientation for pressing.** The fingertip must approach along the panel's
   inward normal; parked by hand it sat 46.9° off, which would skid instead of press.

@@ -292,6 +292,10 @@ Log/
 Thumbs.db
 scratch/
 
+# Isolated third-party deps unpacked on the robot (onnx + a newer protobuf, kept OFF
+# the normal package path so they cannot shadow the shared machine's protobuf 3.12).
+.pydeps-onnx/
+
 # Claude Code git worktrees (local working copies, never committed)
 .claude/worktrees/
 
