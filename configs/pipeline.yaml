@@ -3,6 +3,24 @@
 
 arm:
   make: realman
+  # Single rest pose, used both for driving and as the pressing staging pose —
+  # operator confirmed this tuck is safe to drive with. Sequence per press:
+  #   home -> movej to standoff 50 mm -> movel contact -> movel push -> retract
+  #   -> movej back to home
+  #
+  # Chosen 2026-08-20 over two other candidates on two criteria:
+  #   1. the arm must NOT occlude the panel in the chest camera (YOLO needs the
+  #      whole faceplate) — here both tool point and plunger tip project OUTSIDE
+  #      the image entirely;
+  #   2. every button must stay reachable.
+  # Reachability from here (standoff 50 mm, 24 approach rolls swept) — nothing
+  # unreachable, including `close`, which the earlier candidate could not reach:
+  #   A 24/24 (165 deg)  dot 24/24   5 24/24 (155)  6 24/24
+  #   3 24/24 (142)      4 20/24     1 23/24 (129)  2  8/24 (138)
+  #   open 24/24 (117)   close 14/24 (116)
+  # Required joint travel (117-166 deg) is larger than the rejected candidate's
+  # (33-143), which is the price paid for not blocking the camera.
+  home_joints_deg: [39.76, -100.13, -79.28, -131.63, 117.0, 68.12]
   side: right              # the button-pressing arm (192.168.11.33 on the Orin unit)
   ip: "192.168.11.33"      # left/right VERIFIED 2026-08-14 (hand-push test)
   port: 8080
@@ -34,6 +52,26 @@ hand:
   # mounting clocking before trusting them. z is unaffected by that rotation.
   fingertip_offset: [0.01188, 0.02808, 0.17287]
 
+# End-effector used for PRESSING. The LinkerHand is still fitted (see `hand:`),
+# but pressing is done with a rigid spring plunger bolted to the flange instead of
+# a finger: no joints to damage, and the spring itself provides the compliance we
+# would otherwise need force control for.
+end_effector:
+  type: spring_plunger
+  # Plunger tip relative to what get_tcp_pose() reports — NOT relative to the
+  # flange. A tool frame with z=130 mm is already configured in the controller, so
+  # the flange-to-tip length of 154.0 mm measured by hand becomes 24 mm here.
+  #
+  # Calibrated 2026-08-20 by touching the tip against the `1` button and solving
+  #   offset = inv(base_T_tool) @ tip_3d
+  # where tip_3d comes from ray-plane against the BUTTON SURFACE (the live panel
+  # plane pushed out by the measured 2.3 mm button protrusion).
+  # Cross-check vs the hand measurement (6-1/16" axial, 9/8" radial):
+  #   axial  24.7 mm  vs  24.0 mm   -> 0.7 mm
+  #   radial 26.1 mm  vs  28.6 mm   -> 2.5 mm
+  # Skipping the protrusion correction biases the axial term +4.8 mm.
+  tcp_offset: [0.02600, -0.00191, 0.02474]
+
 button_yolo:
   weights: data/weights/buttons.pt   # TODO: train on the robot's ~/dataset; single class `button`
   conf: 0.25
@@ -55,7 +93,23 @@ elevator:
   panel:
     point:  [0.6818, -0.2508, 0.5661]   # reference only — live fit overrides
     normal: [-0.9997, 0.0072, 0.0248]   # reference only — live fit overrides
+  # Buttons stand 2.3 mm PROUD of the faceplate (measured from depth: faceplate
+  # -0.2 mm, buttons +2.0..+2.3 mm). So the plunger contacts the button 2.3 mm
+  # BEFORE reaching the fitted plane. Aiming at the plane with push_depth=0 would
+  # already overpress by 2.3 mm; the target is
+  #     plane_point + (button_protrusion - push_depth) * outward_normal
   press:
-    standoff: 0.06         # m backed off the panel before/after pressing
-    push_depth: 0.010      # m advanced past the face to actuate the button
+    standoff: 0.06           # m backed off the panel before/after pressing
+    button_protrusion: 0.0023  # m the button sits above the faceplate
+    # 3 mm, established on hardware 2026-08-20 by walking it up: 1 mm and 2 mm
+    # both failed to light the button, 3 mm lit it repeatably (2/2). The hand-felt
+    # estimate of 0.5-1 mm was well short — a hand pressing the button directly
+    # feels only the switch travel, while the plunger must ALSO compress its own
+    # spring, and that spring eats most of the stroke.
+    # Aim at the button CENTRE before adding depth: an early attempt at 2 mm failed
+    # purely because the target pixel was eyeballed ~2.5 px off, putting the tip on
+    # the button's chamfer. Hough-circle centres fixed that (see button_pixels).
+    # If a stiffer button ever needs more than ~5 mm, suspect the spring is too
+    # soft (compressing without transmitting force) rather than the stroke.
+    push_depth: 0.003
     up_hint: [0.0, 0.0, 1.0]

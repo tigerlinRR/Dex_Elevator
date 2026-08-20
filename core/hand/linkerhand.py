@@ -62,8 +62,10 @@ NUM_JOINTS = 6
 TOOL_PORT = 1
 CONTROLLER_PORT = 0
 
-# Slave address of the hand. 0x27/0x28 (right/left) on the ADAM robot — treat as
-# a starting guess here and confirm with probe().
+# Slave address of the hand. VERIFIED on the DEX by probe() 2026-08-17: the right
+# hand answers on the right arm's tool bus at 0x27, the left hand on the left arm's
+# at 0x28 — same numbering as the ADAM robot. Each arm has its own RS485 bus, so
+# the addresses need not have differed, but they do.
 DEFAULT_SLAVE_RIGHT = 0x27
 DEFAULT_SLAVE_LEFT = 0x28
 
@@ -72,6 +74,12 @@ DEFAULT_SPEED = 200
 # Presets copied verbatim from the robot's ~/hand.py (tuned on real hardware).
 # "point" is the one that matters here: index finger extended, everything else
 # curled — the pressing posture.
+# NOTE on "fist": the index finger settles around 70, not 0, and no amount of
+# re-commanding moves it — measured 69 on the right hand and 75 on the left, i.e.
+# two independent hands agree, so this is the mechanism, not a fault. All six
+# joints are sent at once, the thumb reaches 0 first and occupies the palm, and the
+# index then bottoms out against it. (A human fist puts the thumb OUTSIDE the
+# fingers.) Drive the thumb out first if a fully closed fist is ever needed.
 POSES: dict[str, list[int]] = {
     "open": [255, 60, 255, 255, 255, 255],
     "fist": [0, 60, 0, 0, 0, 0],
@@ -176,12 +184,22 @@ class LinkerHand:
         sdk = self.arm._require()
         for i, v in enumerate(values):
             v = max(0, min(255, int(v)))
-            code = sdk.rm_write_single_register(self._params(address + i, 1), v)
-            if code != 0:
+            last = None
+            # Retry: individual writes intermittently time out (code -2) when the
+            # RS485 link has just come up — e.g. right after an e-stop, since the
+            # hand is powered from the arm's tool connector and reboots with it.
+            # Reads succeed throughout, so this is line noise, not a bad address.
+            for attempt in range(3):
+                last = sdk.rm_write_single_register(self._params(address + i, 1), v)
+                if last == 0:
+                    break
+                time.sleep(0.05 * (attempt + 1))
+            if last != 0:
                 raise LinkerHandError(
-                    f"register write to addr {address + i} failed (code={code}); "
-                    f"slave=0x{self.slave:02x} port={self.port}. "
-                    "Run probe() to find the right slave/port."
+                    f"register write to addr {address + i} failed after 3 tries "
+                    f"(code={last}); slave=0x{self.slave:02x} port={self.port}. "
+                    "code=-2 is a comms timeout (try power_on() again); a wrong "
+                    "slave/port would fail on every register — check with probe()."
                 )
             time.sleep(0.03)
 

@@ -28,6 +28,9 @@ floors, the way a person does.
         │
         ▼
   RealMan right arm ── standoff · press · retract   (base does NOT move; lift sets height)
+        │
+        ▼
+  spring plunger on the flange ── presses the button (3 mm past the face)
 ```
 
 The mobile base docks **roughly** in front of the panel (repeatable, not precise);
@@ -41,7 +44,8 @@ the vision only needs to give a reliable button pixel and its floor label.
 |---|---|---|
 | Arm (pressing) | **RealMan RM 65**, right arm `192.168.11.33` | `Robotic_Arm` SDK; `core/robot/realman.py` |
 | Torso lift | vertical column (RealMan lift API) | reaches buttons at different heights |
-| End-effector | LinkerHand dexterous hand | driven separately; a fixed "pointing" pose presses |
+| End-effector (pressing) | **spring plunger** bolted to the flange | rigid, no joints to damage; the spring gives compliance without force control |
+| End-effector (other) | LinkerHand O6 dexterous hand | still fitted and controllable (`core/hand/linkerhand.py`), but not what presses |
 | Camera (buttons) | **Orbbec Gemini 335** (chest) | `core/camera/orbbec.py` (pyorbbecsdk v2) |
 | Camera (scene) | Orbbec Gemini 335L (head) | navigation; not used for pressing yet |
 | Compute | NVIDIA Jetson AGX Orin (`ssh dex5-wired`) | JetPack 6.2 / CUDA 12.6; runs the SDKs + inference |
@@ -61,9 +65,10 @@ Dex_Elevator/
 │   ├── elevator_pipeline.py# orchestrator: capture → detect → match floor → press
 │   ├── camera/             # Camera interface + Orbbec driver (serial/name select) + manager
 │   └── robot/              # RobotArm interface + RealMan adapter + Sim (headless)
-├── yolo/                   # ButtonDetector + floor-label reader (stub) + dataset prep & training (YOLO11)
+│   └── hand/               # LinkerHand O6 over the arm's tool-side Modbus RS485
+├── yolo/                   # ButtonDetector + Hough-circle button finder + dataset prep & training (YOLO11)
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
-├── initialization/         # calibration + eval scripts (intrinsics, extrinsics, validate, localization eval)
+├── initialization/         # bring-up check, calibration + eval scripts, and press_buttons.py (the presser)
 ├── configs/                # cameras.yaml, pipeline.yaml
 └── data/                   # weights/, calibration/ (gitignored)
 ```
@@ -121,6 +126,22 @@ python3 initialization/eval_localization.py --camera cam_chest --web
 See `calibration/README.md` and `initialization/README.md` for details, and
 `CLAUDE.md` for the architecture and gotchas.
 
+## Usage — pressing buttons
+
+Calibration must be done first. Without `--go` the script only locates the panel and
+plans, printing every target — always dry-run before letting it move.
+
+```bash
+python3 initialization/press_buttons.py 1 4 2 5            # plan only, no motion
+python3 initialization/press_buttons.py 1 4 2 5 --go       # press the sequence
+python3 initialization/press_buttons.py 1 --go --push=2    # override push depth (mm)
+```
+
+Each press is `home → standoff (50 mm) → linear approach through contact → retract → home`,
+with the joint-interpolated path checked for panel clearance beforehand. The panel plane and
+the button 3D positions are **measured live** from the current camera frame every run — nothing
+about the panel's position is stored, because the base docks with centimetres of error.
+
 ## Usage — button detector (YOLO)
 
 No in-house elevator dataset exists yet, so the detector is bootstrapped from public **CC BY**
@@ -146,8 +167,27 @@ PYTHONPATH=~/Dex_Elevator $PY yolo/predict_server.py --port 8011   # open http:/
 
 ## Status
 
-**Hand-eye calibration DONE & validated on the Jetson AGX Orin unit (2026-08-14)**
-(chest Gemini 335 ↔ right arm `192.168.11.33`):
+**Pressing works (2026-08-20).** From a fixed home pose the robot locates the panel and its
+buttons, then presses a requested sequence. Running `press_buttons.py 1 4 2 5 --go` lit **4 of
+4** buttons in 47.9 s, with depth error ≤0.05 mm and lateral error ≤0.28 mm against the
+commanded contact point — the whole chain (intrinsics, hand-eye extrinsic, live plane fit,
+plunger TCP, IK) agreeing at once. Reproduced twice.
+
+Scope is deliberately fixed there: the base does not move, and the button pixels come from
+Hough circles rather than YOLO. Both were held constant so that a failed press could only be a
+geometry or motion problem.
+
+Measured, not assumed:
+
+| quantity | value |
+|---|---|
+| button protrusion above the faceplate | 2.3 mm (from depth) |
+| push depth | 3 mm (1 and 2 mm failed to light the button; 3 mm lit it repeatably) |
+| usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
+| plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
+
+**Hand-eye calibration DONE & validated (2026-08-14)** (chest Gemini 335 ↔ right arm
+`192.168.11.33`):
 
 | | result |
 |---|---|
@@ -156,25 +196,29 @@ PYTHONPATH=~/Dex_Elevator $PY yolo/predict_server.py --port 8011   # open http:/
 | End-to-end localization | **median 0.9 mm, mean 1.9 mm** over 8 fresh poses |
 
 Better than the retired Thor robot on every comparable metric (its baseline: 0.31 px,
-2.05 mm, 2.3 mm mean). Saved to `data/calibration/cam_chest_intrinsics.npz` and
-`cam_chest.npy`. Outlier rejection was worth a lot — a single unsettled pose was
-degrading the extrinsic solve 3x; rejected views/samples are kept alongside for
-traceability. The ChArUco board can now be removed and the LinkerHand refitted **with no
-re-calibration** (`base_T_camera` is end-effector-independent) — but keep the board for
-future remounts and spot-checks.
+2.05 mm, 2.3 mm mean). Outlier rejection was worth a lot — a single unsettled pose was
+degrading the extrinsic solve 3x; rejected views/samples are kept alongside for traceability.
+`base_T_camera` is end-effector-independent, so the end-effector was swapped from the
+LinkerHand to the plunger **with no re-calibration** — but keep the ChArUco board for future
+remounts and spot-checks.
 
-Also working: `initialization/bringup_check.py` (10 s readiness self-test), RealMan
-adapter (both arms answer), press geometry, Orbbec serial/name selection, the `--web`
-browser capture UI, the orchestrator skeleton.
+Also working: `initialization/bringup_check.py` (10 s readiness self-test), live panel-plane
+fitting (4.8 ms, repeats to 1.1 mm), LinkerHand O6 control on both arms, Orbbec serial/name
+selection, the `--web` browser capture UI.
 
 Left/right arm **verified 2026-08-14**: `.32` and `.33` are identical RM_65s, so the
 mapping was confirmed by hand-pushing the right arm while polling both — `.33` moved
 34.21°, `.32` moved 0.01°. RIGHT = `192.168.11.33`.
 
-Still to do (marked in-code):
-- **Fine-tune the button YOLO** on our own cam_chest captures for higher accuracy. A
-  **multi-class** baseline (yolo11m, detects + identifies each floor; common-floor val mAP50 ≈ 0.7–0.85)
-  is already trained → `data/weights/buttons.pt` (see `yolo/`, `DATASETS.md`).
+Still to do:
+- **Fine-tune the button YOLO on our own cam_chest captures.** The CC BY baseline (yolo11m,
+  multi-class, common-floor val mAP50 ≈ 0.7–0.85) labels our embossed brushed-steel buttons
+  `empty`, so the label→button mapping in `press_buttons.py` is still a hard-coded grid. That
+  mapping is the last hard-coded thing and it needs to go.
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
-- **Measure the panel plane** and press poses in `configs/pipeline.yaml` (placeholders).
-- Force-limited press (RealMan `rm_force_position_move_pose`); the LinkerHand pointing pose + its fingertip TCP.
+- **Press after driving and re-docking** — everything is already measured live per approach, but
+  it has never been tried.
+- Visual confirmation that a press registered: the plunger occludes the button, and the exposure
+  that makes digits legible saturates the indicator lamp, so the two need different exposures.
+- Force-limited press (RealMan `rm_force_position_move_pose`) — optional now that the spring
+  provides the compliance.

@@ -76,6 +76,8 @@ class OrbbecCamera(Camera):
         height: int = 720,
         fps: int = 30,
         intrinsics: CameraIntrinsics | None = None,
+        exposure: int | str | None = None,   # int = locked value, "auto" = AE, None = leave alone
+        gain: int | None = None,
     ):
         super().__init__(camera_id)
         if not _SDK_AVAILABLE:
@@ -90,6 +92,8 @@ class OrbbecCamera(Camera):
         self.width = width
         self.height = height
         self.fps = fps
+        self.exposure = exposure
+        self.gain = gain
         self._pipeline: Pipeline | None = None
         self._depth_enabled = False
         self._align = None      # AlignFilter, built in start() when depth is on
@@ -187,6 +191,7 @@ class OrbbecCamera(Camera):
             print(f"[{self.camera_id}] depth/align unavailable ({e}); color-only.")
 
         self._pipeline.start(config)
+        self._apply_exposure(device)
 
         # If shared (Part 1) intrinsics were provided, keep them authoritative.
         # Otherwise fall back to the SDK's factory intrinsics + distortion.
@@ -197,6 +202,50 @@ class OrbbecCamera(Camera):
                 width=self.width, height=self.height,
                 dist=self._read_rgb_distortion(),
             )
+
+    def _apply_exposure(self, device) -> None:
+        """Lock colour exposure instead of leaving auto-exposure on.
+
+        AE meters the whole frame. Pointed at an elevator panel the frame is mostly
+        dark wall, so AE opens up for the wall and drives the panel itself into the
+        floor: measured mean brightness 34/255 on the faceplate, where the button
+        digits are simply not there. Locking exposure at the SAME nominal value AE
+        was reporting gives a mean of 226 and the button labels become legible —
+        button detections went from "all empty" to 8 of 10 carrying a real label.
+
+        Values are per-camera in configs/cameras.yaml (``exposure`` / ``gain``);
+        ``exposure: auto`` restores AE. Too high is as bad as too low: at 220+ the
+        faceplate blows out and detections collapse again.
+        """
+        if device is None or self.exposure is None:
+            return
+        try:
+            from pyorbbecsdk import OBPropertyID  # type: ignore
+        except ImportError:  # pragma: no cover
+            return
+        try:
+            if str(self.exposure).lower() == "auto":
+                device.set_bool_property(OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, True)
+                print(f"[{self.camera_id}] colour exposure: auto")
+                return
+            device.set_bool_property(OBPropertyID.OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, False)
+            device.set_int_property(OBPropertyID.OB_PROP_COLOR_EXPOSURE_INT, int(self.exposure))
+            if self.gain is not None:
+                device.set_int_property(OBPropertyID.OB_PROP_COLOR_GAIN_INT, int(self.gain))
+            print(f"[{self.camera_id}] colour exposure locked at {self.exposure}"
+                  + (f", gain {self.gain}" if self.gain is not None else ""))
+        except Exception as e:  # pragma: no cover - firmware dependent
+            print(f"[{self.camera_id}] could not set exposure ({e}); leaving as-is.")
+            return
+        # An exposure change takes several frames to appear, and the pipeline has
+        # its own buffer on top of that. Without flushing, the first capture() after
+        # start() returns a frame shot with the old settings — measured 93/255
+        # instead of 226, which silently halves detection quality.
+        for _ in range(8):
+            try:
+                self._pipeline.wait_for_frames(300)
+            except Exception:  # pragma: no cover
+                break
 
     def _select_color_profile(self, color_profiles):
         """Pick a decodable color profile at the requested resolution.

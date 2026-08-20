@@ -70,6 +70,8 @@ class CameraManager:
                 height=height,
                 fps=cam_cfg.get("fps", 30),
                 intrinsics=intrinsics,
+                exposure=cam_cfg.get("exposure"),
+                gain=cam_cfg.get("gain"),
             )
 
             # Part 2 — shared extrinsic (base_T_camera), loaded once.

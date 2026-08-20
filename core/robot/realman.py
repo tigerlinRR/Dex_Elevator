@@ -31,6 +31,8 @@ and degrades cleanly when the SDK is absent (e.g. on the dev laptop).
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from core.robot.base import RobotArm
@@ -173,6 +175,54 @@ class RealmanArm(RobotArm):
         pose6 = self._pose6_from_matrix(pose)
         code = arm.rm_movel(pose6, v, 0, 0, 1)
         return code == 0
+
+    # -- synchronous variants ----------------------------------------------
+    # rm_movej / rm_movel have two failure modes that stack, and BOTH of them
+    # report the wrong cause downstream:
+    #   1. they return false while still finishing the motion in the background;
+    #   2. they reject a new command while the previous one is still settling.
+    # Fire-and-forget therefore produces symptoms that look like something else
+    # entirely — observed on hardware: the NEXT target came back "no IK solution"
+    # (the seed joints were still the previous pose), and a press reported
+    # "pressed at +50 mm" when the movel had simply been dropped. Both looked like
+    # the button was unreachable. Always confirm arrival.
+
+    def move_joints_sync(self, joints_deg, speed: float = 0.2, tol_deg: float = 1.0,
+                         timeout: float = 15.0, tries: int = 3,
+                         settle: float = 0.35) -> bool:
+        """``rm_movej`` + poll the joint angles until they actually arrive."""
+        arm = self._require()
+        target = [float(x) for x in joints_deg]
+        v = int(np.clip(round(speed * 100), 1, self.max_speed_pct))
+        for _ in range(tries):
+            arm.rm_movej(target, v, 0, 0, 1)
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                if max(abs(a - b) for a, b in zip(self.get_joint_angles(), target)) < tol_deg:
+                    time.sleep(settle)   # let the controller close out the move
+                    return True
+                time.sleep(0.15)
+            time.sleep(0.6)
+        return False
+
+    def move_line_sync(self, pose: np.ndarray, speed: float = 0.15,
+                       tol_m: float = 0.003, timeout: float = 12.0,
+                       tries: int = 3, settle: float = 0.35) -> bool:
+        """``rm_movel`` + poll the TCP until it actually arrives."""
+        arm = self._require()
+        goal = np.asarray(pose, dtype=np.float64)[:3, 3]
+        v = int(np.clip(round(speed * 100), 1, self.max_speed_pct))
+        pose6 = self._pose6_from_matrix(pose)
+        for _ in range(tries):
+            arm.rm_movel(pose6, v, 0, 0, 1)
+            t0 = time.time()
+            while time.time() - t0 < timeout:
+                if np.linalg.norm(self.get_tcp_pose()[:3, 3] - goal) < tol_m:
+                    time.sleep(settle)
+                    return True
+                time.sleep(0.15)
+            time.sleep(0.6)
+        return False
 
     # -- lift (torso column; reached through the LEFT arm's controller) -----
     def get_lift_height(self) -> float:

@@ -129,6 +129,26 @@ sweeps ports/slaves read-only to locate the device — verified `port=1, slave=0
 The fingertip TCP is `hand.fingertip_offset` in `configs/pipeline.yaml`, derived from
 LinkerBot's official O6 URDF + STL meshes (github.com/linker-bot/linkerhand-urdf).
 
+**Autonomous pressing** (`initialization/press_buttons.py`) — the executable that
+ties everything together: `python3 initialization/press_buttons.py 1 4 2 5 --go`.
+Per button: home -> `movej` to standoff -> `movel` through contact into the button
+-> `movel` retract -> `movej` home. Verified 2026-08-20: **4/4 buttons lit**, depth
+error <=0.05 mm, lateral <=0.28 mm, ~48 s for four. Two structural decisions:
+- **Button 3D coordinates are located once per sequence and cached.** The base and
+  panel don't move mid-sequence, so they're constants; re-detecting per button only
+  adds failure chances (an earlier version lost 2 of 3 buttons to intermittent
+  circle-detection misses).
+- **`standoff` cannot exceed ~50 mm.** Backing further off moves the target TOWARD
+  the arm base and into its inner unreachable region: 0/30/50 mm are 24/24
+  reachable, 80 mm+ is 0/24. So "retreat far, then approach" is not an option here.
+
+**Button centres via Hough circles** (`yolo/button_circles.py`) — stand-in for YOLO
+until it's fine-tuned. Precision matters more than it looks: eyeballed pixels were
+off by only ~2.5 px, but that put the plunger on the button's chamfer and it would
+not actuate even at 2 mm push. Circle centres fixed it. `to_grid` is deliberately
+tolerant of over/under-detection (cluster rows by v, take leftmost/rightmost);
+demanding an exact count failed 2 of 3 runs.
+
 **Button detection** (`yolo/button_detector.py`): `ButtonDetector` (Ultralytics
 YOLO, single class `button`) → `Detection` list; `centroid_pixel` gives the press
 pixel; `read_floor_label` (**stub**) is the "which floor" reader — the real open
@@ -196,6 +216,24 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 - **Calibration board mount**: bolt the ChArUco board to the bare **flange** (remove
   the LinkerHand — its fingertip TCP isn't defined in the controller). `base_T_camera`
   is end-effector-independent, so the hand is remounted afterward with no re-calibration.
+- **`rm_movej`/`rm_movel` need arrival confirmation — fire-and-forget misreports the
+  cause.** Two failure modes stack: they return `false` while still finishing the
+  move in the background, AND they reject a new command while the previous one is
+  settling. Symptoms point somewhere else entirely: the NEXT button came back "no
+  IK solution" (the IK seed was still the previous pose), and a press reported
+  "pressed at +50 mm" when the `movel` had simply been dropped. Both looked like the
+  button was unreachable — single-button retests proved otherwise. Use
+  `RealmanArm.move_joints_sync` / `move_line_sync`, which poll joints/TCP until
+  arrival, retry 3x, and settle 0.35 s between moves.
+- **Aim at the button CENTRE before touching `push_depth`.** A press that fails to
+  actuate looks like "not enough force" but is usually "off centre": 2 mm on the
+  chamfer does nothing, 2 mm on the centre nearly works. Fix the aim first, then the
+  depth — otherwise you tune depth to compensate for an aiming error.
+- **`push_depth` by hand-feel is ~3x too small.** The operator felt 0.5-1 mm of
+  switch travel; the real figure is **3 mm** (1 and 2 mm both failed to light the
+  button, 3 mm lit it repeatably). A finger pushes the switch directly, whereas the
+  plunger must ALSO compress its own spring, and the spring eats most of the stroke.
+  Expect the same bias with any compliant press tool.
 - **ALWAYS outlier-reject after calibrating — a single bad view/pose costs 3x accuracy.**
   Measured on the 2026-08 run: intrinsics RMS 0.698 → **0.383 px** by dropping 25 of 88 views;
   extrinsic consistency 1.85 → **0.67 mm** and leave-one-out worst 33.6 → **1.81 mm** by dropping
@@ -273,10 +311,18 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   Reachability is also orientation-limited: at the panel, sweeping the roll about the
   approach axis found only 3 of 12 directions solvable by IK — so the press pose has
   to be chosen from what IK accepts, not assumed.
-- **First actual press.** Geometry, plane fit, TCP and hand pose are all in place and
-  cross-checked, but the arm has never been commanded to a button. Approach in stages
-  (standoff 50 → 30 → 10 mm, `push_depth=0` first) and re-photograph at each step.
-- Force-limited press (`rm_force_position_move_pose`).
+- **Press works** (2026-08-20, 4/4 buttons lit) with a rigid **spring plunger** on the
+  flange, not the LinkerHand: no joints to damage, and the spring supplies the
+  compliance force control would otherwise have to. The hand is still fitted but is
+  not what presses. `end_effector.tcp_offset` in `configs/pipeline.yaml`.
+- Force-limited press (`rm_force_position_move_pose`) — now optional, since the
+  spring provides mechanical compliance.
+- **Verifying a press visually is unsolved.** The plunger occludes the button while
+  pressed, and the locked exposure that makes digits legible blows out the panel, so
+  the indicator lamp is lost in saturation. Options: a second capture at lower
+  exposure after retracting, the head 335L from another angle, or skip it (pressing
+  a lit button again is harmless). Note this means **"read the digits" and "see the
+  lamp" need different exposures** — one setting cannot do both.
 
 Runtime artifacts are gitignored (weights, calibration outputs, captures under
 `data/**`). Don't commit them.

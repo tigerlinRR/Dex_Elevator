@@ -22,6 +22,14 @@ cameras:
     width: 1280
     height: 720
     fps: 30
+    # LOCK the exposure — do not leave auto-exposure on for panel work. AE meters
+    # the whole frame, which is mostly dark wall, so it drives the faceplate itself
+    # down to ~34/255 mean and the button digits vanish. Locking at this value gives
+    # ~226 and button detections went from "all empty" to 8/10 with real labels.
+    # Too high is equally bad: at 220+ the faceplate blows out and detections
+    # collapse to 1. Set `exposure: auto` to hand control back to the camera.
+    exposure: 156
+    gain: 16
     intrinsics_file: cam_chest_intrinsics.npz   # data/calibration/cam_chest_intrinsics.npz (K + dist)
     extrinsic_file: cam_chest.npy               # data/calibration/cam_chest.npy (base_T_camera, RIGHT arm)
 

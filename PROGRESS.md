@@ -3,10 +3,32 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
-## ▶ Migrated to the new AGX Orin DEX (2026-08-13) — READY TO CALIBRATE
-The old DEX (Jetson **Thor**, right arm fault 4104) is retired. Everything is now brought up on
-the **new AGX Orin DEX** and `initialization/bringup_check.py` passes end to end, so the next
-action is the hand-eye calibration itself.
+## ▶ PRESSING WORKS (2026-08-20) — 4 buttons in a row, all lit
+The robot now presses real elevator buttons autonomously. From a fixed home pose it locates the
+panel and the buttons from the chest camera, then presses a requested sequence:
+
+```
+python3 initialization/press_buttons.py 1 4 2 5 --go     # 4/4 lit, 47.9 s
+```
+
+| button | approach roll | joint travel | path clearance | depth error | lateral error |
+|---|---|---|---|---|---|
+| `1` | 45° | 129° | 47 mm | −3.05 mm (target −3.00) | 0.23 mm |
+| `4` | 45° | 142° | 37 mm | −3.00 mm | 0.23 mm |
+| `2` | 105° | 138° | 34 mm | −2.99 mm | 0.08 mm |
+| `5` | 15° | 154° | 36 mm | −3.01 mm | 0.28 mm |
+
+Depth error ≤0.05 mm and lateral error ≤0.28 mm against the commanded contact point, which is
+the whole chain — intrinsics, hand-eye extrinsic, live plane fit, plunger TCP, IK — agreeing at
+once. Repeated twice with identical results.
+
+**Scope deliberately fixed here**: the base does NOT move (parked in front of the panel), and
+the button pixels come from Hough circles, not YOLO. Both were held constant on purpose so that
+a failed press could only be a geometry or motion problem. That paid off — every failure this
+session was diagnosable.
+
+The old DEX (Jetson **Thor**, right arm fault 4104) is retired; everything below runs on the
+**AGX Orin DEX**.
 
 **New machine.** Jetson **AGX Orin Developer Kit**, JetPack **6.2** (R36.4.4), CUDA 12.6, 61 GB
 RAM, 915 GB NVMe. Host `ubuntu`, user `jetson`. It is a **shared machine** — the home dir holds
@@ -43,36 +65,62 @@ before trying to install torch/ultralytics.
 
 **HAND-EYE CALIBRATION IS DONE on this machine (2026-08-14)** — see the section below for numbers.
 
-**Stop point (2026-08-14): everything is in place for a first press except the wrist
-orientation.** Resuming Monday. Next actions, in order:
+### What the press actually does
 
-1. **Wrist orientation.** Parked by hand, the fingertip pointed 46.9° off the panel's
-   inward normal — pressing like that would skid across the face rather than push.
-   Reachability is orientation-limited too: sweeping roll about the approach axis at
-   the panel, only 3 of 12 directions had an IK solution, so the press orientation has
-   to be picked from what IK accepts. Turn the wrist (by hand is safest) to within
-   ~15° of the normal, then the remaining correction is a **31.5 mm translation** —
-   small and low-risk.
-2. **First press, in stages.** standoff 50 → 30 → 10 mm with `push_depth=0`,
-   photographing at each step, then add depth. Never been done; biggest untested risk.
-   The photo at 10 mm also resolves the last open number: the fingertip TCP's z has a
-   17 mm disagreement between the URDF derivation and the visual measurement (x/y agree
-   to 0.5–1.8 mm). Take the LARGER z until settled — too small overshoots into the panel.
-3. **YOLO** — deliberately last. It only automates "which pixel is the button", and
-   that pixel can be supplied by hand today. Wiring it earlier would confound
-   perception errors with geometry errors. Needs torch/ultralytics fetched on the Mac
-   and rsync-ed over (robot has no internet), then likely a TensorRT engine or `yolo11s`.
-4. Route fix + Tailscale (the installed one belongs to `tony.h@` and is offline).
-5. Force-limited press, full pipeline, base docking.
+The end-effector is a **rigid spring plunger bolted to the flange**, NOT a LinkerHand finger —
+switched 2026-08-20 because the hand's finger joints are a damage risk on contact, and because
+future end-effectors may be other grippers entirely. The spring supplies the compliance that
+force control would otherwise have to. TCP `[26.0, −1.9, 24.7] mm` relative to the reported TCP
+frame (which already carries the controller's 130 mm tool z), calibrated two independent ways
+that agree to 0.7 mm axially / 2.5 mm radially.
 
-**Practical notes for Monday:**
-- The mock panel is a real elevator faceplate on a fire-extinguisher cabinet; the `1`
-  button is the green one, 4th row left. Panel sits ~0.68 m in front of / 0.25 m right
-  of the arm base, vertical to within 1.4°.
-- **Don't let the hand into the plane-fit ROI** — it dragged the fit by 23 mm. Use the
-  faceplate's left half until YOLO supplies a proper button-box ROI.
-- Lighting matters: the first captures came out at mean brightness 40–50 and the button
-  labels were unreadable. With the room light on it was fine.
+Per button, from `configs/pipeline.yaml`:
+`home → movej to standoff 50 mm → movel through contact into the button → movel retract → movej home`,
+with the joint-interpolated path checked for panel clearance (refuses anything under 5 mm).
+
+Numbers that were **measured, not assumed**:
+
+| quantity | value | how |
+|---|---|---|
+| button protrusion above faceplate | **2.3 mm** | depth ROI (faceplate −0.2, buttons +2.0…+2.3) |
+| `push_depth` | **3 mm** | walked up on hardware: 1 mm and 2 mm failed to light, 3 mm lit 2/2 |
+| `standoff` usable range | **≤50 mm** | 0/30/50 mm are 24/24 reachable, 80 mm+ is 0/24 |
+| home pose | `[39.76, −100.13, −79.28, −131.63, 117.0, 68.12]°` | picked so the arm does not occlude the panel AND all 10 buttons stay reachable |
+
+The home pose is one pose for both driving and pressing (operator-confirmed safe to drive with).
+It was chosen over two other candidates because the arm projects entirely OUTSIDE the camera
+image there — a pose that blocks the faceplate makes the perception step impossible no matter how
+good the geometry is. Price paid: 117–166° of joint travel per press, vs 33–143° for the rejected
+candidate.
+
+### Next, in order
+
+1. **Fine-tune YOLO on our own cam_chest captures.** The CC BY baseline labels our embossed
+   metal buttons `empty` — the public data is backlit plastic panels, ours are brushed steel with
+   raised digits. Hough circles stand in for now (`yolo/button_circles.py`), which finds *where*
+   the buttons are but not *which floor*, so the label→button mapping is currently a hard-coded
+   grid. That mapping is the one remaining hard-coded thing and it must go.
+2. **Press after driving.** Everything is already live-measured per approach (plane fit + button
+   3D), so re-docking should work without code changes — but it has never been tried.
+3. Two-stage path for the awkward buttons: `close` is reachable from only 14 of 24 rolls and `2`
+   from 8 of 24. They work today, but with little margin.
+4. Force-limited press (`rm_force_position_move_pose`) — now optional, the spring is the
+   compliance.
+5. Route fix + Tailscale (the installed node belongs to `tony.h@` and is offline).
+
+**Open limitation: a press cannot yet be confirmed visually.** The plunger occludes the button
+while pressed, and the locked exposure that makes the digits legible saturates the indicator
+lamp. Reading digits and seeing the lamp need *different* exposures. Options: a second lower-
+exposure capture after retracting, or the head 335L from another angle. Pressing an already-lit
+button is harmless, so this is not blocking.
+
+**Practical notes on the cell:**
+- The mock panel is a real elevator faceplate on a fire-extinguisher cabinet, ~0.68 m in front of
+  and 0.25 m right of the arm base, vertical to within 1.4°. Layout, top to bottom:
+  `A/dot`, `5/6`, `3/4`, `1/2`, `open/close`.
+- **Don't let the hand or plunger into the plane-fit ROI** — it dragged the fit by 23 mm.
+- Lock the camera exposure (`exposure: 156`, `gain: 16`). On auto, AE meters the mostly-dark wall
+  and crushes the faceplate to ~34/255; the digits disappear entirely.
 
 **Left/right arm VERIFIED (2026-08-14).** `.32`/`.33` are identical RM_65s, so the mapping was
 confirmed physically: with both arms polled, hand-pushing the right arm moved `.33` by 34.21°
@@ -143,6 +191,23 @@ not servo-locked — it hand-drags freely, which suits the drag-teach capture in
   editable-installed into the **system python3** via `pip install --user -e .`.
   `initialization/bringup_check.py` passes: libs, configs, ChArUco board, chest-camera capture
   (RGB 1280x720 + 93 % valid depth), and a read-only pose from the right arm.
+- **AUTONOMOUS BUTTON PRESS WORKING (2026-08-20)** — `initialization/press_buttons.py`,
+  4/4 of `1 4 2 5` lit in 47.9 s, depth error ≤0.05 mm, lateral ≤0.28 mm. Reproduced twice.
+  See the top section for the per-button table and the measured constants.
+  - **Spring plunger on the flange** replaces the LinkerHand finger as the press tool
+    (no joints to damage; the spring is the compliance). TCP `[26.0, −1.9, 24.7] mm`,
+    calibrated by touching the tip to a button and solving `inv(base_T_tool) @ tip_3d`,
+    cross-checked against a tape measurement to 0.7 mm axial / 2.5 mm radial.
+  - **Motion made synchronous** — `RealmanArm.move_joints_sync` / `move_line_sync` poll for
+    arrival instead of trusting the return code (`rm_movej`/`rm_movel` return `false` while
+    still executing, and silently reject a command issued mid-settle). Without this, two
+    failures were misattributed entirely: a dropped `movel` reported "pressed at +50 mm",
+    and a stale IK seed reported "no IK solution" for a button that is perfectly reachable.
+  - **Button centres from Hough circles** (`yolo/button_circles.py`) — eyeballing the pixel was
+    only ~2.5 px off but that landed the plunger on the button chamfer, which would not actuate
+    even at 2 mm push. Circle centres fixed it at 2 mm; 3 mm is the production value.
+  - Buttons are located ONCE per sequence and cached (base and panel are static mid-sequence);
+    re-detecting per button only added failure chances.
 - Cameras: chest 335 `CP0BB5300041`, head 335L `CP2G8530000W` (pinned in `configs/cameras.yaml`).
 
 ## Not done yet (stubs / TODO)
@@ -157,27 +222,36 @@ not servo-locked — it hand-drags freely, which suits the drag-teach capture in
       NOTE: yolo11n was far too weak here (floor mAP50 0.1–0.37) — use yolo11m+.
       TODO: fine-tune on our own cam_chest captures for higher accuracy; optionally add `yolov7ncku` for diversity.
       NOTE: `~/dataset` on the Jetson is an **unrelated** task — do NOT train on it, do NOT delete it.
+      **Does not transfer to our panel as-is**: it labels our embossed brushed-steel buttons
+      `empty` (the public data is backlit plastic). Fine-tuning on cam_chest captures is now the
+      top open item, since it is the only thing standing between us and dropping the hard-coded
+      label→button grid in `press_buttons.py`.
+- [x] ~~First autonomous press~~ — DONE 2026-08-20, see above.
+- [x] ~~LinkerHand pointing pose + fingertip TCP~~ — superseded: pressing uses the spring plunger.
+- [x] ~~Measure the panel plane~~ — fitted LIVE every approach; the config value is reference-only.
+- [ ] Fine-tune the button model on our own cam_chest captures, then replace the hard-coded
+      `PANEL_LABELS` grid in `initialization/press_buttons.py` with real detections.
 - [ ] Implement `read_floor_label` (OCR / template / multi-class) — the "which floor" reader.
-- [ ] LinkerHand "pointing" pose + register its **fingertip TCP** (needed to command a press point).
-- [ ] First autonomous press of a KNOWN point (slow, guarded) — biggest untested risk.
-- [ ] Force-limited press (`rm_force_position_move_pose`).
-- [ ] Measure `elevator.panel` plane + press poses in `configs/pipeline.yaml` (currently placeholders).
-- [ ] Wire the full pipeline end-to-end; base docking (AutoXing) to a repeatable pose.
+- [ ] Press after the base has driven and re-docked (geometry is already live-measured, untried).
+- [ ] Two-stage path for `close` (14/24 rolls) and `2` (8/24) — working but thin on margin.
+- [ ] Confirm a press visually (needs a second, lower-exposure capture — see the top section).
+- [ ] Force-limited press (`rm_force_position_move_pose`) — optional now the spring is compliant.
+- [ ] Wire `core/elevator_pipeline.py` end-to-end; base docking (AutoXing) to a repeatable pose.
 
 ## Next-step order
-1. **Motion/press first** (arm is ready, needs no elevator): LinkerHand fingertip TCP →
-   known-point press → force-limited press → measure a panel plane.
-2. **Perception** (bootstrap now, no elevator needed): download public CC BY button exports →
-   `yolo/prepare_dataset.py` → `yolo/train_buttons.py` → baseline `buttons.pt` → `read_floor_label`.
-   Fine-tune on our own cam_chest captures once a (mock/real) panel exists.
+Motion is done; the remaining work is perception, then integration.
+1. **Perception** — fine-tune on our own cam_chest captures so the model reads OUR buttons,
+   then feed real detections into `press_buttons.py` in place of the hard-coded grid.
    (`~/dataset` on the robot is a different task — not this.)
-3. **Integrate**: full pipeline + base docking.
+2. **Integrate** — press after driving/re-docking, then the full `core/elevator_pipeline.py`.
+3. **Harden** — two-stage paths for the thin-margin buttons, visual press confirmation,
+   optionally force-limited press.
 
-## Testing note — no real elevator panel yet (on order)
-Almost everything can proceed on a **mock panel**: a rigid flat board, mounted vertically at
-button height, with cheap arcade/momentary push buttons (real press feel) and/or printed
-button labels. The `ray ∩ plane` geometry doesn't care if it's a real elevator. Only the real
-panel's plane re-measurement + force/lighting fine-tuning need the actual hardware.
+## Testing note — mock panel
+Testing runs against a **real elevator faceplate mounted on a fire-extinguisher cabinet**, which
+is enough for everything except riding an actual elevator: the buttons are the real parts with
+real switch travel, and `ray ∩ plane` does not care what is behind the plane. A real installed
+panel would only change the plane measurement (done live anyway) and the lighting.
 
 ## How to run (on the robot)
 Plain `python3` — no conda, no env activation (see the environment table at the top).
@@ -189,6 +263,11 @@ python3 initialization/calibrate_intrinsics.py --camera cam_chest --web   # 1. i
 python3 initialization/run_calibration.py      --camera cam_chest --web   # 2. eye-to-hand
 python3 initialization/validate_calibration.py --camera cam_chest         # 3. re-validate
 python3 initialization/eval_localization.py    --camera cam_chest --web   # 4. accuracy at fresh poses
+
+# PRESS BUTTONS (needs calibration done). Without --go it only plans and prints targets.
+python3 initialization/press_buttons.py 1 4 2 5            # dry run: locate + plan, no motion
+python3 initialization/press_buttons.py 1 4 2 5 --go       # actually press
+python3 initialization/press_buttons.py 1 --go --push=2    # override push depth, mm
 ```
 `--web` serves a browser preview at **`http://192.168.11.31:8010/`** (the robot has no monitor).
 **The browser has to reach that address**: the dev Mac sits on `192.168.40.x` and there is no
