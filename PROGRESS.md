@@ -156,16 +156,32 @@ candidate.
    So this is **not** a metal-vs-plastic domain gap; it is a marking-contrast problem. Ruled
    out by measurement, not assumption: exposure (swept 50–190, best 3/8, and the low end is
    *worst* at 0/8), upscaling (imgsz 640/1280/1920 — 1920 is worse), CLAHE, and unsharp
-   masking (makes every button `empty`). Fine-tuning on our own captures is the remaining
-   lever — **light DIRECTION is**. Turning the room light off and re-sweeping exposure took
+   masking (makes every button `empty`). What DOES move the needle is the **direction of the
+   light**, not its amount: turning the room light off and re-sweeping exposure took
    per-button contrast from **18.2 to 26.0 (+43 %)** and 3/8 to 4/8, and made `5`/`6`/`3`/`4`
    legible to a human for the first time. The digits are a shadow feature, so a broad overhead
-   source fills the etch and erases them. **Fit a grazing light to the robot** — a real lobby's
-   ceiling lighting is exactly the bad case and we do not control it; "turn the room light off"
-   is a diagnostic, not a plan. Then capture and fine-tune under that light.
-   Hough circles stand in meanwhile (`yolo/button_circles.py`), which finds *where* the
-   buttons are but not *which floor*, so the label→button mapping is a hard-coded grid. That
-   mapping is the one remaining hard-coded thing and it must go.
+   source fills the etch and erases them. "Turn the room light off" is a diagnostic, not a
+   deployment option — a real lobby's ceiling light is exactly the bad case and we do not
+   control it.
+
+   **DECIDED 2026-08-21: no added light.** The operator ruled out a robot-mounted grazing
+   light, so the etched digits stay marginal and nothing may depend on reading them. The plan:
+
+   | step | source | why |
+   |---|---|---|
+   | where the buttons are | **YOLO** | positions detect reliably (10/10); also deletes the OpenCV Hough stand-in |
+   | which floor each is | that elevator's **registered layout** | the arrangement on a faceplate is a physical property of that elevator |
+   | is the layout aligned | the buttons the model *does* read (`open`/`close`/`alarm`, 0.93-0.98) | their position in the layout is known, so they anchor the grid |
+   | anchors disagree | **refuse to press** | a mislabelled button is a SILENT failure — the wrong floor gets pressed with no error |
+
+   Registering a layout is NOT hard-coding the panel's position in space — that stays
+   live-measured, because the base docks with centimetres of error. Fine-tuning still happens,
+   but the goal drops from "read every digit" to "make positions and the high-contrast symbols
+   rock solid", which the existing light already supports.
+
+   Until that lands, what actually runs is OpenCV Hough circles (`yolo/button_circles.py`) for
+   positions plus the hard-coded `PANEL_LABELS` grid for floors — the one remaining hard-coded
+   thing in the system, and the reason a wrong panel would fail silently.
    **Speed is already solved** — see the TensorRT section above; this is purely an accuracy item.
 2. **Press after driving.** Everything is already live-measured per approach (plane fit + button
    3D), so re-docking should work without code changes — but it has never been tried.

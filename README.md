@@ -47,7 +47,7 @@ the vision only needs to give a reliable button pixel and its floor label.
 | End-effector (pressing) | **spring plunger** bolted to the flange | rigid, no joints to damage; the spring gives compliance without force control |
 | End-effector (other) | LinkerHand O6 dexterous hand | still fitted and controllable (`core/hand/linkerhand.py`), but not what presses |
 | Camera (buttons) | **Orbbec Gemini 335** (chest) | `core/camera/orbbec.py` (pyorbbecsdk v2) |
-| Camera (scene) | Orbbec Gemini 335L (head) | navigation; not used for pressing yet |
+| Camera (scene) | Orbbec Gemini 335L (head) | aimed steeply DOWN — sees the robot's own arms and the near floor, not the door or standing people; uncalibrated and currently unused |
 | Compute | NVIDIA Jetson AGX Orin (`ssh dex5-wired`) | JetPack 6.2 / CUDA 12.6; runs the SDKs + inference |
 | Detection | Ultralytics YOLO11m | multi-class (per floor: `1`,`2`,`B1`,`G`…) — detects AND identifies; trained from CC BY data (`yolo/`, `DATASETS.md`) |
 | Inference | **TensorRT FP16** on the Orin's GPU | 43 ms/frame (23 FPS) via `yolo/trt_detector.py`; the machine's torch is CPU-only and is deliberately left alone |
@@ -93,6 +93,25 @@ pip install -e ".[vision]"       # + ultralytics (YOLO)
 The RealMan / Orbbec / Ultralytics SDKs are optional at import time — the modules
 degrade cleanly when a SDK is absent (so this imports on a dev laptop), and
 hardware code runs on the robot.
+
+## Reaching the robot
+
+Two routes, both to the same machine (`~/.ssh/config` on the dev Mac):
+
+| alias | path | throughput | when |
+|---|---|---|---|
+| `dex5-wired` | Ethernet cable, `192.168.11.31` | 54 MB/s | bulk rsync, `--web` MJPEG preview |
+| `dex5-ts` | **Tailscale**, `100.122.187.11` | 6 MB/s | everything else — works from any network, no cable |
+
+Tailscale was verified cable-free on 2026-08-21 (`en0` down, wired alias timing out) by
+running a real two-button press over it. The path is the peer's public endpoint, not the
+`192.168.11.x` link. Latency (~110 ms) does not affect motion safety: `move_joints_sync` /
+`move_line_sync` poll for arrival **on the robot**, so the control loop is local — only the
+command and the log cross the network. That would NOT hold for anything closing a visual
+servo loop on the Mac.
+
+The robot **does have internet** (via its WiFi), so `pip install` works directly on it — the
+old "download on the Mac and rsync it over" workaround is no longer needed.
 
 ## Usage — hand-eye calibration
 
@@ -249,9 +268,15 @@ Still to do:
   and wrong only where the marking is barely in the image (the laser-etched `5`/`6`/`3`/`4`).
   Exposure is not the lever — **light direction is**: killing the room light raised per-button
   contrast 18.2 → 26.0 and made those digits human-legible for the first time, because an
-  etched digit is a shadow feature that broad overhead light fills in. So: fit a grazing light
-  to the robot, then capture and fine-tune under it. Until then the label→button mapping in
-  `press_buttons.py` stays a hard-coded grid — the last hard-coded thing in the system.
+  etched digit is a shadow feature that broad overhead light fills in. **Adding a light to the
+  robot was ruled out (2026-08-21)**, so nothing may depend on reading those digits. The design
+  instead: positions from YOLO (reliable), floor labels from each elevator's layout registered
+  once at commissioning, and the buttons the model *does* read confidently (`open`/`close`/
+  `alarm`) used as anchors to verify that layout is aligned — with a refusal to press if they
+  disagree, because a mislabelled button is otherwise a **silent** wrong-floor press.
+  Registering a layout is not the same as hard-coding the panel's position in space, which
+  stays live-measured. Until this lands, `press_buttons.py` still uses OpenCV Hough circles
+  plus a hard-coded label grid — the last hard-coded thing in the system.
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
 - **Press after driving and re-docking** — everything is already measured live per approach, but
   it has never been tried.

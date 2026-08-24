@@ -49,18 +49,26 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
   `protobuf` still reports 3.12.4.
 - **This is a SHARED machine.** The home dir holds unrelated projects (ZED, VR teleop,
   LinkerHand gripper endurance). Touch only `~/Dex_Elevator`, `~/pyorbbecsdk`, `~/.local`.
-- **The Jetson has NO internet, and only the Ethernet cable reaches it.** Verified
-  2026-08-20: the default route points at the dead gateway `192.168.11.1`, and its WiFi is
-  **associated with a printer's access point** (`Brother HL-L3275`, `192.222.10.133/24`) —
-  which is the real reason there is no internet. The `192.168.10.146` / `Richtech_Tech`
-  address in older notes is **stale**. The robot also scans only that one SSID and
-  `nmcli dev wifi rescan` returns `not authorized`, so re-pointing the WiFi needs the user.
-  Consequence: **unplugging the Mac's cable cuts off all remote access** (the robot keeps
-  running fine on its own). `pip`/`apt`/`git clone` fail on the robot — download on the dev
-  Mac and rsync the artifacts over.
+- **The Jetson HAS internet, and is reachable without the cable — both were wrong in earlier
+  notes.** Re-verified 2026-08-21:
+  - Its WiFi is associated with `Brother HL-L3275` (`192.222.10.133/24`) — an access point
+    named after a printer, which nonetheless **routes to the internet** (`curl https://pypi.org`
+    returns 200, and it is the default route at metric 600, beating the dead wired gateway
+    `192.168.11.1` at 20100). So **`pip install` works directly on the robot**; the old
+    "download on the dev Mac and rsync it over" workaround is obsolete.
+  - **Tailscale is up and has been all along** (`100.122.187.11`, node `ubuntu`, key valid to
+    2026-12-27). The "offline, last seen 199d" lines in `tailscale status` belong to OTHER
+    people's nodes — misreading them is what produced the "Tailscale is offline" claim.
+  - Two SSH routes, both in the Mac's `~/.ssh/config`: **`dex5-wired`** (cable, 54 MB/s) and
+    **`dex5-ts`** (Tailscale, 6 MB/s, ~110 ms, works from any network). Verified cable-free by
+    pressing two buttons with `en0` down. Prefer the cable for bulk rsync and `--web` preview.
+  - The `192.168.10.146` / `Richtech_Tech` address in older notes is **stale**. The robot also
+    scans only that one SSID and `nmcli dev wifi rescan` returns `not authorized`.
   - Careful reading routes on the Mac: its `en0` is `192.168.11.50` with a **/16** netmask,
     so `route get 192.168.10.x` cheerfully answers "via en0" for addresses that are not
-    reachable at all. Test with an actual connection, not a route lookup.
+    reachable at all. Test with an actual connection, not a route lookup — and for Tailscale
+    check the peer's actual endpoint (`tailscale ping`), since it will happily use the LAN
+    path when the cable IS plugged in and then look cable-independent when it is not.
 - **`sudo` requires a password**, so any root step has to be handed to the user.
 - **Torso lift column** (RealMan lift API, mm) raises/lowers the upper body. The
   chest camera and arm bases ride it together, so `base_T_camera` stays constant.
@@ -68,6 +76,17 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
   RealMan gripper) — pressing uses a fixed "pointing" hand pose set out-of-band.
 - **Two Orbbec** cameras: **Gemini 335** (chest, button camera) + **335L** (head,
   scene). Distinguish them by device name suffix ("335" vs "335L") or serial.
+  - **The head 335L is aimed steeply DOWN** (verified 2026-08-21 by looking at a frame): it
+    sees the robot's own two arms, the base deck, and the near floor — NOT the elevator door
+    or people at standing height. It catches only the bottom 4 of the 10 buttons, very
+    obliquely, and has no calibration files. The roughly level, forward-facing camera is the
+    CHEST one. Conclusion: the head unit earns nothing as mounted; leave it unused rather than
+    inventing a job for it, and revisit only if "is the door open / is the car full" turns out
+    to need a high forward view. Re-aiming it would cost a mechanical change plus a fresh
+    hand-eye calibration.
+  - **Its auto-exposure needs ~30 frames to settle** (46 -> 121/255, plateauing at frame ~32).
+    A single `capture()` right after `start()` is 3x too dark. `cam_chest` never showed this
+    because its exposure is locked.
 - SDKs (`Robotic_Arm`, `pyorbbecsdk`, `ultralytics`) are **optional at import
   time** — every module guards the import and degrades, so the repo imports on a
   laptop and hardware code runs on the robot.
@@ -299,9 +318,25 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
     4/8 correct, with `5`/`6`/`3`/`4` becoming legible to a human for the first time. The
     digits are laser-etched into brushed steel — a shadow feature, not an albedo one — so a
     broad overhead source fills the etch from every direction and erases them, and no global
-    exposure can put them back. **A robot-mounted grazing light is the durable fix** (a real
-    lobby's ceiling lighting is exactly the bad case and we do not control it); "turn the
-    room light off" is a diagnostic, not a deployment plan.
+    exposure can put them back. Note "turn the room light off" is a DIAGNOSTIC, not a
+    deployment option — a real lobby's ceiling lighting is exactly the bad case and we do not
+    control it.
+    **A robot-mounted grazing light was considered and RULED OUT by the operator (2026-08-21)** —
+    do not propose it again. So the etched digits will never be reliably legible, and the design
+    must not depend on reading them. The chosen direction instead:
+    - button POSITIONS come from YOLO (reliable — 10/10), which also removes the OpenCV
+      Hough-circle stand-in from the pipeline;
+    - the label for each position comes from that elevator's REGISTERED LAYOUT, captured once at
+      commissioning. This is not the same as hard-coding the panel's position in space (that
+      must stay live-measured — the base docks with centimetres of error); the arrangement of
+      buttons on a given faceplate is a physical property of that elevator;
+    - the layout's alignment is VERIFIED using the buttons the model does read confidently
+      (`open`/`close`/`alarm`, 0.93-0.98) as anchors, since their position in the layout is known;
+    - if the anchors disagree with the layout, REFUSE to press rather than press something.
+      This is the part that fixes the real hazard: a mislabelled button is a SILENT failure —
+      the robot quietly presses the wrong floor with no error anywhere.
+    Fine-tuning still happens, but its goal drops from "read every digit" to "make positions and
+    the high-contrast symbols rock solid" — which the existing lighting already supports.
   - Also not levers, all measured: upscaling the crop (imgsz 640/1280/1920 on the same
     175x335 crop — 1920 makes it *worse*, 6 detections -> 2), CLAHE (clip 2/4: digits still
     wrong), and unsharp masking (turns every button into `empty` at 0.45-0.95).
@@ -386,8 +421,8 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   identifies each floor) → `data/weights/buttons.pt`, and **running on the Orin's GPU** via
   `yolo/trt_detector.py` (TensorRT FP16, 43 ms/frame). Speed is DONE. Accuracy is not:
   **measured on our panel 2026-08-20**, it is correct on every high-contrast marking and
-  useless on the low-contrast etched digits. Fine-tuning on our own cam_chest captures —
-  under a grazing light — is the remaining work.
+  useless on the low-contrast etched digits. Fine-tuning on our own cam_chest captures is the
+  remaining work; whether a grazing light is added first is undecided (see the gotcha).
 - Implement `read_floor_label` (OCR / multi-class / template) — the identification step.
 - **Wrist orientation for pressing.** The fingertip must approach along the panel's
   inward normal; parked by hand it sat 46.9° off, which would skid instead of press.
