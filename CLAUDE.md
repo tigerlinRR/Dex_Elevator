@@ -118,9 +118,15 @@ python3 initialization/eval_localization.py    --camera cam_chest --web   # end-
 on `192.168.40.x` and cannot reach the Jetson's WiFi subnet (`192.168.10.x`), so today
 calibration needs the **Ethernet cable** between Mac and robot (Mac becomes `192.168.11.50`).
 
-Button detector (YOLO) — train in the robot's dedicated **`ultralytics`** conda env
-(torch + CUDA); **not** `richtech-v3` (no torch there, and installing it would break
-its pinned `numpy<2`). Bootstrap from public **CC BY** Roboflow exports.
+Button detector (YOLO) — train on the Orin's GPU in the isolated venv
+`~/venv-dex-train` (created with `venv --without-pip` + `get-pip.py`, because Ubuntu
+strips `ensurepip` and installing it needs sudo). It holds **torch 2.8.0 + torchvision
+0.23.0 CUDA builds** from `https://pypi.jetson-ai-lab.io/jp6/cu126` — note the `.io`
+domain, `.dev` is unreachable — plus ultralytics installed `--no-deps`. **Do not use
+torch 2.10 there**: its CUDA build needs `libcudss.so.0`, which JetPack does not ship.
+Nothing in `~/.local` is touched, so the CPU torch that `~/mmdetection` imports is
+unaffected. Run training with `PYTHONPATH=~/Dex_Elevator` (the venv has no editable
+install of this repo).
 
 ```bash
 PYU=~/miniconda3/envs/ultralytics/bin/python
@@ -185,12 +191,39 @@ error <=0.05 mm, lateral <=0.28 mm, ~48 s for four. Two structural decisions:
   the arm base and into its inner unreachable region: 0/30/50 mm are 24/24
   reachable, 80 mm+ is 0/24. So "retreat far, then approach" is not an option here.
 
-**Button centres via Hough circles** (`yolo/button_circles.py`) — stand-in for YOLO
-until it's fine-tuned. Precision matters more than it looks: eyeballed pixels were
-off by only ~2.5 px, but that put the plunger on the button's chamfer and it would
-not actuate even at 2 mm push. Circle centres fixed it. `to_grid` is deliberately
-tolerant of over/under-detection (cluster rows by v, take leftmost/rightmost);
-demanding an exact count failed 2 of 3 runs.
+**Where the buttons are, and which is which** (`yolo/panel_layout.py` +
+`configs/panels.yaml`) — the default path since 2026-08-25. Positions come from the
+detector; the floor label for each position comes from that elevator's **registered
+layout**; and the buttons the model *does* read confidently anchor the grid so a
+misalignment is caught rather than pressed. Measured, and each number changed the design:
+- **Positions are reliable, labels are not.** 10/10 buttons found on the panel crop at
+  imgsz 640 (centre error 0.3-6.3 px, matching Hough), but only 5 of 8 markings read
+  correctly. So positions are trusted and labels are not.
+- **Run detection on a CROP, not the full frame.** Full-frame at conf 0.25 misses one
+  button of ten; the crop finds all ten with one spurious box.
+- **A whole-panel pass classifies far worse than per-button crops** (`3` reads `empty`
+  0.46 in the panel pass, `3` 0.48 alone), so anchors are re-classified from their own
+  crops. `classify_solo`'s `pad_scale` is NOT a free parameter — 44 px crops score
+  1/10, 68 px 3/10, 104 px 4/10; 1.6 button widths made every anchor mismatch and
+  looked exactly like a scrambled grid. 2.1 reproduces the best case.
+- **The ROI is derived, not hard-coded** (`panel_roi`): the union of ALL detections is
+  too crude, because a low-confidence pass also fires on the cabinet's keyhole and
+  stretched the ROI 145 px past the faceplate. Single-linkage clustering on the
+  centres, keeping the largest cluster, separates the grid from those strays. Then
+  `tight_roi` re-boxes the fit around the confirmed buttons only — the wall and cabinet
+  behind are separate parallel planes and bias the depth fit.
+- **Refuse, don't guess.** A shifted grid yields perfectly plausible coordinates, so a
+  wrong label is a SILENT wrong-floor press. Verified by feeding a deliberately
+  inverted layout: anchors went 0/4 and the press was refused.
+
+**Button centres via Hough circles** (`yolo/button_circles.py`) — the previous
+stand-in, kept behind `press_buttons.py --circles` as a fallback and A/B reference.
+Head to head on 20 live frames while the showroom light drifted the faceplate to 223
+(blown out): **Hough 1/20, detector 12/20**. At the designed brightness both work and
+the press results are indistinguishable (lateral 0.17/0.20 mm vs 0.06/0.23 mm), so the
+reason to switch is not accuracy — it is labels, the derived ROI, and light tolerance.
+Detector localisation repeats to **±0.3 px**; it costs 201 ms per attempt against
+Hough's 41 ms, which is 1 % of a 23 s two-button sequence.
 
 **Button detection** (`yolo/button_detector.py`): `ButtonDetector` (Ultralytics
 YOLO, single class `button`) → `Detection` list; `centroid_pixel` gives the press
@@ -218,14 +251,29 @@ Class names do not survive into the engine — `export_names()` writes them to
 `data/weights/buttons_names.json` alongside it.
 
 **Button-YOLO training tooling** (`yolo/prepare_dataset.py`, `yolo/train_buttons.py`,
-`yolo/buttons.yaml`): no in-house dataset exists yet, so the detector is bootstrapped from
-public **CC BY** Roboflow exports. **Multi-class by default** — each floor symbol keeps its own
-label so the model **detects AND identifies** which floor (`prepare_dataset.py` keeps the source
-labels + pHash-dedups into `data/datasets/buttons/`; `--collapse` is an opt-in single-`button`
-mode). `train_buttons.py` trains YOLO11 → `data/weights/buttons.pt` — **use `--model yolo11m.pt`**;
-nano is far too weak for 368-class floor ID (floor mAP50 0.1–0.37 vs yolo11m 0.7–0.85). Run both in
-the robot's **`ultralytics`** conda env (torch+cuda; `richtech-v3` has no torch). Attribution in
-`DATASETS.md`. Fine-tune on our own cam_chest captures later for higher accuracy.
+`yolo/buttons.yaml`): the detector is trained from **public** datasets — five of them, merged.
+**Multi-class by default**: each floor symbol keeps its own label so the model **detects AND
+identifies** which floor (`--collapse` is an opt-in single-`button` mode). `train_buttons.py`
+trains YOLO11 → `data/weights/buttons.pt` — **use `--model yolo11m.pt`**; nano is far too weak
+for this many classes. Attribution in `DATASETS.md`.
+
+Merging several sources needed two fixes, both of which failed *quietly* before:
+- **Sources are merged by class NAME, never by class id.** Public sets do not agree on what to
+  call a button — floor 3 is `3`, `three` and `button-3` across the three taxonomies we have —
+  so an id-based merge relabels every box. `CLASS_ALIASES` canonicalises names and `CLASS_DROP`
+  removes classes whose meaning is ambiguous (`floor-1` next to `button-1`) or which are not
+  buttons at all (`closed-door` is a door STATE). Drops are counted and printed; a silent drop
+  is indistinguishable from "that class was never in the data".
+- **The val split is carved on a FRACTION, not on absence.** The old rule ("carve only if no
+  source has a val split") was defeated by sources shipping 5 and 10 val images: the merge kept
+  **194 val images for 369 classes** — under one example per class — so every mAP would have
+  been noise that still looked like a measurement. Now anything below half of `--val-frac` is
+  topped up (194 → 1076).
+
+Licence discipline matters here because the goal is a product: only CC BY 4.0 and MIT sources
+are used (both permit commercial use with attribution); NC or unlicensed data is worse than no
+data. The largest academic set (CUHK, 3,718 images / 35,100 labels, arXiv 2103.09030) is **not**
+used — its download link is dead and it states no licence.
 
 **Orchestrator** (`core/elevator_pipeline.py`): capture → detect → match the button
 whose label == requested floor → `press_target_from_pixel` → arm standoff/press/retract.
@@ -288,6 +336,26 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   button was unreachable — single-button retests proved otherwise. Use
   `RealmanArm.move_joints_sync` / `move_line_sync`, which poll joints/TCP until
   arrival, retry 3x, and settle 0.35 s between moves.
+- **A camera that enumerates but never delivers colour is fixed by
+  `device.reboot()`, no root and no replug.** The chest 335 got into this state after a
+  USB re-enumeration: `lsusb` and `query_devices()` both listed it, and every
+  `capture()` died with "no color frame after 40 tries". The head 335L worked
+  throughout, which is what proved it was device-state and not the code — test the
+  OTHER camera before touching anything. `pyorbbecsdk`'s `Device.reboot()` cleared it
+  in ~25 s. Note the misleading first hypothesis: the failure appeared right after
+  TensorRT was added to the same process, so it looked like engine init was starving
+  the camera stream; reordering changed nothing, and the camera failed on its own too.
+- **`pip install --extra-index-url` will happily pick the WRONG index.** The
+  jetson-ai-lab index and PyPI both offer `torch==2.10.0`; with both indexes visible pip
+  chose PyPI's **CPU** build and `torch.cuda.is_available()` stayed False. Install GPU
+  torch with `--index-url <jetson index> --no-deps` only, then add the pure-python deps
+  from PyPI separately.
+- **Stray `.py` files at the repo root on the robot shadow the stdlib.** The July
+  deployment left a flattened copy of the whole package there, including `types.py` and
+  `config.py`; any python started from `~/Dex_Elevator` then died with a circular-import
+  error out of `enum`/`dataclasses`. Moved to `~/Dex_Elevator_stray_root_backup_*`. The
+  repo root legitimately contains NO `.py` files — if one appears, an rsync flattened
+  something.
 - **Never trust a Jetson benchmark that has not been warmed up.** The CPU governor is
   `schedutil` and the GPU idles at 306 MHz, so **whatever is measured first in a process
   pays for the clock ramp and everything after it looks faster**. This produced two wrong

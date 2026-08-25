@@ -1,0 +1,44 @@
+# Registered panel layouts — one entry per physical elevator faceplate.
+#
+# WHY THIS FILE EXISTS
+# The detector reads high-contrast markings reliably (`open`/`close`/`alarm`/`2` all
+# come back at 0.9+), but the laser-etched digits on our brushed-steel panel are only
+# marginally present in the image at all: 5 of 8 readable buttons correct, and no
+# exposure or upscaling fixes it (a robot-mounted grazing light, which would, was
+# ruled out 2026-08-21). Button POSITIONS, in contrast, detect 10/10.
+#
+# So the arrangement of a given faceplate is registered ONCE, here, and at run time
+# position -> floor is a lookup instead of a character-recognition gamble.
+#
+# THIS IS NOT hard-coding where the panel is in space. That is still measured live on
+# every approach (`fit_panel_plane_from_depth` + ray-plane), because the mobile base
+# docks with centimetres of error. What is fixed here is only which button is which
+# ON the faceplate — a physical property of that elevator, stable for its lifetime.
+#
+# `expect:` marks an ANCHOR — a cell whose class the model DOES read confidently,
+# used to verify the grid is aligned before anything is pressed. Anchors are the
+# safety mechanism: without them, one missed row shifts every label by one position
+# and the robot silently presses the wrong floor. With them, a shifted grid fails to
+# match and the press is refused.
+panels:
+  - id: mock_cabinet
+    description: >
+      Real elevator faceplate mounted on the fire-extinguisher cabinet in the lab.
+      5 rows x 2 columns. Top-left is the yellow alarm bell; top-right is an unmarked
+      dark disc (the model correctly calls it `empty` — there is nothing to read).
+    # Rows top -> bottom, each row left -> right, as seen by the chest camera.
+    grid:
+      - [{label: A,     expect: alarm}, {label: dot, expect: empty}]
+      - [{label: "5"},                  {label: "6"}]
+      - [{label: "3"},                  {label: "4"}]
+      - [{label: "1"},                  {label: "2"}]
+      - [{label: open,  expect: open},  {label: close, expect: close}]
+    verify:
+      # How many anchors must agree before a press is allowed. 2 of the 4 defined
+      # anchors: enough that a one-row shift cannot pass (a shift breaks every
+      # anchor at once), while tolerating a single bad read.
+      min_anchors: 2
+      # An anchor read below this confidence does not count as agreement. Measured
+      # anchor confidences on this panel: open 0.92, close 0.92, alarm 0.97,
+      # empty 0.98 — so 0.40 leaves a wide margin without accepting noise.
+      min_conf: 0.40

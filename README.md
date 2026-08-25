@@ -67,7 +67,7 @@ Dex_Elevator/
 │   ├── camera/             # Camera interface + Orbbec driver (serial/name select) + manager
 │   └── robot/              # RobotArm interface + RealMan adapter + Sim (headless)
 │   └── hand/               # LinkerHand O6 over the arm's tool-side Modbus RS485
-├── yolo/                   # ButtonDetector, TensorRT GPU detector, Hough-circle finder, dataset prep & training
+├── yolo/                   # TensorRT GPU detector, panel-layout matcher, dataset prep & training
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
 ├── initialization/         # bring-up check, calibration + eval scripts, and press_buttons.py (the presser)
 ├── configs/                # cameras.yaml, pipeline.yaml
@@ -216,9 +216,9 @@ buttons, then presses a requested sequence. Running `press_buttons.py 1 4 2 5 --
 commanded contact point — the whole chain (intrinsics, hand-eye extrinsic, live plane fit,
 plunger TCP, IK) agreeing at once. Reproduced twice.
 
-Scope is deliberately fixed there: the base does not move, and the button pixels come from
-Hough circles rather than YOLO. Both were held constant so that a failed press could only be a
-geometry or motion problem.
+Scope is deliberately fixed there: the base does not move. The button pixels came from Hough
+circles at the time, so a failed press could only be a geometry or motion problem — since
+**2026-08-25 they come from the detector** (see below).
 
 Measured, not assumed:
 
@@ -228,6 +228,25 @@ Measured, not assumed:
 | push depth | 3 mm (1 and 2 mm failed to light the button; 3 mm lit it repeatably) |
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
 | plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
+
+**Detection drives the press (2026-08-25).** `press_buttons.py` gets button positions from the
+detector and floor labels from a registered layout in `configs/panels.yaml`; both panel-specific
+constants (the label grid and the hand-measured ROI) are gone. The ROI is now derived from the
+detections by clustering, which also keeps the robot's own arm out of the depth plane fit.
+
+The buttons the model reads confidently (`open`/`close`/`alarm`/`empty`) anchor the grid, and a
+mismatch **refuses the press** — verified by feeding an inverted layout (anchors 0/4, refused).
+That guard exists because the failure it catches is silent: a shifted grid yields perfectly
+plausible coordinates and the wrong floor gets pressed with no error anywhere.
+
+Result on hardware: 2/2 pressed, depth error 0.09 mm, lateral 0.06 / 0.23 mm, and the same
+roll/travel/clearance the Hough version planned. Head to head over 20 live frames the detector
+localises to ±0.3 px and survived a lighting drift that took Hough from working to 1/20.
+
+**Model retrained on five merged public datasets (2026-08-25)** — 7,178 de-duplicated images
+(CC BY 4.0 and MIT only, so commercially usable), all-class mAP50 **0.30 → 0.676**, common
+floors 0.89–0.97, and on our own panel **3 of 8 markings correct → 5 of 8**. Trained on the
+Orin's GPU in ~8.9 h inside an isolated venv, leaving the machine's shared CPU torch untouched.
 
 **Hand-eye calibration DONE & validated (2026-08-14)** (chest Gemini 335 ↔ right arm
 `192.168.11.33`):
@@ -262,7 +281,7 @@ mapping was confirmed by hand-pushing the right arm while polling both — `.33`
 34.21°, `.32` moved 0.01°. RIGHT = `192.168.11.33`.
 
 Still to do:
-- **Fine-tune the button YOLO on our own cam_chest captures** — the remaining accuracy work.
+- **Fine-tune on our own cam_chest captures** — the remaining accuracy work.
   Measured per button on our panel, the CC BY baseline is right on every marking that is
   legible (`alarm` 0.97, `close` 0.98, `open` 0.93, `2` 0.86, blank disc correctly `empty`)
   and wrong only where the marking is barely in the image (the laser-etched `5`/`6`/`3`/`4`).
@@ -275,8 +294,7 @@ Still to do:
   `alarm`) used as anchors to verify that layout is aligned — with a refusal to press if they
   disagree, because a mislabelled button is otherwise a **silent** wrong-floor press.
   Registering a layout is not the same as hard-coding the panel's position in space, which
-  stays live-measured. Until this lands, `press_buttons.py` still uses OpenCV Hough circles
-  plus a hard-coded label grid — the last hard-coded thing in the system.
+  stays live-measured.
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
 - **Press after driving and re-docking** — everything is already measured live per approach, but
   it has never been tried.

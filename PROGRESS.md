@@ -27,6 +27,70 @@ the button pixels come from Hough circles, not YOLO. Both were held constant on 
 a failed press could only be a geometry or motion problem. That paid off — every failure this
 session was diagnosable.
 
+### Detection replaced the OpenCV stand-in (2026-08-25)
+
+`press_buttons.py` no longer uses Hough circles or a hard-coded label grid. Both of the
+panel-specific constants are gone:
+
+| was | is now |
+|---|---|
+| `PANEL_LABELS` — a grid literal in the source | `configs/panels.yaml` — a registered layout, verified at run time |
+| `PANEL_ROI = (955,145,1130,480)` — measured by hand | derived from the detections by clustering (`panel_roi`) |
+
+Verified on hardware: **2/2 pressed**, depth error 0.09 mm, lateral 0.06 / 0.23 mm — and the
+planner produced the *same* roll/travel/clearance as the Hough version, which cross-validates
+the new positions. The auto-derived ROI came out `(955,124)-(1131,498)` against the hand-measured
+`(955,145,1130,480)`.
+
+The safety mechanism is real, not paper. Buttons the model reads confidently
+(`open`/`close`/`alarm`/`empty`) anchor the grid, and a mismatch REFUSES the press:
+
+- fed a deliberately inverted layout → anchors 0/4 → refused
+- a spurious extra detection made the grid `(2,2,2,2,2,1)` → refused, retried, passed
+- one anchor (`A`) misreads consistently, and `min_anchors: 2` is what tolerates it
+
+This matters because the failure being guarded against is **silent**: a shifted grid produces
+perfectly plausible coordinates and the robot would press the wrong floor with no error anywhere.
+
+**Hough vs detector, 20 live frames each, same frames.** The showroom light drifted the faceplate
+to 223 (blown out) mid-test, which turned into a robustness measurement:
+
+| | success | at panel brightness | position repeatability | per attempt |
+|---|---|---|---|---|
+| Hough circles | 1/20 | succeeded at 199, failed at 223 | — (one success) | 41 ms |
+| **detector** | **12/20** | succeeded at 221 | **±0.3 px** | 201 ms |
+
+At the designed brightness both work and press accuracy is indistinguishable, so the reason to
+switch is not accuracy — it is labels, the derived ROI, and light tolerance. 201 ms is 1 % of a
+23 s two-button sequence. `--circles` is kept as a fallback and A/B reference.
+
+### Model retrained on five merged datasets (2026-08-25)
+
+| | before | after |
+|---|---|---|
+| sources | 1 | **5** (CC BY 4.0 + MIT only — all commercially usable) |
+| images after de-dup | 2,019 | **7,178** (2,634 duplicates dropped) |
+| train / val | 1,412 / 405 | **6,084 / 1,076** |
+| all-class mAP50 | 0.30 | **0.676** |
+| common floors mAP50 | 0.70–0.85 | **`1` .965 `2` .964 `3` .955 `4` .954 `5` .894 `6` .898 `G` .937** |
+| **on OUR panel** | **3/8 markings** | **5/8** |
+
+Trained on the Orin's GPU in ~8.9 h (yolo11m, imgsz 640, 100 epochs). 27 % of the nominal 9,812
+images were duplicates — two of the five sources are the same upstream set at different versions,
+and two more are another shared upstream.
+
+The gain on our own panel is real but partial: `3` and `4` became correct (0.48 / 0.81) while
+`5`, `6` and `1` are still wrong. **This softens an earlier claim of mine** — "more data cannot
+help our panel because the marking is not in the image" was too strong. It holds for the worst
+buttons; for `3` and `4` the information was there and only the old model could not extract it.
+
+**GPU training on the Orin, without disturbing the shared torch**: an isolated venv
+`~/venv-dex-train` holds torch 2.8.0 + torchvision 0.23.0 CUDA builds from
+`pypi.jetson-ai-lab.io/jp6/cu126`. Three traps: `--extra-index-url` let pip pick PyPI's CPU
+wheel instead (use `--index-url` + `--no-deps`); torch **2.10**'s CUDA build needs
+`libcudss.so.0`, which JetPack does not ship, so 2.8.0 it is; and Ubuntu strips `ensurepip`, so
+the venv is made with `--without-pip` and bootstrapped via `get-pip.py`.
+
 ### The robot is standalone, and YOLO now runs on its GPU (2026-08-20)
 
 Nothing on the dev Mac is involved at run time — camera, arm, hand, pressing and button
@@ -140,49 +204,13 @@ candidate.
 
 ### Next, in order
 
-1. **Fine-tune YOLO on our own cam_chest captures.** Re-measured 2026-08-20, per button, on a
-   live frame — the baseline is **right on every marking that is actually legible** and wrong
-   only where the marking is barely in the image:
-
-   | button | marking | model says |
-   |---|---|---|
-   | `A` | yellow alarm bell (colour) | `alarm` **0.97** ✓ |
-   | `close` / `open` | arrow symbols | `close` **0.98** / `open` **0.93** ✓ |
-   | `2` | digit, happens to be legible | `2` **0.86** ✓ |
-   | blank disc | none | `empty` **0.98** ✓ (correct — nothing to read) |
-   | `5` `6` `3` `4` | laser-etched into brushed steel | `empty` / `12` / `15` / `37` ✗ |
-   | `1` | green star overlapping the digit | `15` ✗ |
-
-   So this is **not** a metal-vs-plastic domain gap; it is a marking-contrast problem. Ruled
-   out by measurement, not assumption: exposure (swept 50–190, best 3/8, and the low end is
-   *worst* at 0/8), upscaling (imgsz 640/1280/1920 — 1920 is worse), CLAHE, and unsharp
-   masking (makes every button `empty`). What DOES move the needle is the **direction of the
-   light**, not its amount: turning the room light off and re-sweeping exposure took
-   per-button contrast from **18.2 to 26.0 (+43 %)** and 3/8 to 4/8, and made `5`/`6`/`3`/`4`
-   legible to a human for the first time. The digits are a shadow feature, so a broad overhead
-   source fills the etch and erases them. "Turn the room light off" is a diagnostic, not a
-   deployment option — a real lobby's ceiling light is exactly the bad case and we do not
-   control it.
-
-   **DECIDED 2026-08-21: no added light.** The operator ruled out a robot-mounted grazing
-   light, so the etched digits stay marginal and nothing may depend on reading them. The plan:
-
-   | step | source | why |
-   |---|---|---|
-   | where the buttons are | **YOLO** | positions detect reliably (10/10); also deletes the OpenCV Hough stand-in |
-   | which floor each is | that elevator's **registered layout** | the arrangement on a faceplate is a physical property of that elevator |
-   | is the layout aligned | the buttons the model *does* read (`open`/`close`/`alarm`, 0.93-0.98) | their position in the layout is known, so they anchor the grid |
-   | anchors disagree | **refuse to press** | a mislabelled button is a SILENT failure — the wrong floor gets pressed with no error |
-
-   Registering a layout is NOT hard-coding the panel's position in space — that stays
-   live-measured, because the base docks with centimetres of error. Fine-tuning still happens,
-   but the goal drops from "read every digit" to "make positions and the high-contrast symbols
-   rock solid", which the existing light already supports.
-
-   Until that lands, what actually runs is OpenCV Hough circles (`yolo/button_circles.py`) for
-   positions plus the hard-coded `PANEL_LABELS` grid for floors — the one remaining hard-coded
-   thing in the system, and the reason a wrong panel would fail silently.
-   **Speed is already solved** — see the TensorRT section above; this is purely an accuracy item.
+1. **Fine-tune on our own cam_chest captures** — the remaining accuracy item. The five-source
+   public model now reads 5 of 8 markings on our panel (was 3/8); `5`, `6` and `1` still fail
+   because their etched marks are barely in the image, and a grazing light was ruled out. The
+   pipeline no longer *depends* on reading them — positions plus a registered layout carry the
+   press, with the readable buttons as anchors — so this is now about tightening the safety
+   margin rather than unblocking the feature. **Mix, do not replace**: training on our panel
+   alone would destroy the generality that makes the anchors work anywhere else.
 2. **Press after driving.** Everything is already live-measured per approach (plane fit + button
    3D), so re-docking should work without code changes — but it has never been tried.
 3. Two-stage path for the awkward buttons: `close` is reachable from only 14 of 24 rolls and `2`
@@ -204,6 +232,12 @@ button is harmless, so this is not blocking.
 - **Don't let the hand or plunger into the plane-fit ROI** — it dragged the fit by 23 mm.
 - Lock the camera exposure (`exposure: 156`, `gain: 16`). On auto, AE meters the mostly-dark wall
   and crushes the faceplate to ~34/255; the digits disappear entirely.
+- **The exposure constant WILL have to be re-tuned on site.** The lab is a showroom and is lit
+  far more strongly than a real lobby (operator-confirmed), and even within one session its light
+  drifted enough to take the faceplate from 199 to 223 — where Hough collapsed to 1/20. A value
+  tuned here is therefore almost certainly too dark in the field, in the opposite direction. The
+  durable fix is auto-exposure metered on the panel ROI only (follows the environment without
+  being dragged by the wall), which is not built yet.
 
 **Left/right arm VERIFIED (2026-08-14).** `.32`/`.33` are identical RM_65s, so the mapping was
 confirmed physically: with both arms polled, hand-pushing the right arm moved `.33` by 34.21°
@@ -304,6 +338,15 @@ not servo-locked — it hand-drags freely, which suits the drag-teach capture in
     produced a step-by-step profile summing to 10 ms for a call that took 26 ms. Discard
     120-150 iterations, and instrument the real call rather than timing steps in isolation
     (isolated timings are optimistic: the real loop's per-frame writes evict the cache).
+- **Detection wired into the press path (2026-08-25)** — `yolo/panel_layout.py` +
+  `configs/panels.yaml` replaced Hough circles and the hard-coded label grid. 2/2 pressed,
+  0.09 mm depth error; a deliberately inverted layout is refused. See the top section.
+- **Model retrained on 5 merged public datasets (2026-08-25)** — 7,178 images, all-class mAP50
+  0.30 → 0.676, and 3/8 → 5/8 markings correct on our own panel.
+- **Camera recovery**: the chest 335 can enumerate normally yet never deliver a colour frame
+  (every `capture()` fails after 40 retries). `pyorbbecsdk`'s `Device.reboot()` clears it in
+  ~25 s — no root, no replug. The head 335L working throughout is what identified it as
+  device state rather than a code fault.
 - Cameras: chest 335 `CP0BB5300041`, head 335L `CP2G8530000W` (pinned in `configs/cameras.yaml`).
 
 ## Not done yet (stubs / TODO)

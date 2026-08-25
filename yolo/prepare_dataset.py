@@ -69,6 +69,47 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # --------------------------------------------------------------------------- #
 # perceptual hash (DCT pHash, cv2-only -- no imagehash/PIL dependency)
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Class-name canonicalisation across sources
+#
+# Public elevator datasets do NOT agree on what to call a button. Merging them by
+# class id silently corrupts labels; merging by NAME needs this table first:
+#
+#   floor 3   ->  "3" (sun_moon)      "three" (annotations/saga)   "button-3" (entc)
+#   ground    ->  "G"                 —                            "button-g"
+#
+# Anything not listed passes through unchanged, so the 368-class taxonomy of the
+# largest source stays the canonical vocabulary and the small sets fold into it.
+# --------------------------------------------------------------------------- #
+CLASS_ALIASES: dict[str, str] = {
+    # spelled-out digits (annotations, saga)
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    # "button-" prefixed (entc)
+    "button-1": "1", "button-2": "2", "button-3": "3", "button-4": "4",
+    "button-5": "5", "button-g": "G", "button-up": "up", "button-down": "down",
+    "button-open": "open", "button-close": "close", "button-alarm": "alarm",
+}
+
+# Classes that are NOT buttons, or whose meaning is ambiguous enough that folding
+# them in would inject wrong labels. Dropped with a count so the loss is visible.
+#   closed-door  — a door STATE, not a button (door state is a depth problem here)
+#   floor-*      — entc has BOTH `button-1` and `floor-1`; the latter is most likely
+#                  the floor INDICATOR display, and guessing wrong mislabels a button
+#   red-sqr      — undocumented; only in one 542-image set
+CLASS_DROP: set[str] = {
+    "closed-door", "floor-1", "floor-2", "floor-3", "floor-ground", "red-sqr",
+}
+
+
+def canonical(name: str) -> str | None:
+    """Canonical class name, or ``None`` if this class should be dropped."""
+    n = name.strip()
+    if n in CLASS_DROP:
+        return None
+    return CLASS_ALIASES.get(n.lower(), n)
+
+
 def phash(path: Path, hash_size: int = 8) -> int | None:
     """64-bit DCT perceptual hash of an image, or ``None`` if it can't be read."""
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -135,15 +176,20 @@ def find_pairs(root: Path) -> list[tuple[str, Path, Path | None]]:
     return pairs
 
 
-def write_label(src_lbl: Path | None, dst_lbl: Path, collapse: bool = False) -> None:
-    """Copy a YOLO label file.
+def write_label(src_lbl: Path | None, dst_lbl: Path, collapse: bool = False,
+                remap: dict[int, int] | None = None) -> tuple[int, int]:
+    """Copy a YOLO label file, returning ``(kept, dropped)`` box counts.
 
-    ``collapse=False`` (default) keeps the original class ids (multi-class: each
-    floor symbol stays its own class). ``collapse=True`` forces class 0 (single
-    ``button`` class). Works for bbox (5 tokens) and segmentation (>5 tokens). An
-    empty or missing label becomes an empty file (a valid background image).
+    ``collapse=True`` forces class 0 (single ``button`` class). Otherwise ``remap``
+    translates this source's class ids into the merged vocabulary's ids; an id
+    missing from ``remap`` is a class this merge drops, and its boxes go with it.
+    With neither, the original ids are kept (single-source multi-class).
+
+    Works for bbox (5 tokens) and segmentation (>5 tokens). An empty or missing
+    label becomes an empty file (a valid background image).
     """
     out_lines: list[str] = []
+    dropped = 0
     if src_lbl and src_lbl.exists():
         for line in src_lbl.read_text().splitlines():
             parts = line.split()
@@ -151,8 +197,15 @@ def write_label(src_lbl: Path | None, dst_lbl: Path, collapse: bool = False) -> 
                 continue
             if collapse:
                 parts[0] = "0"
+            elif remap is not None:
+                tgt = remap.get(int(parts[0]))
+                if tgt is None:
+                    dropped += 1
+                    continue
+                parts[0] = str(tgt)
             out_lines.append(" ".join(parts))
     dst_lbl.write_text("\n".join(out_lines) + ("\n" if out_lines else ""))
+    return len(out_lines), dropped
 
 
 # --------------------------------------------------------------------------- #
@@ -233,18 +286,47 @@ def main() -> None:
         for d in args.src:
             sources.append((_tag(Path(d).name), locate_root(Path(d))))
 
-        # multi-class (default): keep the single source's own class taxonomy.
-        names = None
+        # Multi-class (default). Sources are merged by canonical class NAME, never
+        # by class id — different datasets number their classes differently, so an
+        # id-based merge silently relabels every box. Sources are taken
+        # largest-vocabulary-first so the richest taxonomy defines the ids and the
+        # smaller sets fold into it rather than the other way round.
+        names: list[str] | None = None
+        remaps: dict[str, dict[int, int]] = {}
         if not args.collapse:
-            if len(sources) != 1:
-                sys.exit("multi-class needs exactly ONE source (different datasets number "
-                         "their classes differently; merging by id would corrupt labels).\n"
-                         "Use one --src/--zip, or pass --collapse to flatten all to `button`.")
-            names = read_names(sources[0][1])
-            if not names:
-                sys.exit("could not read `names` from the source data.yaml; "
-                         "pass --collapse to train a single-class detector instead.")
-            print(f"multi-class: {len(names)} classes from {sources[0][0]}")
+            per_source: list[tuple[str, Path, list[str]]] = []
+            for tag, root in sources:
+                n = read_names(root)
+                if not n:
+                    sys.exit(f"could not read `names` from {tag}'s data.yaml; "
+                             "pass --collapse to train a single-class detector instead.")
+                per_source.append((tag, root, n))
+            per_source.sort(key=lambda t: -len(t[2]))
+
+            vocab: dict[str, int] = {}
+            for tag, _root, n in per_source:
+                for raw in n:
+                    c = canonical(raw)
+                    if c is not None and c not in vocab:
+                        vocab[c] = len(vocab)
+            names = [c for c, _ in sorted(vocab.items(), key=lambda kv: kv[1])]
+
+            print(f"multi-class: {len(names)} canonical classes from "
+                  f"{len(per_source)} source(s)")
+            for tag, _root, n in per_source:
+                m, dropped_names = {}, []
+                for i, raw in enumerate(n):
+                    c = canonical(raw)
+                    if c is None:
+                        dropped_names.append(raw)
+                    else:
+                        m[i] = vocab[c]
+                remaps[tag] = m
+                renamed = sum(1 for raw in n
+                              if canonical(raw) is not None and canonical(raw) != raw)
+                print(f"    {tag:<22} {len(n):>4} classes -> {len(m):>4} mapped"
+                      f"  ({renamed} renamed, {len(dropped_names)} dropped"
+                      + (f": {dropped_names}" if dropped_names else "") + ")")
         else:
             print("collapse: all classes -> single `button`")
 
@@ -282,13 +364,26 @@ def main() -> None:
             kept_hashes.append(h)
             exact.add(h)
 
-        # 3b. carve a val split if none of the sources had one ------------- #
-        if not any(r["split"] == "val" for r in kept):
-            cut = int(args.val_frac * 100)
-            for r in kept:
-                if r["split"] == "train" and (r["hash"] % 100) < cut:
-                    r["split"] = "val"
-            print(f"  no source val split -> carved ~{cut}% of train into val (by pHash)")
+        # 3b. make sure val is big enough to MEAN anything -------------------- #
+        # Trigger on the val FRACTION, not on val being absent. Merging several
+        # sources reliably produces a token val split — saga ships 5 val images,
+        # annotations 10 — and "some source had a val split" was enough to skip the
+        # carve entirely. That left 194 val images for a 369-class problem, i.e.
+        # well under one example per class, so every mAP number would have been
+        # noise while still looking like a real measurement.
+        n_val = sum(1 for r in kept if r["split"] == "val")
+        want = args.val_frac * len(kept)
+        if n_val < 0.5 * want:
+            need = want - n_val
+            pool = [r for r in kept if r["split"] == "train"]
+            # deterministic and independent of source order: rank by pHash
+            pool.sort(key=lambda r: r["hash"] % 100003)
+            for r in pool[:int(need)]:
+                r["split"] = "val"
+            print(f"  val was {n_val} ({n_val/len(kept):.1%}) -> carved "
+                  f"{int(need)} more from train, now "
+                  f"{sum(1 for r in kept if r['split'] == 'val')} "
+                  f"(~{args.val_frac:.0%} target)")
 
         # 4. write the merged dataset ------------------------------------- #
         if args.clean and out.exists():
@@ -297,13 +392,21 @@ def main() -> None:
             (out / "images" / split).mkdir(parents=True, exist_ok=True)
             (out / "labels" / split).mkdir(parents=True, exist_ok=True)
         counts: dict[str, int] = {}
+        boxes_kept = boxes_dropped = 0
         for r in kept:
             split = r["split"]
             name = f'{r["tag"]}__{r["img"].name}'
             shutil.copy2(r["img"], out / "images" / split / name)
-            write_label(r["lbl"], out / "labels" / split / f"{Path(name).stem}.txt",
-                        collapse=args.collapse)
+            k, d = write_label(r["lbl"], out / "labels" / split / f"{Path(name).stem}.txt",
+                               collapse=args.collapse,
+                               remap=remaps.get(r["tag"]))
+            boxes_kept += k
+            boxes_dropped += d
             counts[split] = counts.get(split, 0) + 1
+        # Report what the merge threw away — a silent drop here looks exactly like
+        # "that class was never in the data".
+        print(f"  boxes: {boxes_kept} kept"
+              + (f", {boxes_dropped} dropped (classes in CLASS_DROP)" if boxes_dropped else ""))
 
         # 5. data.yaml (absolute path -> works regardless of cwd) + provenance
         data_yaml: dict = {

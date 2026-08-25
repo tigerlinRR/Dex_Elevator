@@ -44,11 +44,12 @@ from core.press import (  # noqa: E402
 from core.robot.realman import RealmanArm  # noqa: E402
 from core.transforms import make_transform, matrix_to_rpy, rpy_to_matrix  # noqa: E402
 from yolo.button_circles import detect_buttons  # noqa: E402
+from yolo.panel_layout import assign, load_panel, panel_roi, tight_roi  # noqa: E402
 
-# Panel layout, top row first. Mock panel in the lab; a real car panel needs its
-# own layout (this is exactly the mapping YOLO replaces once it can read digits).
-PANEL_LABELS = [("A", "dot"), ("5", "6"), ("3", "4"), ("1", "2"), ("open", "close")]
-PANEL_ROI = (955, 145, 1130, 480)   # faceplate only: the wall behind is a second plane
+# Fallback layout for --circles (Hough circles cannot read labels, so the mapping
+# has to be supplied). The detector path gets its layout from configs/panels.yaml.
+CIRCLE_LABELS = [("A", "dot"), ("5", "6"), ("3", "4"), ("1", "2"), ("open", "close")]
+CIRCLE_ROI = (955, 145, 1130, 480)  # faceplate only: the wall behind is a second plane
 STANDOFF = 0.050                     # m. Cannot exceed ~50 mm — beyond that the target
                                      # sits inside the arm's inner unreachable region.
 
@@ -60,6 +61,14 @@ def main() -> int:
     ap.add_argument("--go", action="store_true", help="execute (default: plan only)")
     ap.add_argument("--push", type=float, default=None, help="override push depth (mm)")
     ap.add_argument("--camera", default="cam_chest")
+    ap.add_argument("--panel", default="mock_cabinet",
+                    help="registered layout id from configs/panels.yaml")
+    ap.add_argument("--circles", action="store_true",
+                    help="use the old Hough-circle finder + hard-coded grid instead "
+                         "of the detector (fallback / A-B comparison)")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="skip anchor verification. UNSAFE: a shifted grid then "
+                         "presses the wrong floor silently")
     args = ap.parse_args()
 
     cfg = load_pipeline()
@@ -74,21 +83,66 @@ def main() -> int:
     handle = CameraManager().build().get(args.camera)
     base_T_cam = handle.extrinsic
     cam = handle.camera
-    cam.start()
 
     # ---- locate the panel and every button once ----
+    # Detector path (default): a full-frame pass gives the button boxes, their union
+    # becomes the ROI, and a second pass on that crop gives the positions. Deriving
+    # the ROI from the detections rather than hard-coding it is what keeps the
+    # robot's own arm out of the plane fit — with the hand in a fixed ROI the fit
+    # was dragged 23 mm. It also removes the last panel-specific constant.
+    # Build the detector BEFORE starting the camera. Loading a 44 MB TensorRT
+    # engine and allocating its buffers takes a second or two, and doing that
+    # between start() and the first capture() starved the colour stream: the 335
+    # emits depth-only framesets until colour syncs in, and it burned through all
+    # 40 retries. Symptom is "no color frame after 40 tries", which reads like a
+    # broken camera.
+    detector = layout = None
+    if not args.circles:
+        from yolo.trt_detector import TrtButtonDetector  # noqa: E402
+        detector = TrtButtonDetector()
+        layout = load_panel(args.panel)
+        print(f"panel {layout.id!r}: {layout.shape} grid, "
+              f"{len(layout.anchors)} anchors, engine {detector.engine_path.name}")
+    cam.start()
+
     buttons3d = plane = None
-    for _ in range(6):
+    for attempt in range(6):
         frame = cam.capture()
-        fit = fit_panel_plane_from_depth(frame, base_T_cam, roi=PANEL_ROI)
-        if fit is None:
-            continue
+        bgr = cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR)
+
+        if args.circles:
+            roi = CIRCLE_ROI
+            fit = fit_panel_plane_from_depth(frame, base_T_cam, roi=roi)
+            if fit is None:
+                continue
+            grid, p2 = detect_buttons(bgr, roi, CIRCLE_LABELS)
+            if grid is None:
+                continue
+            print(f"located panel + {len(grid)} buttons (Hough, param2={p2})")
+        else:
+            # Order matters: buttons first, THEN the plane. The coarse ROI is
+            # deliberately generous and can reach past the faceplate onto the
+            # cabinet — a second, roughly parallel plane that would bias the fit.
+            # Once the buttons are known, the fit gets a box around them alone.
+            coarse = panel_roi(bgr, detector, verbose=True)
+            if coarse is None:
+                print(f"  [{attempt + 1}/6] no buttons in the frame at all")
+                continue
+            grid, rep = assign(bgr, coarse, detector, layout,
+                               verify=not args.no_verify)
+            for line in rep.lines():
+                print(f"  [{attempt + 1}/6] {line}")
+            if not rep.ok:
+                continue
+            roi = tight_roi(rep.found, bgr.shape[:2])
+            fit = fit_panel_plane_from_depth(frame, base_T_cam, roi=roi)
+            if fit is None:
+                print(f"  [{attempt + 1}/6] plane fit failed in ROI {roi}")
+                continue
+            print(f"  [{attempt + 1}/6] plane fitted in {roi} "
+                  f"(coarse was {coarse})")
+
         origin, normal = fit
-        grid, p2 = detect_buttons(cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR),
-                                  PANEL_ROI, PANEL_LABELS)
-        if grid is None:
-            continue
-        print(f"located panel + {len(grid)} buttons (circle param2={p2})")
         buttons3d = {
             name: ray_plane_intersection(px, frame.intrinsics, base_T_cam,
                                          origin + protrusion * normal, normal)
@@ -97,7 +151,8 @@ def main() -> int:
         plane = (origin, normal)
         break
     if buttons3d is None:
-        print("!! could not locate the panel/buttons — is the arm blocking the view?")
+        print("!! could not locate the panel/buttons — is the arm blocking the view, "
+              "or is this a different panel than the registered layout?")
         return 1
     origin, normal = plane
     inward = -normal
