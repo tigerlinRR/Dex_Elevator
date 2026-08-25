@@ -178,6 +178,45 @@ sweeps ports/slaves read-only to locate the device — verified `port=1, slave=0
 The fingertip TCP is `hand.fingertip_offset` in `configs/pipeline.yaml`, derived from
 LinkerBot's official O6 URDF + STL meshes (github.com/linker-bot/linkerhand-urdf).
 
+**Choosing a press pose is constrained, not scripted** (`plan()` in
+`initialization/press_buttons.py`, thresholds in `arm.limits`). The approach roll is
+still searched over all 24 directions; what is fixed is which poses are DISALLOWED.
+Measured against the controller's real limits (J1 +-178, J2 +-130, **J3 +-135**,
+J4 +-178, J5 +-128, J6 +-360 — read, not guessed):
+- The old objective, least joint travel, was picking poses sitting ON a hard stop:
+  **0.1 deg** of J3 margin for button `2`, 0.7 deg for `4`. J3 binds for every button
+  on this panel, and the controller's own self-collision check is **off**, so "IK
+  returned a solution" is not "safe to execute".
+- Maximising margin instead swings the path INTO the panel (measured clearance
+  -12.0 mm for `dot`, -3.4 mm for `A`). So: reject the unsafe, then take the largest
+  margin among survivors, breaking ties on travel. Margins went 0.7 -> 3.6 deg for
+  `4`, 4.1 -> 9.2 for `6`, 3.9 -> 7.6 for `3`.
+- **The contact pose is now IK-checked too.** It never was: only the standoff was
+  solved, and the press itself was a Cartesian `movel` 50 mm further in. Driving a
+  straight line into a pose with no good solution is exactly where the arm jams.
+- Button `2` is now REFUSED from the current lift height, because its best achievable
+  margin is 1.0 deg. It used to "work" on 0.1 deg of margin, i.e. by luck. The fix is
+  the lift (below), not a looser threshold.
+
+**Panel height is handled by the lift, panel-independently** (`arm.lift`). What
+governs reachability is the button's height in the base frame, and the lift moves that
+frame — so `required_lift = command_min + command_per_mm * (z_measured - target_z)`
+works on any elevator instead of a per-panel constant. Three measured facts that all
+look different from what they are:
+- **The lift is on the LEFT controller.** The right one answers `rm_get_lift_state`
+  with `pos = 0`, which reads exactly like "fully down".
+- **Reported position is 2x the real travel** (ratio 0.5016 / 0.5021 / 0.5008 over
+  three different moves, checked against the camera). Command and readback agree to
+  1 mm and `err_flag` stays clean, so nothing warns you — only measuring the geometry
+  reveals that the body rose half as far.
+- **The blocking form of `rm_set_lift_height` hangs forever past the travel limit**
+  (1100 is fine, 1200 never returns). Use the non-blocking form and poll for
+  `mode != 2`.
+Repeatability is 0.09 mm at command 444 and 0.24 mm at 600 (spread of the panel's
+measured z over four cycles), which is what makes **look low, press high** viable: the
+camera rides the lift, so past ~175 mm of real rise the bottom button row leaves the
+frame, while the arm wants another 200 mm on top of that.
+
 **Autonomous pressing** (`initialization/press_buttons.py`) — the executable that
 ties everything together: `python3 initialization/press_buttons.py 1 4 2 5 --go`.
 Per button: home -> `movej` to standoff -> `movel` through contact into the button

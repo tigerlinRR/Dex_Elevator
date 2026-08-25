@@ -229,6 +229,19 @@ Measured, not assumed:
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
 | plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
 
+**Press poses are bounded, and the lift makes reach panel-independent (2026-08-25).**
+The approach roll is still searched; `arm.limits` says which poses are disallowed. Against the
+controller's real joint limits the old "least joint travel" rule been choosing poses sitting
+on a hard stop — 0.1° of J3 margin for button `2`, 0.7° for `4` — and the contact pose was never
+IK-checked at all. Margins are now 3.6–19.8° where they were 0.7–13.2°, verified with a 2/2 press
+at the newly chosen rolls.
+
+Panel height is absorbed by the torso lift rather than a per-panel constant:
+`required_lift = command_min + 2 × (z_measured − 0.240 m)`. That makes **button centres
+0.71–1.23 m off the floor** pressable, covering the ADA range of 0.89–1.22 m. Three measured
+surprises are recorded in the config: the lift is on the LEFT controller, its reported position is
+**twice** the real travel, and the blocking move call hangs forever past the travel limit.
+
 **Detection drives the press (2026-08-25).** `press_buttons.py` gets button positions from the
 detector and floor labels from a registered layout in `configs/panels.yaml`; both panel-specific
 constants (the label grid and the hand-measured ROI) are gone. The ROI is now derived from the

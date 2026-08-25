@@ -27,6 +27,73 @@ the button pixels come from Hough circles, not YOLO. Both were held constant on 
 a failed press could only be a geometry or motion problem. That paid off — every failure this
 session was diagnosable.
 
+### Press poses are now bounded, and the lift makes it panel-independent (2026-08-25)
+
+**Boundaries, not a recipe.** The approach roll is still searched over all 24
+directions; `arm.limits` in `configs/pipeline.yaml` says which poses are disallowed.
+Read from the controller, the real joint limits are J1 +-178, J2 +-130, **J3 +-135**,
+J4 +-178, J5 +-128, J6 +-360 — and J3 binds for every button on this panel:
+
+| button | old margin to J3's stop | new |
+|---|---|---|
+| `2` | **0.1 deg** | refused (see below) |
+| `4` | 0.7 | **3.6** |
+| `6` | 4.1 | **9.2** |
+| `3` | 3.9 | **7.6** |
+| `5` | 7.0 | **12.9** |
+| `A` | 13.2 | **19.8** |
+
+Verified on hardware after the change: 2/2 pressed, depth error 0.09 mm, lateral
+0.18 / 0.35 mm — at different rolls than before (`1` moved 30 -> 105, `4` 30 -> 180).
+
+Three things this exposed:
+- The old objective (least joint travel) was selecting poses **on a hard stop**.
+  Button `2` had been working on 0.1 deg of margin, i.e. by luck; it is now refused,
+  which is a real functional loss and the correct call.
+- Maximising margin instead is not the answer — it swings the path into the panel
+  (clearance -12.0 mm for `dot`). Hence constraints plus an objective.
+- **The contact pose was never IK-checked.** Only the standoff was solved; the press
+  was a Cartesian `movel` 50 mm further in. That is precisely where a jam comes from,
+  and the controller's own self-collision check is **off** (verified).
+
+**The lift is the fix for the thin-margin buttons, and it generalises.** What governs
+reachability is the button's height in the base frame; the lift moves that frame, so
+`required_lift = 444 + 2 * (z_measured - 0.240 m)` works on any elevator rather than
+being a constant tuned to this faceplate. The arm is 10/10 reachable for panel-centre
+heights of 0.19-0.39 m, but the margin across that band runs 2.8 deg at 0.39 to
+41.4 deg at 0.19.
+
+| lift command | base-frame origin above floor | pressable button heights |
+|---|---|---|
+| 444 (as found) | 516 mm | **706 - 906 mm** |
+| 1100 (verified max) | 844 mm | **1034 - 1234 mm** |
+
+So **button centres 0.71 - 1.23 m off the floor are pressable**, which covers the ADA
+range of 0.89 - 1.22 m — though the top of that is reached at the thin-margin end of
+the band, so high panels have less margin than low ones.
+
+Measured facts behind this, each of which looks like something else:
+- **The lift hangs off the LEFT controller.** The right one returns `pos = 0`, which
+  reads exactly like "fully down" — it is actually at 444.
+- **Reported position is 2x the real vertical travel** (0.5016 / 0.5021 / 0.5008 over
+  three moves, measured against the camera). Command and readback agree to 1 mm and
+  `err_flag` stays clean, so nothing flags it; only measuring the geometry shows the
+  body moved half as far. Trusting the number would have put the compensation out by
+  78 mm, on a press where 1 mm decides button versus chamfer.
+- **The blocking `rm_set_lift_height` hangs forever past the limit** — 1100 holds,
+  1200 never returns. Use the non-blocking form and poll until `mode != 2`.
+- **Repeatability 0.09 mm at 444 and 0.24 mm at 600**, as the spread of the panel's
+  measured z over four cycles — better than the press's own lateral error, which is
+  what makes "look low, press high" viable.
+- The base frame's origin is ~525 mm BELOW the arm's own mounting flange (a tape put
+  the flange at 41 in while the origin computes to 515.9 mm), so it is not the arm
+  base — but it does ride the lift, which is all the model needs. Its height was
+  derived from the camera's z for the `3`/`4` row (+568.4 mm) against a tape reading
+  of 42-11/16 in, and cross-checked by predicting the row spacing (86.3 mm) before
+  measuring it (3-3/8 to 3-1/2 in).
+
+Not yet done: actually moving the lift as part of a press ("look low, press high").
+
 ### Detection replaced the OpenCV stand-in (2026-08-25)
 
 `press_buttons.py` no longer uses Hough circles or a hard-coded label grid. Both of the
@@ -213,8 +280,10 @@ candidate.
    alone would destroy the generality that makes the anchors work anywhere else.
 2. **Press after driving.** Everything is already live-measured per approach (plane fit + button
    3D), so re-docking should work without code changes — but it has never been tried.
-3. Two-stage path for the awkward buttons: `close` is reachable from only 14 of 24 rolls and `2`
-   from 8 of 24. They work today, but with little margin.
+3. **Implement "look low, press high"** — raise the lift to the height the boundary check
+   wants, compensating the targets by the measured 2:1 ratio. This is what restores button `2`
+   (refused today at 1.0 deg of margin) and takes the worst margin from 1 to 28 deg. All the
+   constants are measured and in `arm.lift`; the motion has never been put in the press loop.
 4. Force-limited press (`rm_force_position_move_pose`) — now optional, the spring is the
    compliance.
 5. Route fix + Tailscale (the installed node belongs to `tony.h@` and is offline).

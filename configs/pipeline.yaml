@@ -21,6 +21,85 @@ arm:
   # Required joint travel (117-166 deg) is larger than the rejected candidate's
   # (33-143), which is the price paid for not blocking the camera.
   home_joints_deg: [39.76, -100.13, -79.28, -131.63, 117.0, 68.12]
+  # BOUNDARIES for choosing a press pose. These say what is NOT allowed; the
+  # approach roll itself is still searched, never hard-coded.
+  #
+  # Why this exists: the old rule was "pick the reachable roll with the least joint
+  # travel", and measured against the real joint limits (J1 +-178, J2 +-130,
+  # J3 +-135, J4 +-178, J5 +-128, J6 +-360, read from the controller) that rule was
+  # choosing poses sitting ON a hard stop — button `2` at **0.1 deg** from J3's
+  # limit and `4` at 0.7 deg. J3 is the binding joint for every button on this panel.
+  # The controller's own self-collision check is also OFF (verified), so "IK returned
+  # a solution" is not the same as "safe to execute".
+  #
+  # Maximising margin instead is NOT the answer either: it swings the path into the
+  # panel (measured clearance -12.0 mm for `dot`, -3.4 mm for `A`). Hence constraints
+  # plus an objective: reject the unsafe, then take the largest margin among what is
+  # left, breaking ties by joint travel.
+  limits:
+    # Degrees the closest joint must stay clear of its hard stop, checked at BOTH the
+    # standoff and the contact pose. 1.0 is deliberately low, not comfortable: the
+    # best achievable is 1.0 deg for `2` and 2.1 for `close` from the current home
+    # pose, so a stricter floor would make those two unpressable. Their thin margin
+    # is a geometry problem to fix with the home pose or the torso lift, not with
+    # this number.
+    min_joint_margin_deg: 1.0
+    # |J5| must stay away from the wrist singularity at J5 = 0, where a straight-line
+    # move demands huge joint rates and the controller stalls. Measured range in use
+    # is 80-104 deg, so 15 only rejects the pathological cases.
+    min_wrist_deg: 15.0
+    # Largest allowed single-step joint change along the interpolated path. A
+    # configuration flip (elbow or wrist branch change) shows up as a jump far above
+    # the ~15 deg/step seen on healthy paths, and executes as a violent detour.
+    max_path_jump_deg: 45.0
+    # The plunger must not sweep into the faceplate on the way in.
+    min_clearance_mm: 5.0
+  # TORSO LIFT — the height model that makes this panel-independent.
+  #
+  # The arm's reachable band is a property of the ARM, expressed as the button's
+  # height in the base frame; the lift moves that frame, so any panel height can be
+  # brought into the band. Tuning a lift height for one faceplate would produce a
+  # constant that is wrong for the next elevator; this is the reusable form.
+  #
+  # ALL of these were measured on hardware 2026-08-25, and two of them would have
+  # been badly wrong if assumed:
+  lift:
+    controller: left       # the lift hangs off the LEFT arm's controller. The RIGHT
+                           # one answers rm_get_lift_state with a meaningless pos=0,
+                           # which reads exactly like "the lift is at the bottom".
+    # The reported position is TWICE the real vertical travel. Measured over three
+    # different moves (76 / 116 / 256 reported) against the camera's own measurement
+    # of the panel: ratio 0.5016 / 0.5021 / 0.5008. Trusting the reported number
+    # would have put the compensation out by 78 mm, and 1 mm already decides whether
+    # the plunger lands on the button or its chamfer.
+    command_per_mm: 2.0
+    # Verified travel. 1100 is reachable and holds; commanding 1200 hangs the
+    # BLOCKING form of rm_set_lift_height forever, so always use the non-blocking
+    # form (last arg 0) and poll rm_get_lift_state until mode != 2.
+    command_min: 444       # the height this session found it at; lower is untested
+    command_max: 1100
+    # Height of the base frame's ORIGIN above the floor at command_min. Derived, not
+    # guessed: the camera puts the `3`/`4` row at z = +568.4 mm in the base frame and
+    # a tape puts it 42-11/16 in = 1084.3 mm off the floor, so the origin sits at
+    # 1084.3 - 568.4 = 515.9 mm. Cross-checked by predicting the top row's spacing
+    # (86.3 mm) before measuring it: the tape came back 3-3/8 to 3-1/2 in.
+    # NOTE the origin is ~525 mm BELOW the arm's own mounting flange, so it is not
+    # the arm base — but it does ride the lift (proved by the panel's z changing with
+    # lift height), which is all this model needs.
+    origin_above_floor_mm: 515.9
+    # Where to put the panel centre in the base frame before pressing. The arm is
+    # 10/10 reachable across 0.19-0.39 m, but the margin to the nearest joint hard
+    # stop varies enormously across that band: 2.8 deg at 0.39, 12.9 at 0.32,
+    # 28.4 at 0.24, 41.4 at 0.19 (which the lift cannot reach from here). 0.240 is
+    # the best the travel allows and gives 28 deg — against 1 deg at today's height.
+    target_relative_z_m: 0.240
+    usable_relative_z_m: [0.19, 0.39]
+    # The camera rides the lift too, so raising it drops the panel in the image: past
+    # about 175 mm of real rise the bottom row leaves the frame. Hence LOOK LOW,
+    # PRESS HIGH — localise at a height where the panel is visible, then raise and
+    # compensate. Safe to do because the lift repeats to 0.09 mm at 444 and 0.24 mm
+    # at 600, measured as the spread of the panel's z over four cycles.
+    max_view_rise_mm: 175
   side: right              # the button-pressing arm (192.168.11.33 on the Orin unit)
   ip: "192.168.11.33"      # left/right VERIFIED 2026-08-14 (hand-push test)
   port: 8080

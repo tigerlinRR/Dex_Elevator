@@ -52,6 +52,9 @@ CIRCLE_LABELS = [("A", "dot"), ("5", "6"), ("3", "4"), ("1", "2"), ("open", "clo
 CIRCLE_ROI = (955, 145, 1130, 480)  # faceplate only: the wall behind is a second plane
 STANDOFF = 0.050                     # m. Cannot exceed ~50 mm — beyond that the target
                                      # sits inside the arm's inner unreachable region.
+# Hard stops read from the controller (rm_get_joint_max_pos) on the RIGHT RM-65, not
+# guessed. J3 is the one that binds for every button on this panel.
+J_LIMIT = np.array([178.0, 130.0, 135.0, 178.0, 128.0, 360.0])
 
 
 def main() -> int:
@@ -76,6 +79,7 @@ def main() -> int:
     protrusion = cfg["elevator"]["press"]["button_protrusion"]
     push = args.push / 1000.0 if args.push is not None else cfg["elevator"]["press"]["push_depth"]
     home = cfg["arm"]["home_joints_deg"]
+    LIM = cfg["arm"]["limits"]
 
     arm = RealmanArm(side=cfg["arm"]["side"])
     arm.connect()
@@ -164,23 +168,81 @@ def main() -> int:
 
     from Robotic_Arm.rm_ctypes_wrap import rm_inverse_kinematics_params_t  # noqa: E402
 
-    def plan(target_tip, seed):
-        """Best (least joint travel) reachable approach orientation, or None."""
-        best = None
+    def ik(target_tip, R, seed):
+        cmd = make_transform(R, target_tip) @ make_transform(np.eye(3), -tcp)
+        params = rm_inverse_kinematics_params_t(
+            seed, list(cmd[:3, 3]) + list(matrix_to_rpy(R, degrees=False)), 1)
+        code, sol = sdk.rm_algo_inverse_kinematics(params)
+        return [float(x) for x in sol] if code == 0 else None
+
+    def joint_margin(q):
+        """Degrees the closest joint has left before its hard stop."""
+        q = np.asarray(q, dtype=np.float64)
+        return float(np.min(np.minimum(J_LIMIT - q, q + J_LIMIT)))
+
+    def plan(button, seed):
+        """Choose an approach roll that satisfies the boundaries, or explain why not.
+
+        The roll is SEARCHED, not hard-coded — what is fixed is which poses are
+        disallowed (`arm.limits` in configs/pipeline.yaml). Two things this fixes:
+
+        * The old rule took the least-joint-travel solution, which on this panel
+          meant poses sitting on a hard stop: 0.1 deg of J3 margin for `2`, 0.7 for
+          `4`. J3 binds for every button here and the controller's self-collision
+          check is off, so an IK solution alone is no guarantee.
+        * The contact pose was never IK-checked at all — only the standoff was, and
+          the press itself was a Cartesian `movel` into whatever lay 50 mm further
+          in. Driving a straight line into a pose with no good solution is exactly
+          where the arm jams.
+
+        Returns ``(travel, deg, q_standoff, margin, reasons)``; ``reasons`` counts why
+        rolls were rejected, so a refusal says WHICH boundary bit.
+        """
+        cands, reasons = [], {}
+
+        def reject(why):
+            reasons[why] = reasons.get(why, 0) + 1
+
         for deg in range(0, 360, 15):
             a = np.radians(deg)
             R = _orthonormal_frame(inward, up_hint=np.cos(a) * e1 + np.sin(a) * e2)
-            cmd = make_transform(R, target_tip) @ make_transform(np.eye(3), -tcp)
-            params = rm_inverse_kinematics_params_t(
-                seed, list(cmd[:3, 3]) + list(matrix_to_rpy(R, degrees=False)), 1)
-            code, sol = sdk.rm_algo_inverse_kinematics(params)
-            if code != 0:
+            q_off = ik(button + normal * STANDOFF, R, seed)
+            if q_off is None:
+                reject("no IK at standoff")
                 continue
-            sol = [float(x) for x in sol]
-            travel = max(abs(x - y) for x, y in zip(sol, seed))
-            if best is None or travel < best[0]:
-                best = (travel, deg, sol)
-        return best
+            q_on = ik(button - normal * push, R, q_off)
+            if q_on is None:
+                reject("no IK at contact")
+                continue
+            margin = min(joint_margin(q_off), joint_margin(q_on))
+            if margin < LIM["min_joint_margin_deg"]:
+                reject(f"joint margin < {LIM['min_joint_margin_deg']} deg")
+                continue
+            wrist = min(abs(q_off[4]), abs(q_on[4]))
+            if wrist < LIM["min_wrist_deg"]:
+                reject(f"wrist singularity (|J5| < {LIM['min_wrist_deg']} deg)")
+                continue
+            steps = np.linspace(seed, q_off, 21)
+            jump = max(float(np.abs(np.diff(steps, axis=0)).max()),
+                       float(np.abs(np.array(q_on) - np.array(q_off)).max()))
+            if jump > LIM["max_path_jump_deg"]:
+                reject(f"path jump > {LIM['max_path_jump_deg']} deg "
+                       "(configuration flip)")
+                continue
+            clear = clearance(seed, q_off)
+            if clear < LIM["min_clearance_mm"]:
+                reject(f"clearance < {LIM['min_clearance_mm']} mm")
+                continue
+            travel = max(abs(x - y) for x, y in zip(q_off, seed))
+            cands.append((travel, deg, q_off, margin, clear))
+        if not cands:
+            return None, reasons
+        # Largest joint-limit margin wins; joint travel only breaks ties. Maximising
+        # margin alone would swing the path into the panel (measured -12.0 mm for
+        # `dot`), which is what the clearance boundary above is there to stop.
+        cands.sort(key=lambda c: (-c[3], c[0]))
+        travel, deg, q_off, margin, clear = cands[0]
+        return (travel, deg, q_off, margin, clear, len(cands)), reasons
 
     def clearance(seed, goal):
         """Closest the plunger tip gets to the panel along the joint-interpolated path."""
@@ -210,18 +272,19 @@ def main() -> int:
                 results.append((name, False))
                 break
             seed = list(arm.get_joint_angles())
-        best = plan(button + normal * STANDOFF, seed)
+        best, reasons = plan(button, seed)
         if best is None:
-            print("    no IK solution")
+            print("    no pose satisfies the boundaries:")
+            for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+                print(f"      {n:>2}/24 rolls  {why}")
             results.append((name, False))
             continue
-        travel, deg, goal = best
-        clear = clearance(seed, goal)
-        print(f"    roll={deg} travel={travel:.0f} deg clearance={clear:.0f} mm")
-        if clear <= 5:
-            print("    path would hit the panel, refusing")
-            results.append((name, False))
-            continue
+        travel, deg, goal, margin, clear, n_ok = best
+        print(f"    roll={deg} travel={travel:.0f} deg  joint margin={margin:.1f} deg  "
+              f"clearance={clear:.0f} mm  ({n_ok}/24 rolls passed)")
+        if reasons:
+            worst = sorted(reasons.items(), key=lambda kv: -kv[1])[:2]
+            print("      rejected: " + ", ".join(f"{n}x {why}" for why, n in worst))
         if not args.go:
             results.append((name, None))
             continue
