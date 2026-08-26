@@ -58,3 +58,21 @@ robot's real `x,y[,yaw]` and compare to the elevator point:
 - `GET  /task/v3/{id}` — status (isFinish / isCancel)
 - `POST /task/v3/{id}/cancel`
 - `GET  /robot/v2.0/{serial}/state` — live x,y,yaw,moveState
+
+## Running ON the AGX (on-robot deployment)
+Runs on the robot itself, so it does not depend on a laptop being connected and the
+press is a **local** call (no SSH).
+
+    # on the AGX (ssh in), in the repo:
+    cd ~/Dex_Elevator/elevator_runner
+    printf 'AUTOXING_APP_ID="..."\nAUTOXING_APP_SECRET="..."\nAUTOXING_APP_CODE="APPCODE ..."\nROBOT_SERIAL="1352512k06960Og"\nAGX_SSH="local"\n' > .env
+    chmod 600 .env
+    /usr/bin/python3 -m pip install --user flask requests
+    /usr/bin/python3 server.py            # binds 127.0.0.1:8765 (localhost only)
+
+- Set **`AGX_SSH="local"`** so the press runs `press_buttons.py` directly (no SSH).
+- The page binds to **localhost only**. To open it from your laptop, SSH-tunnel:
+      ssh -L 8765:127.0.0.1:8765 dex-agx      # then browse http://127.0.0.1:8765/
+  (Do NOT bind 0.0.0.0 — the page has no auth and this is a shared machine.)
+- **Shared-machine caveat:** the AGX hosts other people's projects. Keep `.env` at
+  `chmod 600`, never commit it (it is gitignored), and remove it if the tool is retired.

@@ -376,9 +376,19 @@ def run_loop(params):
 
 
 def press_on_agx(floors):
-    """SSH into the AGX and run the press. Returns (ok, output_tail)."""
+    """Run the button press. Returns (ok, output_tail).
+
+    Two modes, chosen by AGX_SSH:
+      * "local" / "" / "localhost" -> the tool is RUNNING ON THE AGX; run
+        press_buttons.py directly, no SSH. This is the on-robot deployment.
+      * anything else              -> treat it as an ssh target/alias and run the
+        press remotely over SSH (tool running on a laptop).
+    """
     cmd = CFG["press_cmd"].format(floors=floors)
-    full = ["ssh", CFG["agx_ssh"], cmd]
+    if CFG["agx_ssh"] in ("", "local", "localhost"):
+        full = ["bash", "-lc", cmd]            # local: tool is on the AGX
+    else:
+        full = ["ssh", CFG["agx_ssh"], cmd]    # remote: over SSH from a laptop
     try:
         r = subprocess.run(full, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:

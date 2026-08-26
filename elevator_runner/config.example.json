@@ -5,5 +5,6 @@
   "app_code": "APPCODE xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   "robot_serial": "YOUR_ROBOT_SERIAL",
   "agx_ssh": "dex-agx",
-  "press_cmd": "cd ~/Dex_Elevator && PYTHONPATH=. /usr/bin/python3 initialization/press_buttons.py {floors} --go --lift"
+  "press_cmd": "cd ~/Dex_Elevator && PYTHONPATH=. /usr/bin/python3 initialization/press_buttons.py {floors} --go --lift",
+  "_agx_ssh_help": "\"local\" when running ON the AGX (press runs directly); or an ssh alias like \"dex-agx\" when running on a laptop"
 }
