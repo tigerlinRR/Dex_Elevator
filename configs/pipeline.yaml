@@ -87,13 +87,24 @@ arm:
     # the arm base — but it does ride the lift (proved by the panel's z changing with
     # lift height), which is all this model needs.
     origin_above_floor_mm: 515.9
-    # Where to put the panel centre in the base frame before pressing. The arm is
-    # 10/10 reachable across 0.19-0.39 m, but the margin to the nearest joint hard
-    # stop varies enormously across that band: 2.8 deg at 0.39, 12.9 at 0.32,
-    # 28.4 at 0.24, 41.4 at 0.19 (which the lift cannot reach from here). 0.240 is
-    # the best the travel allows and gives 28 deg — against 1 deg at today's height.
-    target_relative_z_m: 0.240
-    usable_relative_z_m: [0.19, 0.39]
+    # The lift height is SEARCHED, not computed from a target. There used to be a
+    # `target_relative_z_m: 0.240` here, measured at one docking distance and applied
+    # everywhere. Re-docked 12 cm further out it selected the WORST heights on offer:
+    # button `1` had 12 of 24 approach rolls at the computed height and 0 of 24 one
+    # step above, while every height from 444 to 944 gave 24/24 with 41-56 deg of
+    # margin. Reachability depends on distance AND height; only height was measured
+    # and the result was over-generalised. Searching needs no such map.
+    #
+    # Step through the travel at this granularity. 50 command units = 25 mm of real
+    # rise; the margin surface is smooth over tens of mm, so this is fine and costs
+    # ~14 boundary evaluations per button (sub-millisecond IK each).
+    search_step: 50
+    # A height clearing this margin is "good enough", and among those the one needing
+    # the LEAST torso motion wins. That keeps the torso still at a comfortable docking
+    # distance — moving it costs seconds and drops the panel out of the camera's view —
+    # while still using the full travel when the arm genuinely cannot reach otherwise.
+    # 20 deg is well clear of the 1 deg floor that `2` used to press on.
+    prefer_margin_deg: 20.0
     # The camera rides the lift too, so raising it drops the panel in the image: past
     # about 175 mm of real rise the bottom row leaves the frame. Hence LOOK LOW,
     # PRESS HIGH — localise at a height where the panel is visible, then raise and

@@ -143,10 +143,21 @@ class AutoXing:
             if not items:
                 break
             for p in items:
+                # AutoXing returns a POI's position as `coordinate: [x, y]`, NOT as
+                # top-level x/y -- unlike robot_state, which does use top-level x/y.
+                # Reading p["x"] therefore defaulted every POI to (0, 0), silently.
+                # The arrival gate then measured the robot's distance to the MAP
+                # ORIGIN (~29 m here) against an 8 cm tolerance, so a live run would
+                # drive to the elevator, refuse to press as "out of reach", back off
+                # and retry until it gave up. The dry run hides this because it
+                # substitutes a fixed 3.0 cm simulated arrival error.
+                coord = p.get("coordinate") or []
                 out.append({
                     "id": p.get("id") or (p.get("ext") or {}).get("id", ""),
                     "name": (p.get("ext") or {}).get("name") or p.get("name") or "Waypoint",
-                    "x": p.get("x", 0), "y": p.get("y", 0), "yaw": p.get("yaw", 0),
+                    "x": coord[0] if len(coord) > 0 else p.get("x", 0),
+                    "y": coord[1] if len(coord) > 1 else p.get("y", 0),
+                    "yaw": p.get("yaw", 0),
                     "type": p.get("type", -1), "areaId": p.get("areaId", ""),
                     "floor": p.get("floor", ""),
                 })

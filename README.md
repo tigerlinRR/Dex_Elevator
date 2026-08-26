@@ -70,7 +70,8 @@ Dex_Elevator/
 ├── yolo/                   # TensorRT GPU detector, panel-layout matcher, dataset prep & training
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
 ├── initialization/         # bring-up check, calibration + eval scripts, and press_buttons.py (the presser)
-├── configs/                # cameras.yaml, pipeline.yaml
+├── configs/                # cameras.yaml, pipeline.yaml, panels.yaml
+├── elevator_runner/        # drive-to-the-panel tool (AutoXing cloud API + press)
 └── data/                   # weights/, calibration/ (gitignored)
 ```
 
@@ -228,6 +229,24 @@ Measured, not assumed:
 | push depth | 3 mm (1 and 2 mm failed to light the button; 3 mm lit it repeatably) |
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
 | plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
+
+**Pressing after driving — working (2026-08-26).** Re-docked three times at three
+different stopping positions and pressed 4 of 4 each time; the worst docking error absorbed was
+123 mm further out, 44 mm sideways and 4.5° of yaw, with no constant changed. Getting there took
+two fixes: the grid check became a **lattice fit** that infers buttons the detector missed (at
+that distance it drops one or two per frame), and the anchor test became **relative** — the
+unshifted alignment only has to beat every shifted one, because an absolute "2 of 4 must read
+correctly" refused a correct grid once the buttons shrank from 50 to 44 px.
+
+**The lift height is searched, not computed.** A target height measured at one docking distance
+picked the worst heights available once the robot parked 12 cm further out — button `1` had 0 of
+24 approach rolls there while every height from 444 to 944 gave 24/24. Searching lift × roll,
+preferring the least torso motion that still clears the margin, restored it to 24/24 and cut the
+four-button sequence from 63 s to 51 s.
+
+**Driving to the panel** lives in `elevator_runner/` — a Flask tool on the robot that loads
+waypoints from AutoXing's cloud API, drives a route, and presses on arrival within tolerance.
+Dry run by default, bound to localhost, credentials in a gitignored `.env`.
 
 **Look low, press high — working (2026-08-26).** `press_buttons.py --lift` detects once at a
 height where the camera can see the panel, then per button raises the torso so that button sits

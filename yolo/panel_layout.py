@@ -228,15 +228,90 @@ class Report:
     anchors_total: int = 0
     anchor_detail: list[str] = field(default_factory=list)
     found: list = field(default_factory=list)   # the raw detections, for tight_roi()
+    inferred: list[str] = field(default_factory=list)  # cells filled from the lattice
+    residual: float = 0.0                       # worst lattice fit error, px
 
     def lines(self) -> list[str]:
-        out = [f"detected {self.detected} buttons, rows {self.shape}"]
+        out = [f"detected {self.detected} buttons"]
+        if self.residual:
+            out[0] += f", lattice residual {self.residual:.1f} px"
+        if self.inferred:
+            out.append(f"inferred {len(self.inferred)} missed cell(s) from the lattice: "
+                       + ", ".join(self.inferred))
         if self.anchors_total:
             out.append(f"anchors {self.anchors_ok}/{self.anchors_total} agree")
             out.extend(f"    {d}" for d in self.anchor_detail)
         if not self.ok:
             out.append(f"REFUSED: {self.reason}")
         return out
+
+
+def fit_lattice(found: Sequence[Found], rows: int, cols: int,
+                iters: int = 6) -> Optional[dict]:
+    """Fit the buttons' regular lattice, so MISSED buttons can be filled in.
+
+    Elevator faceplates are laid out on a grid, and ours is regular to about a pixel:
+    row pitch 43.4 mm / 68 px and column pitch 56.6 mm / 79 px, consistent across all
+    five rows. Requiring every cell to be detected therefore throws away good frames
+    for no reason — after the base re-docked 12 cm further out the buttons shrank from
+    50 to 44 px and the strict shape check failed on 6 of 6 attempts, with grids like
+    (2,1,2,2,3), while all ten buttons were plainly visible.
+
+    Model: ``pixel(i, j) = origin + i * row_vec + j * col_vec``, fitted by least
+    squares with the cell assignment re-estimated each iteration. Affine rather than a
+    homography: over a faceplate this small the difference stays inside the residual
+    budget, and the residual is checked, so a genuinely skewed view is rejected rather
+    than silently extrapolated.
+
+    Fixing ``rows``/``cols`` from the registered layout is what makes this safe. If a
+    whole row were missed, the fit would have to spread ``rows`` rows across one row
+    less of real buttons, and the residual blows up — so the same check that fills
+    gaps also catches the shift that would press the wrong floor.
+
+    Returns ``{origin, row_vec, col_vec, cells, residual, assigned}`` or ``None``.
+    """
+    if len(found) < 4:
+        return None
+    P = np.array([[f.u, f.v] for f in found], dtype=np.float64)
+    u, v = P[:, 0], P[:, 1]
+    # Initial guess: the detections span the panel, so the extremes bracket the grid.
+    r_pitch = (v.max() - v.min()) / max(rows - 1, 1)
+    c_pitch = (u.max() - u.min()) / max(cols - 1, 1)
+    if r_pitch <= 1 or c_pitch <= 1:
+        return None
+    o = np.array([u.min(), v.min()])
+    rv = np.array([0.0, r_pitch])
+    cv = np.array([c_pitch, 0.0])
+
+    idx = None
+    for _ in range(iters):
+        # assign each detection to its nearest cell under the current lattice
+        M = np.column_stack([rv, cv])                       # 2x2: [row_vec col_vec]
+        try:
+            ij = np.linalg.lstsq(M, (P - o).T, rcond=None)[0].T
+        except np.linalg.LinAlgError:
+            return None
+        ij = np.rint(ij).astype(int)
+        ij[:, 0] = np.clip(ij[:, 0], 0, rows - 1)
+        ij[:, 1] = np.clip(ij[:, 1], 0, cols - 1)
+        if idx is not None and np.array_equal(ij, idx):
+            break
+        idx = ij
+        # least squares for (origin, row_vec, col_vec) given the assignment
+        A = np.column_stack([np.ones(len(P)), ij[:, 0], ij[:, 1]])
+        sol, *_ = np.linalg.lstsq(A, P, rcond=None)
+        o, rv, cv = sol[0], sol[1], sol[2]
+
+    # Two detections landing on one cell means the assignment is not trustworthy.
+    keys = [tuple(k) for k in idx]
+    if len(set(keys)) != len(keys):
+        return None
+    pred = o + idx[:, 0:1] * rv + idx[:, 1:2] * cv
+    residual = float(np.sqrt(((P - pred) ** 2).sum(1)).max())
+    cells = {(i, j): tuple(o + i * rv + j * cv)
+             for i in range(rows) for j in range(cols)}
+    return {"origin": o, "row_vec": rv, "col_vec": cv, "cells": cells,
+            "residual": residual, "assigned": {k: n for n, k in enumerate(keys)}}
 
 
 def _rows_from(found: list[Found], layout: PanelLayout) -> Optional[list[list[Found]]]:
@@ -277,48 +352,110 @@ def tight_roi(found: Sequence[Found], shape: tuple[int, int],
 
 
 def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
-           layout: PanelLayout, min_conf: float = 0.25,
-           verify: bool = True) -> tuple[dict[str, tuple[float, float]], Report]:
-    """Map each registered label to a pixel, verifying the grid first.
+           layout: PanelLayout, min_conf: float = 0.25, verify: bool = True,
+           max_residual: float = 6.0,
+           min_detected_frac: float = 0.7) -> tuple[dict[str, tuple[float, float]], Report]:
+    """Map each registered label to a pixel, verifying the geometry first.
 
     Returns ``({label: (u, v)}, report)``. On failure the mapping is EMPTY and
-    ``report.ok`` is False — callers must refuse to press rather than fall back to
-    a guess, because the failure mode being guarded against (a shifted grid) still
-    produces perfectly plausible coordinates.
+    ``report.ok`` is False — callers must refuse to press rather than fall back to a
+    guess, because the failure being guarded against (a shifted grid) still produces
+    perfectly plausible coordinates.
+
+    Verification is GEOMETRIC, by fitting the button lattice. That replaced an exact
+    row-shape match, which was rejecting good frames: at a re-docked distance 12 cm
+    further out the detector drops a button or two per frame, and the shape check
+    failed 6 times out of 6 while all ten buttons were clearly visible. The lattice
+    both fills those gaps and catches a real shift, since the row and column counts
+    come from the registered layout and a missing row cannot be fitted without the
+    residual blowing up.
+
+    Anchors are kept, but only as a check against a SHIFT rather than as a confidence
+    test on the classifier. They were an absolute test ("2 of 4 must read correctly"),
+    and that refused a correct grid outright once the buttons shrank from 50 to 44 px —
+    a false refusal that leaves the robot stuck. Now the unshifted alignment merely has
+    to beat every shifted alternative.
     """
     found = detect_positions(bgr, roi, detector, min_conf=min_conf)
-    rows = _rows_from(found, layout)
-    shape = tuple(len(r) for r in rows) if rows else ()
-    rep = Report(ok=False, detected=len(found), shape=shape)
+    rows, cols = layout.rows, max(len(r) for r in layout.grid)
+    n_cells = sum(len(r) for r in layout.grid)
+    rep = Report(ok=False, detected=len(found))
     rep.found = found
 
-    if not rows:
-        rep.reason = "no buttons detected in the panel ROI"
-        return {}, rep
-    if shape != layout.shape:
-        rep.reason = (f"grid {shape} does not match the registered layout "
-                      f"{layout.shape} for panel {layout.id!r}")
+    if len(found) < min_detected_frac * n_cells:
+        rep.reason = (f"only {len(found)} of {n_cells} buttons detected "
+                      f"(need {min_detected_frac:.0%}); the panel is not clearly enough "
+                      "in view to infer the rest")
         return {}, rep
 
-    mapping = {layout.grid[i][j].label: (rows[i][j].u, rows[i][j].v)
-               for i in range(layout.rows) for j in range(len(layout.grid[i]))}
+    lat = fit_lattice(found, rows, cols)
+    if lat is None:
+        rep.reason = "could not fit a lattice to the detections"
+        return {}, rep
+    rep.residual = lat["residual"]
+    if lat["residual"] > max_residual:
+        rep.reason = (f"lattice residual {lat['residual']:.1f} px exceeds "
+                      f"{max_residual} px — the detections do not form the registered "
+                      f"{rows}x{cols} grid, so a row may be missing or this is a "
+                      "different panel")
+        return {}, rep
 
+    # Cell -> detection, and the cells that have to be inferred.
+    at = lat["assigned"]
+    mapping: dict[str, tuple[float, float]] = {}
+    detected_cell: dict[tuple[int, int], Found] = {}
+    for i, row in enumerate(layout.grid):
+        for j, cell in enumerate(row):
+            k = (i, j)
+            if k in at:
+                f = found[at[k]]
+                mapping[cell.label] = (f.u, f.v)
+                detected_cell[k] = f
+            else:
+                mapping[cell.label] = lat["cells"][k]
+                rep.inferred.append(cell.label)
+
+    # Anchors: does the unshifted alignment explain the classes better than a shift?
+    # Only REAL detections may vote — scoring inferred cells would be circular.
     anchors = layout.anchors
     rep.anchors_total = len(anchors)
     if verify and anchors:
-        for i, j, cell in anchors:
-            got, conf = classify_solo(bgr, rows[i][j], detector)
-            rows[i][j].solo_label, rows[i][j].solo_conf = got, conf
-            good = got == cell.expect and conf >= layout.min_conf
-            rep.anchors_ok += good
+        solo: dict[tuple[int, int], tuple[str, float]] = {}
+
+        def score(shift: int) -> int:
+            hits = 0
+            for i, j, c in anchors:
+                k = ((i + shift) % rows, j)
+                f = detected_cell.get(k)
+                if f is None:
+                    continue
+                if k not in solo:
+                    solo[k] = classify_solo(bgr, f, detector)
+                got, conf = solo[k]
+                hits += got == c.expect and conf >= layout.min_conf
+            return hits
+
+        base = score(0)
+        rep.anchors_ok = base
+        for i, j, c in anchors:
+            f = detected_cell.get((i, j))
+            got, conf = solo.get((i, j), ("", 0.0))
+            state = ("inferred cell" if f is None else
+                     ("ok" if (got == c.expect and conf >= layout.min_conf)
+                      else "mismatch"))
             rep.anchor_detail.append(
-                f"{cell.label:<6} expect {cell.expect:<6} got "
-                f"{(got or '-'):<8} {conf:.2f}  {'ok' if good else 'MISMATCH'}")
-        if rep.anchors_ok < layout.min_anchors:
-            rep.reason = (f"only {rep.anchors_ok} of {len(anchors)} anchors agree "
-                          f"(need {layout.min_anchors}); the grid is probably shifted, "
-                          "which would press the wrong floor")
+                f"{c.label:<6} expect {c.expect:<6} got {(got or '-'):<8} "
+                f"{conf:.2f}  {state}")
+        others = [score(sh) for sh in range(1, rows)]
+        if others and base <= max(others):
+            rep.reason = (f"a shifted alignment explains the anchors at least as well "
+                          f"({base} vs {max(others)}); refusing rather than risk "
+                          "pressing the wrong floor")
             return {}, rep
+        if base == 0 and not any(others):
+            rep.anchor_detail.append(
+                "no anchor read confidently either way — accepted on the lattice fit "
+                f"alone (residual {lat['residual']:.1f} px)")
 
     rep.ok = True
     return mapping, rep

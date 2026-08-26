@@ -69,6 +69,18 @@ def main() -> int:
     ap.add_argument("--circles", action="store_true",
                     help="use the old Hough-circle finder + hard-coded grid instead "
                          "of the detector (fallback / A-B comparison)")
+    ap.add_argument("--auto", action="store_true",
+                    help="watch until the panel is visible AND has stopped moving, "
+                         "then press the sequence ONCE and exit. Re-running is the "
+                         "manual re-trigger; it never re-arms itself.")
+    ap.add_argument("--settle-frames", type=int, default=5,
+                    help="consecutive stable frames required by --auto (default 5)")
+    ap.add_argument("--settle-mm", type=float, default=2.0,
+                    help="max panel movement between frames to count as still (mm)")
+    ap.add_argument("--auto-timeout", type=float, default=300.0,
+                    help="give up if nothing settles within this many seconds")
+    ap.add_argument("--countdown", type=int, default=3,
+                    help="seconds of warning before --auto starts moving the arm")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip anchor verification. UNSAFE: a shifted grid then "
                          "presses the wrong floor silently")
@@ -95,14 +107,25 @@ def main() -> int:
     base_T_cam = handle.extrinsic
     cam = handle.camera
 
-    # ---- torso lift (LOOK LOW, PRESS HIGH) --------------------------------
-    # No single height reaches all rows with safe margin (the camera-visible band and
-    # the good-margin band do not overlap), so --lift detects at the current visible
-    # height, then per button raises the lift to put THAT button at target_relative_z
-    # (the arm's best-margin height) and compensates the cached coord. The lift hangs
-    # off the LEFT controller and reports TWICE the real travel (command_per_mm=2), so
-    # 1 command unit = 0.5 mm real; the base-frame origin rides the lift, so raising by
-    # `rise` metres lowers a button's base-frame z by the same `rise` (x, y unchanged).
+    # ---- torso lift: SEARCHED, not computed --------------------------------
+    # The lift is a degree of freedom, so it is searched exactly like the approach
+    # roll, and for the same reason. An earlier version computed one height per button
+    # from a fixed `target_relative_z`, and that target had been measured at ONE
+    # docking distance. Re-docked 12 cm further out it picked the worst heights
+    # available: button `1` went to 12 of 24 rolls at the computed height and 0 of 24
+    # at the next one up, while EVERY height from 444 to 944 gave 24/24 with 41-56 deg
+    # of margin. Reachability is a function of distance AND height; only the height
+    # axis was measured, and the conclusion was over-generalised.
+    #
+    # Searching removes the need for that map. It also prefers NOT to move: the torso
+    # only rises when the current height cannot deliver `prefer_margin_deg`, which at
+    # a comfortable docking distance means no torso motion at all.
+    #
+    # Mechanics that bite: the lift hangs off the LEFT controller (the right one
+    # reports a meaningless pos=0), it reports TWICE the real travel, and the blocking
+    # form of rm_set_lift_height hangs forever past the travel limit. The base frame
+    # rides the lift, so raising by `rise` metres lowers a button's base-frame z by the
+    # same `rise` (x and y unchanged) — and the panel PLANE moves with it too.
     lift_arm = lift_cfg = None
     L0 = None
     if args.lift:
@@ -131,15 +154,51 @@ def main() -> int:
             time.sleep(0.3)
         return None
 
-    def lift_plan(z0):
-        """Command to bring a button at base-frame z0 (measured at L0) to target_z,
-        and the resulting downward z shift of the button in the base frame."""
-        target_z = lift_cfg["target_relative_z_m"]
-        per_mm = lift_cfg["command_per_mm"]        # command units per mm of real rise
-        want = L0 + per_mm * 1000.0 * (z0 - target_z)
-        cmd = float(np.clip(want, lift_cfg["command_min"], lift_cfg["command_max"]))
-        rise_m = (cmd - L0) / per_mm / 1000.0      # real rise achieved (m)
-        return cmd, rise_m
+    def lift_options():
+        """Lift commands to try, current height FIRST so a tie prefers not moving."""
+        lo, hi = lift_cfg["command_min"], lift_cfg["command_max"]
+        step = int(lift_cfg.get("search_step", 50))
+        out, seen = [], set()
+        for c in [L0] + list(range(int(lo), int(hi) + 1, step)):
+            c = float(np.clip(c, lo, hi))
+            if round(c) not in seen:
+                seen.add(round(c))
+                out.append(c)
+        return out
+
+    def rise_of(cmd):
+        """Real vertical rise, in metres, of going from L0 to `cmd`."""
+        return (cmd - L0) / lift_cfg["command_per_mm"] / 1000.0
+
+    def plan_over_lift(button0, seed):
+        """Search (lift height, approach roll) together.
+
+        Returns ``(cmd, rise, best, reasons, tried)``. Selection: among heights whose
+        best pose clears `prefer_margin_deg`, take the one needing the LEAST torso
+        motion (ties to the larger margin); if none clears it, take the largest margin
+        available. Preferring stillness matters — moving the torso costs seconds, and
+        it drops the panel out of the camera's view, so it should happen only when the
+        arm genuinely cannot do the job from where it is.
+        """
+        prefer = float(lift_cfg.get("prefer_margin_deg", 20.0))
+        feasible, last_reasons, tried = [], {}, 0
+        for cmd in lift_options():
+            rise = rise_of(cmd)
+            b = np.asarray(button0, dtype=np.float64) - np.array([0.0, 0.0, rise])
+            best, reasons = plan(b, seed, origin - np.array([0.0, 0.0, rise]))
+            tried += 1
+            if best is None:
+                last_reasons = reasons or last_reasons
+                continue
+            feasible.append((cmd, rise, best))
+        if not feasible:
+            return None, 0.0, None, last_reasons, tried
+        good = [f for f in feasible if f[2][3] >= prefer]
+        if good:
+            cmd, rise, best = min(good, key=lambda f: (abs(f[0] - L0), -f[2][3]))
+        else:
+            cmd, rise, best = max(feasible, key=lambda f: f[2][3])
+        return cmd, rise, best, {}, tried
 
     # ---- locate the panel and every button once ----
     # Detector path (default): a full-frame pass gives the button boxes, their union
@@ -162,8 +221,11 @@ def main() -> int:
               f"{len(layout.anchors)} anchors, engine {detector.engine_path.name}")
     cam.start()
 
-    buttons3d = plane = None
-    for attempt in range(6):
+    def locate(verbose=True, tag=""):
+        """One attempt at locating the panel and every button. None if it failed.
+
+        Returns ``(buttons3d, (origin, normal))`` in the arm base frame.
+        """
         frame = cam.capture()
         bgr = cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR)
 
@@ -171,46 +233,124 @@ def main() -> int:
             roi = CIRCLE_ROI
             fit = fit_panel_plane_from_depth(frame, base_T_cam, roi=roi)
             if fit is None:
-                continue
+                return None
             grid, p2 = detect_buttons(bgr, roi, CIRCLE_LABELS)
             if grid is None:
-                continue
-            print(f"located panel + {len(grid)} buttons (Hough, param2={p2})")
+                return None
+            if verbose:
+                print(f"{tag}located panel + {len(grid)} buttons (Hough, param2={p2})")
         else:
             # Order matters: buttons first, THEN the plane. The coarse ROI is
             # deliberately generous and can reach past the faceplate onto the
             # cabinet — a second, roughly parallel plane that would bias the fit.
             # Once the buttons are known, the fit gets a box around them alone.
-            coarse = panel_roi(bgr, detector, verbose=True)
+            coarse = panel_roi(bgr, detector, verbose=verbose)
             if coarse is None:
-                print(f"  [{attempt + 1}/6] no buttons in the frame at all")
-                continue
+                if verbose:
+                    print(f"{tag}no buttons in the frame at all")
+                return None
             grid, rep = assign(bgr, coarse, detector, layout,
                                verify=not args.no_verify)
-            for line in rep.lines():
-                print(f"  [{attempt + 1}/6] {line}")
+            if verbose:
+                for line in rep.lines():
+                    print(f"{tag}{line}")
             if not rep.ok:
-                continue
+                return None
             roi = tight_roi(rep.found, bgr.shape[:2])
             fit = fit_panel_plane_from_depth(frame, base_T_cam, roi=roi)
             if fit is None:
-                print(f"  [{attempt + 1}/6] plane fit failed in ROI {roi}")
-                continue
-            print(f"  [{attempt + 1}/6] plane fitted in {roi} "
-                  f"(coarse was {coarse})")
+                if verbose:
+                    print(f"{tag}plane fit failed in ROI {roi}")
+                return None
+            if verbose:
+                print(f"{tag}plane fitted in {roi} (coarse was {coarse})")
 
-        origin, normal = fit
-        buttons3d = {
-            name: ray_plane_intersection(px, frame.intrinsics, base_T_cam,
-                                         origin + protrusion * normal, normal)
-            for name, px in grid.items()
-        }
-        plane = (origin, normal)
-        break
-    if buttons3d is None:
-        print("!! could not locate the panel/buttons — is the arm blocking the view, "
-              "or is this a different panel than the registered layout?")
-        return 1
+        org, nrm = fit
+        pts = {name: ray_plane_intersection(px, frame.intrinsics, base_T_cam,
+                                            org + protrusion * nrm, nrm)
+               for name, px in grid.items()}
+        return pts, (org, nrm)
+
+
+    def centroid(pts):
+        return np.mean(np.array(list(pts.values()), dtype=np.float64), axis=0)
+
+
+    def wait_until_settled():
+        """Watch until the panel is visible AND has stopped moving, then return it.
+
+        The trigger is the PANEL's pose in the arm base frame, not the base's own
+        odometry — which is deliberate. The chassis reporting "stopped" is not the same
+        as the panel being still relative to the arm (the body rocks after a stop), and
+        a chassis nudge that does not move the panel is not worth waiting out. The
+        camera measures the quantity the press actually depends on. It also needs no
+        access to the base at all: the only candidate found on the wired
+        network is an unidentified service on port 9090 with no client library here.
+        """
+        need = args.settle_frames
+        tol = args.settle_mm / 1000.0
+        deadline = time.time() + args.auto_timeout
+        stable, prev, last = 0, None, None
+        misses = 0
+        while time.time() < deadline:
+            got = locate(verbose=False)
+            if got is None:
+                misses += 1
+                if stable:
+                    print(f"    lost the panel after {stable} stable frame(s)")
+                stable, prev = 0, None
+                if misses % 10 == 0:
+                    print(f"    waiting: panel not located ({misses} frames)")
+                continue
+            pts, pl = got
+            c = centroid(pts)
+            if prev is not None:
+                moved = float(np.linalg.norm(c - prev)) * 1000
+                if moved <= args.settle_mm:
+                    stable += 1
+                else:
+                    if stable:
+                        print(f"    moving again ({moved:.1f} mm) — resetting")
+                    stable = 0
+            prev, last = c, (pts, pl)
+            if stable >= need:
+                print(f"    settled: {need} consecutive frames within "
+                      f"{args.settle_mm} mm")
+                return last
+            if stable == 1:
+                print(f"    panel visible, checking it is still…")
+        print(f"!! gave up after {args.auto_timeout:.0f} s without a settled panel")
+        return None
+
+
+    if args.auto:
+        print(f"AUTO: waiting for the panel to be visible and still "
+              f"({args.settle_frames} frames within {args.settle_mm} mm), then pressing "
+              f"{' '.join(args.buttons)} ONCE and exiting.")
+        got = wait_until_settled()
+        if got is None:
+            return 1
+        buttons3d, plane = got
+        if args.go:
+            for k in range(args.countdown, 0, -1):
+                print(f"    pressing in {k}…  (Ctrl+C to cancel)")
+                time.sleep(1.0)
+    else:
+        buttons3d = plane = None
+        # 15 attempts, not 6. Localisation succeeds on roughly a quarter of frames at a
+        # re-docked distance (the detector drops a button or two and the lattice needs
+        # 70 % of them), and three consecutive runs used attempts 4, 1 and 5 of 6 — one
+        # bad frame away from failing outright. Each attempt costs ~200 ms, so the whole
+        # budget is 3 s against a 60 s sequence.
+        for attempt in range(15):
+            got = locate(tag=f"  [{attempt + 1}/15] ")
+            if got is not None:
+                buttons3d, plane = got
+                break
+        if buttons3d is None:
+            print("!! could not locate the panel/buttons — is the arm blocking the "
+                  "view, or is this a different panel than the registered layout?")
+            return 1
     origin, normal = plane
     inward = -normal
 
@@ -353,20 +493,9 @@ def main() -> int:
             continue
         button = buttons3d[name]
         origin_now = origin
-        if args.lift:
-            cmd, rise = lift_plan(button[2])
-            print(f"    lift -> command {cmd:.0f} (raise {rise * 1000:+.0f} mm) to put "
-                  f"z={button[2]:.3f} m at target {lift_cfg['target_relative_z_m']:.3f} m")
-            if args.go and move_lift(cmd) is None:
-                print("    lift move did not confirm; skipping")
-                results.append((name, False))
-                continue
-            # Base-frame origin rides the lift: raising by `rise` lowers the button's
-            # base-frame z by `rise` (x, y unchanged). Compensate the cached coord.
-            button = np.asarray(button, dtype=np.float64) - np.array([0.0, 0.0, rise])
-            # The plane rides the lift with everything else, so compensate it too —
-            # otherwise the clearance check is measured against where the panel WAS.
-            origin_now = origin - np.array([0.0, 0.0, rise])
+
+        # Home FIRST: the seed decides which IK branch comes back, so planning has to
+        # start from the pose the arm will actually depart from.
         seed = list(arm.get_joint_angles())
         if max(abs(a - b) for a, b in zip(seed, home)) > 3.0:
             if not arm.move_joints_sync(home):
@@ -374,7 +503,31 @@ def main() -> int:
                 results.append((name, False))
                 break
             seed = list(arm.get_joint_angles())
-        best, reasons = plan(button, seed, origin_now)
+
+        if args.lift:
+            cmd, rise, best, reasons, tried = plan_over_lift(button, seed)
+            if best is None:
+                print(f"    no pose satisfies the boundaries at ANY of {tried} lift "
+                      "heights:")
+                for why, n in sorted((reasons or {}).items(), key=lambda kv: -kv[1]):
+                    print(f"      {n:>2}/24 rolls  {why}")
+                results.append((name, False))
+                continue
+            if abs(cmd - L0) < 1.0:
+                print(f"    lift stays at {L0:.0f} (no torso motion needed)")
+            else:
+                print(f"    lift -> command {cmd:.0f} (raise {rise * 1000:+.0f} mm), "
+                      f"chosen from {tried} heights")
+                if args.go and move_lift(cmd) is None:
+                    print("    lift move did not confirm; skipping")
+                    results.append((name, False))
+                    continue
+            # Both the button and the plane ride the lift: raising by `rise` lowers
+            # their base-frame z by `rise` (x, y unchanged).
+            button = np.asarray(button, dtype=np.float64) - np.array([0.0, 0.0, rise])
+            origin_now = origin - np.array([0.0, 0.0, rise])
+        else:
+            best, reasons = plan(button, seed, origin_now)
         if best is None:
             print("    no pose satisfies the boundaries:")
             for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):

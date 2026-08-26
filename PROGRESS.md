@@ -27,6 +27,70 @@ the button pixels come from Hough circles, not YOLO. Both were held constant on 
 a failed press could only be a geometry or motion problem. That paid off — every failure this
 session was diagnosable.
 
+### Pressing after driving — WORKING, and the lift is now searched (2026-08-26)
+
+**Re-docked and pressed, three times, at three different stopping positions.** The
+worst docking error absorbed was **123 mm further out, 44 mm sideways, 4.5 deg of
+yaw** — all taken up by the live measurement chain with no constant changed. Depth
+error stayed <=0.08 mm and lateral 0.05-0.50 mm, the same as from a fixed spot.
+
+Two things had to be fixed first, and the first attempt failed 6 of 6 on both:
+
+| symptom | cause | fix |
+|---|---|---|
+| anchors 1/4, press refused | the classifier degrades at 44 px (was 50 px), and the anchor test was ABSOLUTE ("2 of 4 must read correctly"). It refused a grid that a look at the frame showed to be perfectly correct | anchors became a RELATIVE test: the unshifted alignment only has to beat every shifted one |
+| grid shape != (2,2,2,2,2) | at that distance the detector drops one or two buttons per frame | fit the button LATTICE and infer the missed cells (residual ~1.5 px); rows/cols come from the layout, so a real shift still blows the residual up |
+
+The anchor false-positive is the one worth remembering: its failure direction is the
+worst available — it refuses a CORRECT detection, and the consequence is a robot
+standing in a lobby unable to act.
+
+**The lift height is now searched, not computed.** A `target_relative_z_m: 0.240`
+constant, measured at one docking distance, was picking the worst heights on offer once
+the robot parked 12 cm further out: button `1` had 12 of 24 approach rolls at the
+computed height and **0 of 24** one step above (so the press failed, 3/4), while EVERY
+height from 444 to 944 gave 24/24 with 41-56 deg of margin. Reachability is a function
+of distance AND height, and only the height axis had been measured — the same mistake
+as the old "least joint travel" rule, one level up: **a variable that should be
+searched had been pinned to a constant.**
+
+Searching (lift x roll, preferring the least torso motion that still clears
+`prefer_margin_deg`) fixed it and is strictly better:
+
+| | computed height | searched |
+|---|---|---|
+| `1` | 0/24 rolls — FAILED | 24/24, margin 45.4 deg |
+| `4` | 7/24, margin 35 deg | 24/24, margin 44.1 deg |
+| `2` | 7/24, margin 35 deg | 23/24, margin 41.6 deg |
+| `5` | 15/24, margin 34.5 deg | 24/24, margin 49.0 deg |
+| sequence time | 62-64 s | **51.1 s** (no torso motion needed at this dock) |
+
+Also: localisation retries raised 6 -> 15 (three runs used attempts 4, 1 and 5 of 6 —
+one bad frame from failing outright, and each attempt costs 200 ms), and
+`press_buttons.py --auto` added: wait until the panel is visible AND still, press once,
+exit. Verified on hardware, 4/4.
+
+### Driving to the panel: `elevator_runner/` (2026-08-26)
+
+A Flask tool on the robot (contributed by a colleague) that loads waypoints from
+**AutoXing's cloud API**, drives a route, and presses when the robot arrives within
+tolerance of the point marked as the elevator. Dry run by default; binds to
+`127.0.0.1:8765` so only someone SSH'd in can reach it; credentials in a gitignored
+`.env`.
+
+Tested on the robot before any live drive, which caught a defect the dry run cannot
+show: **AutoXing returns a POI's position as `coordinate: [x, y]`, not top-level
+`x`/`y`** — although `robot_state` DOES use top-level `x`/`y`. Every waypoint therefore
+parsed to (0, 0), and the arrival gate compared the robot's distance to the map origin,
+**2927 cm, against an 8 cm tolerance**. A live run would have driven to the elevator,
+refused to press as "out of reach", backed off, retried and given up — with a log line
+that reads like a docking-accuracy problem. Fixed, then verified by computing a real
+distance: **2.8 cm** from the robot to the POI named `elevator test`.
+
+Still to note: this map uses none of the AutoXing elevator POI types (`[6, 28]`) — the
+elevator point is type 11 like any other waypoint — so the tool's auto-highlight never
+fires and the operator selects the point by name.
+
 ### Look low, press high — WORKING (2026-08-26)
 
 Contributed by a colleague; the lift is now part of the press loop. `--lift` detects

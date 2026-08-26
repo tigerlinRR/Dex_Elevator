@@ -218,9 +218,16 @@ camera rides the lift, so past ~175 mm of real rise the bottom button row leaves
 frame, while the arm wants another 200 mm on top of that.
 
 **`press_buttons.py --lift` implements that** (contributed 2026-08-26): detect once at
-the current visible height, then PER BUTTON raise the lift so that button sits at
-`target_relative_z_m`, compensate the cached 3D coord by the achieved rise, press, and
-restore the lift at the end. Per-button targeting beats one height for the whole panel:
+the current visible height, then per button move the lift, compensate the cached 3D
+coord by the achieved rise, press, and restore the lift at the end. **The height is
+SEARCHED, not computed** — the first version computed it from a fixed
+`target_relative_z` measured at ONE docking distance, and re-docked 12 cm further out
+that constant selected the worst heights available: button `1` got 12 of 24 rolls at
+the computed height and 0 of 24 one step up, while every height from 444 to 944 gave
+24/24 with 41-56 deg of margin. Reachability depends on distance AND height; only the
+height axis had been measured. Searching needs no such map, and it prefers NOT to move
+(`prefer_margin_deg`), so at a comfortable docking distance the torso stays still and
+the sequence runs ~11 s faster. Per-button targeting beats one height for the whole panel:
 button `2`, which the boundary check refuses outright at the viewing height (best
 margin 1.0 deg), plans at **52.8 deg of margin with all 24 rolls passing** — and it
 lights. The plane origin must be compensated along with the button (`origin_now`),
@@ -269,6 +276,20 @@ misalignment is caught rather than pressed. Measured, and each number changed th
   centres, keeping the largest cluster, separates the grid from those strays. Then
   `tight_roi` re-boxes the fit around the confirmed buttons only — the wall and cabinet
   behind are separate parallel planes and bias the depth fit.
+- **Verification is a LATTICE FIT, not a row-shape match** (`fit_lattice`). Requiring
+  the detected grid to equal the registered shape exactly threw away good frames: at a
+  re-docked distance 12 cm further out the buttons shrank from 50 to 44 px and one or
+  two per frame go missing, so the shape check refused 6 of 6 attempts while all ten
+  buttons were plainly visible. Fitting `pixel(i,j) = origin + i*row + j*col` fills the
+  gaps AND catches a shift, because rows/cols come from the registered layout: a
+  missing row cannot be fitted without the residual blowing up. Measured residual on a
+  good frame is ~1.5 px.
+- **Anchors are a RELATIVE test, not an absolute one.** They used to require "2 of 4
+  read correctly", and that refused a perfectly correct grid once the classifier
+  degraded at the greater distance — a false refusal whose consequence is the robot
+  standing in the lobby unable to act. Now the unshifted alignment merely has to score
+  better than every shifted alternative, which keeps the protection (a shift breaks all
+  anchors at once) without depending on absolute classifier confidence.
 - **Refuse, don't guess.** A shifted grid yields perfectly plausible coordinates, so a
   wrong label is a SILENT wrong-floor press. Verified by feeding a deliberately
   inverted layout: anchors went 0/4 and the press was refused.
@@ -331,6 +352,30 @@ Licence discipline matters here because the goal is a product: only CC BY 4.0 an
 are used (both permit commercial use with attribution); NC or unlicensed data is worse than no
 data. The largest academic set (CUHK, 3,718 images / 35,100 labels, arXiv 2103.09030) is **not**
 used — its download link is dead and it states no licence.
+
+**Driving to the panel** (`elevator_runner/`, a Flask tool on the robot) — loads the
+robot's waypoints from **AutoXing's cloud API**, drives a chosen route, and when the
+robot arrives within tolerance of the point marked as the elevator, runs
+`press_buttons.py <floors> --go --lift`. Dry run is the default. It binds to
+`127.0.0.1:8765`, so it is reachable only by someone already SSH'd in (deliberate on a
+shared box); credentials live in a gitignored `.env`.
+- **AutoXing returns a POI's position as `coordinate: [x, y]`, NOT top-level `x`/`y`** —
+  while `robot_state` DOES use top-level `x`/`y`. Reading `poi["x"]` silently defaulted
+  every waypoint to (0, 0), so the arrival gate compared the robot's distance to the MAP
+  ORIGIN (2927 cm here) against an 8 cm tolerance: a live run would have driven to the
+  elevator, refused to press as "out of reach", backed off and retried until it gave up.
+  The dry run hides this because it substitutes a fixed 3.0 cm simulated error. Fixed
+  and verified by computing a real distance: 2.8 cm to the POI named `elevator test`.
+- This map uses none of the AutoXing elevator POI types (`[6, 28]`) — the elevator point
+  is type 11 like any other waypoint — so the UI's auto-highlight never fires and the
+  operator picks the point by name.
+
+**Pressing on its own** (`press_buttons.py --auto`) — waits until the panel is both
+visible AND still (5 consecutive frames within 2 mm), then presses ONCE and exits;
+re-running is the manual re-trigger, it never re-arms itself. The trigger is the
+PANEL's pose in the arm base frame rather than the base's odometry, which needs no
+access to the base at all. Not needed when the runner drives, since the runner already
+gates on arrival; it exists for hand-positioned or non-AutoXing deployments.
 
 **Orchestrator** (`core/elevator_pipeline.py`): capture → detect → match the button
 whose label == requested floor → `press_target_from_pixel` → arm standoff/press/retract.
