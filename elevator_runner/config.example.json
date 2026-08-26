@@ -1,0 +1,9 @@
+{
+  "autoxing_host": "https://apiglobal.autoxing.com",
+  "app_id": "YOUR_AUTOXING_APP_ID",
+  "app_secret": "YOUR_AUTOXING_APP_SECRET",
+  "app_code": "APPCODE xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "robot_serial": "YOUR_ROBOT_SERIAL",
+  "agx_ssh": "dex-agx",
+  "press_cmd": "cd ~/Dex_Elevator && PYTHONPATH=. /usr/bin/python3 initialization/press_buttons.py {floors} --go --lift"
+}
