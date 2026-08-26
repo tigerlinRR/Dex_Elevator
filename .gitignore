@@ -312,3 +312,6 @@ README.zh-CN.md
 !data/calibration/cam_chest.calib.npz
 !data/calibration/cam_chest_extrinsic_validation.json
 !data/calibration/cam_chest_calibration_summary.txt
+elevator_runner/.env
+elevator_runner/config.json
+elevator_runner/__pycache__/

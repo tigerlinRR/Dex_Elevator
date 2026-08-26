@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Elevator Runner</title>
+<style>
+  :root { --bg:#0f172a; --card:#fff; --line:#e2e8f0; --ink:#1a1f29; --muted:#64748b;
+          --blue:#2563eb; --green:#16a34a; --amber:#ea580c; --red:#dc2626; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC",sans-serif;
+         color:var(--ink); background:#f1f5f9; font-size:14px; }
+  header { background:var(--bg); color:#fff; padding:12px 18px; display:flex; align-items:center; gap:14px; }
+  header h1 { font-size:16px; margin:0; }
+  header .meta { font-size:12px; color:#cbd5e1; }
+  .wrap { max-width:1100px; margin:16px auto; padding:0 16px; display:grid;
+          grid-template-columns:1fr 1fr; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:13px; margin:0 0 10px; color:#0b3b6f; text-transform:uppercase; letter-spacing:.4px; }
+  .full { grid-column:1 / -1; }
+  button { font:inherit; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; font-weight:600; }
+  .primary { background:var(--blue); color:#fff; } .primary:disabled { opacity:.5; cursor:not-allowed; }
+  .stop { background:var(--red); color:#fff; } .ghost { background:#eef2f7; color:#334155; }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
+  input[type=text], input[type=number], select { width:100%; padding:7px 9px; border:1px solid var(--line);
+          border-radius:7px; font:inherit; }
+  .row { display:flex; gap:10px; } .row > div { flex:1; }
+  .poi-list { max-height:340px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { position:sticky; top:0; background:#f8fafc; font-size:11px; color:var(--muted); }
+  td.c { text-align:center; } .pill { font-size:10px; padding:1px 7px; border-radius:9px; font-weight:700; }
+  .pill.elev { background:#dcfce7; color:#166534; }
+  .order { width:44px; }
+  .status { font-size:13px; } .status b { color:#0b3b6f; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; font-size:13px; }
+  .kv div:nth-child(odd){ color:var(--muted); }
+  .log { background:#0b1220; color:#cbd5e1; font-family:ui-monospace,Menlo,monospace; font-size:12px;
+         padding:10px; border-radius:8px; height:240px; overflow:auto; white-space:pre-wrap; }
+  .warn { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:8px 11px;
+          border-radius:8px; font-size:12px; margin-bottom:10px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:9px; background:#eef2f7; color:#334155; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛗 Elevator Runner</h1>
+  <span class="meta" id="meta">loading…</span>
+  <span style="flex:1"></span>
+  <span class="badge" id="runstate">idle</span>
+</header>
+
+<div class="wrap">
+  <!-- LEFT: points -->
+  <div class="card">
+    <h2>1 · Points</h2>
+    <div class="row">
+      <div><label>Robot serial</label><input type="text" id="robot" placeholder="from config" readonly title="locked to one robot"></div>
+      <div style="flex:0 0 auto; align-self:flex-end;"><button class="ghost" onclick="loadPois()">Load points</button></div>
+    </div>
+    <p style="font-size:12px;color:var(--muted)">Tick points to include in the route (top→bottom = travel order). Choose ONE as the elevator point — that's where it presses. Elevator-type POIs are flagged.</p>
+    <div class="poi-list">
+      <table id="poitbl"><thead><tr>
+        <th class="c">use</th><th class="order">order</th><th>name</th><th>type</th><th>x , y</th><th class="c">elevator</th>
+      </tr></thead><tbody id="poirows"><tr><td colspan="6" style="color:#94a3b8">— load points —</td></tr></tbody></table>
+    </div>
+  </div>
+
+  <!-- RIGHT: run settings -->
+  <div class="card">
+    <h2>2 · Run</h2>
+    <label>Floors to press (space-separated, e.g. <code>3</code> or <code>1 4 2</code>)</label>
+    <input type="text" id="floors" placeholder="3">
+    <div class="row">
+      <div><label>Run count (loop)</label><input type="number" id="loops" value="1" min="1"></div>
+      <div><label>Arrival tolerance (cm)</label><input type="number" id="tol" value="8" min="1" step="0.5"></div>
+    </div>
+    <div class="row">
+      <div><label>Max retries / loop</label><input type="number" id="retries" value="3" min="0"></div>
+      <div><label>Backoff (s)</label><input type="number" id="backoff" value="20" min="0"></div>
+    </div>
+    <div class="row">
+      <div><label>Yaw tolerance (deg)</label><input type="number" id="yawtol" value="12" min="1"></div>
+      <div><label>Run mode</label>
+        <select id="runmode">
+          <option value="2" selected>2 · track + limited avoidance</option>
+          <option value="1">1 · flexible avoidance</option>
+          <option value="3">3 · strict track</option>
+        </select></div>
+    </div>
+    <label style="margin-top:10px"><input type="checkbox" id="dry" checked> Dry run (plan only — no dispatch, no press)</label>
+    <div class="warn" id="livewarn" style="display:none">⚠ LIVE MODE: this will dispatch the real robot and press real buttons. Make sure the area is clear.</div>
+    <div style="margin-top:12px; display:flex; gap:10px;">
+      <button class="primary" id="startbtn" onclick="start()">Start</button>
+      <button class="stop" onclick="stop()">Stop</button>
+    </div>
+  </div>
+
+  <!-- STATUS -->
+  <div class="card full">
+    <h2>3 · Status</h2>
+    <div class="row">
+      <div class="kv" id="kv"></div>
+    </div>
+  </div>
+  <div class="card full">
+    <h2>Log</h2>
+    <div class="log" id="log">—</div>
+  </div>
+</div>
+
+<script>
+let POIS = [];
+const $ = id => document.getElementById(id);
+
+async function boot() {
+  const c = await (await fetch('/api/config')).json();
+  $('robot').value = c.robot_serial || '';
+  $('meta').textContent = `robot ${c.robot_serial||'?'} · AGX ${c.agx_ssh} · creds ${c.creds_configured?'✓':'✗ (dry run only)'}`;
+  if (!c.creds_configured) { $('dry').checked = true; }
+}
+$('dry').addEventListener('change', e => { $('livewarn').style.display = e.target.checked ? 'none':'block'; });
+
+async function loadPois() {
+  const robot = $('robot').value.trim();
+  const r = await fetch('/api/pois' + (robot?`?robot=${encodeURIComponent(robot)}`:''));
+  const j = await r.json();
+  if (j.error) { alert('Load points failed: ' + j.error); return; }
+  POIS = j.pois; renderPois();
+}
+
+function renderPois() {
+  const tb = $('poirows'); tb.innerHTML = '';
+  if (!POIS.length) { tb.innerHTML = '<tr><td colspan="6" style="color:#94a3b8">no points</td></tr>'; return; }
+  POIS.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    const elevDefault = p.isElevator ? 'checked' : '';
+    tr.innerHTML = `
+      <td class="c"><input type="checkbox" class="use" data-i="${i}" ${p.isElevator?'checked':''}></td>
+      <td><input type="number" class="ord" data-i="${i}" style="width:40px" min="1"></td>
+      <td>${escapeHtml(p.name)} ${p.isElevator?'<span class="pill elev">ELEV</span>':''}</td>
+      <td><span class="badge">${p.type}</span> ${p.floor?('· '+escapeHtml(String(p.floor))):''}</td>
+      <td>${Number(p.x).toFixed(2)} , ${Number(p.y).toFixed(2)}</td>
+      <td class="c"><input type="radio" name="elev" class="elev" data-i="${i}" ${elevDefault}></td>`;
+    tb.appendChild(tr);
+  });
+}
+function escapeHtml(s){ return (s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function collectRoute() {
+  const uses = [...document.querySelectorAll('.use:checked')].map(e => +e.dataset.i);
+  const ords = {}; document.querySelectorAll('.ord').forEach(e => { if (e.value) ords[+e.dataset.i] = +e.value; });
+  uses.sort((a,b) => (ords[a]||999) - (ords[b]||999));
+  return uses.map(i => POIS[i]);
+}
+function collectElevator() {
+  const r = document.querySelector('.elev:checked');
+  return r ? POIS[+r.dataset.i] : null;
+}
+
+async function start() {
+  const route = collectRoute();
+  const elevator = collectElevator();
+  if (!elevator) { alert('Pick the elevator point (radio button).'); return; }
+  if (!route.length) { alert('Tick at least one point to visit.'); return; }
+  // ensure the elevator point is the LAST stop
+  const routeIds = route.map(p => p.id);
+  if (routeIds[routeIds.length-1] !== elevator.id) route.push(elevator);
+  const dry = $('dry').checked;
+  if (!dry && !confirm('LIVE: dispatch the real robot and press real buttons. Area clear?')) return;
+  const body = {
+    robot_serial: $('robot').value.trim(),
+    route, elevator,
+    floors: $('floors').value.trim(),
+    loops: +$('loops').value, tolerance_cm: +$('tol').value,
+    yaw_tol_deg: +$('yawtol').value, max_retries: +$('retries').value,
+    backoff_sec: +$('backoff').value, run_mode: +$('runmode').value, dry_run: dry,
+  };
+  const r = await fetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const j = await r.json();
+  if (j.error) alert('Start failed: ' + j.error);
+}
+async function stop() { await fetch('/api/stop', {method:'POST'}); }
+
+async function poll() {
+  try {
+    const j = await (await fetch('/api/status')).json();
+    $('runstate').textContent = j.active ? 'RUNNING' : (j.state.phase || 'idle');
+    $('startbtn').disabled = j.active;
+    const s = j.state || {};
+    const color = s.phase==='out-of-reach' ? 'var(--amber)' : (s.phase==='done'?'var(--green)':'var(--blue)');
+    $('kv').innerHTML = `
+      <div>Phase</div><div><span class="dot" style="background:${color}"></span><b>${s.phase||'—'}</b>${s.dry_run?' · <span class="badge">DRY RUN</span>':''}</div>
+      <div>Loop</div><div>${s.loop||0} / ${s.loops_total||0}</div>
+      <div>Task id</div><div>${s.task_id||'—'}</div>
+      <div>Arrival error</div><div>${s.last_error_cm==null?'—':s.last_error_cm+' cm'} ${s.last_yaw_err!=null?('· yaw '+s.last_yaw_err+'°'):''}</div>
+      <div>Last press</div><div>${escapeHtml(s.last_press||'—')}</div>
+      <div>Successes / Failures</div><div>${s.successes||0} / ${s.failures||0}</div>`;
+    $('log').textContent = (j.log||[]).join('\n') || '—';
+    $('log').scrollTop = $('log').scrollHeight;
+  } catch(e) {}
+}
+boot(); setInterval(poll, 1500); poll();
+</script>
+</body>
+</html>
