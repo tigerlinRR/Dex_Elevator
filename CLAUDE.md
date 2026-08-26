@@ -217,6 +217,24 @@ measured z over four cycles), which is what makes **look low, press high** viabl
 camera rides the lift, so past ~175 mm of real rise the bottom button row leaves the
 frame, while the arm wants another 200 mm on top of that.
 
+**`press_buttons.py --lift` implements that** (contributed 2026-08-26): detect once at
+the current visible height, then PER BUTTON raise the lift so that button sits at
+`target_relative_z_m`, compensate the cached 3D coord by the achieved rise, press, and
+restore the lift at the end. Per-button targeting beats one height for the whole panel:
+button `2`, which the boundary check refuses outright at the viewing height (best
+margin 1.0 deg), plans at **52.8 deg of margin with all 24 rolls passing** — and it
+lights. The plane origin must be compensated along with the button (`origin_now`),
+since the panel rides the lift too; getting that wrong understates clearance by
+`rise * normal_z`, measured at 4.7-6.4 mm.
+
+**Self-collision is checked at planning time** via
+`rm_algo_safety_robot_self_collision_detection` (also contributed 2026-08-26) — pure
+computation against the controller's own model, sampled along the whole
+seed -> standoff -> contact path, because a configuration can pass through a collision
+between two clear endpoints. This matters because the controller's *runtime*
+self-collision check is **off**. It covers the arm's own links and end-effector only:
+the other arm, the chassis and the door frame still need virtual walls.
+
 **Autonomous pressing** (`initialization/press_buttons.py`) — the executable that
 ties everything together: `python3 initialization/press_buttons.py 1 4 2 5 --go`.
 Per button: home -> `movej` to standoff -> `movel` through contact into the button

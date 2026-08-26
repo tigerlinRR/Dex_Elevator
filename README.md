@@ -229,6 +229,14 @@ Measured, not assumed:
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
 | plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
 
+**Look low, press high — working (2026-08-26).** `press_buttons.py --lift` detects once at a
+height where the camera can see the panel, then per button raises the torso so that button sits
+at the arm's best-margin height, compensates the cached 3D coordinate by the achieved rise, and
+presses. Button `2`, which the boundary check refuses outright at the viewing height (1.0° of
+joint margin), plans at **52.8°** with all 24 approach rolls passing — and lights. Planning also
+runs the controller's own self-collision model along the whole path, which matters because its
+runtime check is off.
+
 **Press poses are bounded, and the lift makes reach panel-independent (2026-08-25).**
 The approach roll is still searched; `arm.limits` says which poses are disallowed. Against the
 controller's real joint limits the old "least joint travel" rule been choosing poses sitting

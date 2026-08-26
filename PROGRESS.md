@@ -27,6 +27,38 @@ the button pixels come from Hough circles, not YOLO. Both were held constant on 
 a failed press could only be a geometry or motion problem. That paid off — every failure this
 session was diagnosable.
 
+### Look low, press high — WORKING (2026-08-26)
+
+Contributed by a colleague; the lift is now part of the press loop. `--lift` detects
+once at the current visible height, then **per button** raises the torso so that button
+sits at the arm's best-margin height, compensates the cached 3D coordinate by the
+achieved rise, presses, and restores the lift afterwards.
+
+Result: button `2` — refused entirely at the viewing height (best joint margin
+1.0 deg) — plans at **52.8 deg of margin with 24/24 rolls passing, and lights**.
+Per-button targeting is why it beats the ~28 deg a single panel-wide height would give.
+
+Also added: **self-collision checking at planning time**
+(`rm_algo_safety_robot_self_collision_detection`, pure computation against the
+controller's own model, sampled along the whole path because a configuration can pass
+through a collision between two clear endpoints). The controller's runtime
+self-collision check is off, so this closes that gap for the arm's own links and
+end-effector — the other arm, chassis and door frame still need virtual walls.
+
+Reviewed and fixed one defect: `clearance()` kept using the plane origin measured
+BEFORE the lift moved. The panel rides the lift too, so the distance along the normal
+was off by `rise * normal_z` — measured **4.7-6.4 mm** for rises of 242-328 mm.
+Verified numerically before changing anything: it flipped **no** verdict (real
+clearances are 45-52 mm against a 5 mm threshold) and erred conservatively, so it was
+inert rather than dangerous — but it is now compensated (`origin_now`), and clearance
+for `2` reads 52 mm where it read 46.
+
+**The dominant failure mode is now detection flakiness, not reach.** In that same dry
+run, 4 of 6 attempts were refused because one button was missed — grids like
+`(2,2,2,1,2)`. The buttons sit on a very regular lattice (row pitch 43.4 mm / 68 px,
+column 56.6 mm / 79 px, consistent to ~1 px across all five rows), so fitting that
+lattice and filling in the missed cells should recover them. Not built yet.
+
 ### Press poses are now bounded, and the lift makes it panel-independent (2026-08-25)
 
 **Boundaries, not a recipe.** The approach roll is still searched over all 24
@@ -280,10 +312,12 @@ candidate.
    alone would destroy the generality that makes the anchors work anywhere else.
 2. **Press after driving.** Everything is already live-measured per approach (plane fit + button
    3D), so re-docking should work without code changes — but it has never been tried.
-3. **Implement "look low, press high"** — raise the lift to the height the boundary check
-   wants, compensating the targets by the measured 2:1 ratio. This is what restores button `2`
-   (refused today at 1.0 deg of margin) and takes the worst margin from 1 to 28 deg. All the
-   constants are measured and in `arm.lift`; the motion has never been put in the press loop.
+3. **Fit the button lattice and infer missed cells.** Detection flakiness is now the
+   dominant failure mode: 4 of 6 localisation attempts get refused because one button of ten
+   was missed. The lattice is regular to ~1 px, so the missing cells can be predicted from
+   the ones that were found. Anchors must stay real detections (verifying inferences with
+   inferences is circular), inferred cells must be logged as inferred, and a poor lattice fit
+   must refuse rather than extrapolate.
 4. Force-limited press (`rm_force_position_move_pose`) — now optional, the spring is the
    compliance.
 5. Route fix + Tailscale (the installed node belongs to `tony.h@` and is offline).

@@ -72,6 +72,13 @@ def main() -> int:
     ap.add_argument("--no-verify", action="store_true",
                     help="skip anchor verification. UNSAFE: a shifted grid then "
                          "presses the wrong floor silently")
+    ap.add_argument("--lift", action="store_true",
+                    help="LOOK LOW, PRESS HIGH: detect once at the current (visible) "
+                         "height, then per button raise the torso lift to bring that "
+                         "button to arm.lift.target_relative_z (best joint margin) and "
+                         "press from the compensated coord. Needs arm.lift in config. "
+                         "Restores the lift afterwards. No single height reaches all "
+                         "rows with safe margin, so this is required for full coverage.")
     args = ap.parse_args()
 
     cfg = load_pipeline()
@@ -87,6 +94,52 @@ def main() -> int:
     handle = CameraManager().build().get(args.camera)
     base_T_cam = handle.extrinsic
     cam = handle.camera
+
+    # ---- torso lift (LOOK LOW, PRESS HIGH) --------------------------------
+    # No single height reaches all rows with safe margin (the camera-visible band and
+    # the good-margin band do not overlap), so --lift detects at the current visible
+    # height, then per button raises the lift to put THAT button at target_relative_z
+    # (the arm's best-margin height) and compensates the cached coord. The lift hangs
+    # off the LEFT controller and reports TWICE the real travel (command_per_mm=2), so
+    # 1 command unit = 0.5 mm real; the base-frame origin rides the lift, so raising by
+    # `rise` metres lowers a button's base-frame z by the same `rise` (x, y unchanged).
+    lift_arm = lift_cfg = None
+    L0 = None
+    if args.lift:
+        lift_cfg = cfg["arm"].get("lift")
+        if lift_cfg is None:
+            print("!! --lift needs `arm.lift` in configs/pipeline.yaml")
+            return 1
+        lift_arm = RealmanArm(side=lift_cfg.get("controller", "left"))
+        lift_arm.connect()
+        L0 = lift_arm.get_lift_height()          # command units at detection time
+        print(f"lift: on the {lift_cfg.get('controller','left')} controller, "
+              f"currently at command {L0:.0f}")
+
+    def move_lift(cmd_target, speed=30, timeout=25.0, tol=3.0):
+        """Move the lift to a command value; poll until it arrives (mode != 2)."""
+        cmd_target = float(np.clip(cmd_target, lift_cfg["command_min"],
+                                   lift_cfg["command_max"]))
+        ls = lift_arm._require()
+        ls.rm_set_lift_height(int(speed), int(round(cmd_target)), 0)  # non-blocking
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            code, st = ls.rm_get_lift_state()
+            if code == 0 and st and st.get("mode") != 2 \
+                    and abs(st.get("pos", 0) - cmd_target) <= tol:
+                return cmd_target
+            time.sleep(0.3)
+        return None
+
+    def lift_plan(z0):
+        """Command to bring a button at base-frame z0 (measured at L0) to target_z,
+        and the resulting downward z shift of the button in the base frame."""
+        target_z = lift_cfg["target_relative_z_m"]
+        per_mm = lift_cfg["command_per_mm"]        # command units per mm of real rise
+        want = L0 + per_mm * 1000.0 * (z0 - target_z)
+        cmd = float(np.clip(want, lift_cfg["command_min"], lift_cfg["command_max"]))
+        rise_m = (cmd - L0) / per_mm / 1000.0      # real rise achieved (m)
+        return cmd, rise_m
 
     # ---- locate the panel and every button once ----
     # Detector path (default): a full-frame pass gives the button boxes, their union
@@ -180,7 +233,25 @@ def main() -> int:
         q = np.asarray(q, dtype=np.float64)
         return float(np.min(np.minimum(J_LIMIT - q, q + J_LIMIT)))
 
-    def plan(button, seed):
+    def self_collides(seed, q_off, q_on):
+        """True if the arm self-collides anywhere along seed -> standoff -> contact.
+
+        Uses the controller's OWN model via rm_algo_safety_robot_self_collision_detection
+        (0 = clear, nonzero = collision OR joint-limit exceeded). Joints are already
+        margin-checked before this runs, so a hit here is a genuine self-collision.
+        Pure computation, no motion. NOTE this covers the arm's own links + the
+        end-effector per the controller model only — NOT the other arm, the chassis,
+        or the door frame (those need virtual walls). Sampled densely because a
+        configuration can pass through a collision between two clear endpoints.
+        """
+        path = np.vstack([np.linspace(seed, q_off, 25), np.linspace(q_off, q_on, 6)])
+        for q in path:
+            if sdk.rm_algo_safety_robot_self_collision_detection(
+                    [float(x) for x in q[:6]]) != 0:
+                return True
+        return False
+
+    def plan(button, seed, org):
         """Choose an approach roll that satisfies the boundaries, or explain why not.
 
         The roll is SEARCHED, not hard-coded — what is fixed is which poses are
@@ -194,6 +265,10 @@ def main() -> int:
           the press itself was a Cartesian `movel` into whatever lay 50 mm further
           in. Driving a straight line into a pose with no good solution is exactly
           where the arm jams.
+        * The controller's self-collision check is off, so the whole seed -> standoff
+          -> contact path is now checked here at planning time via
+          `rm_algo_safety_robot_self_collision_detection` (arm's own links + EE only;
+          the other arm / chassis / door still need virtual walls).
 
         Returns ``(travel, deg, q_standoff, margin, reasons)``; ``reasons`` counts why
         rolls were rejected, so a refusal says WHICH boundary bit.
@@ -229,9 +304,12 @@ def main() -> int:
                 reject(f"path jump > {LIM['max_path_jump_deg']} deg "
                        "(configuration flip)")
                 continue
-            clear = clearance(seed, q_off)
+            clear = clearance(seed, q_off, org)
             if clear < LIM["min_clearance_mm"]:
                 reject(f"clearance < {LIM['min_clearance_mm']} mm")
+                continue
+            if self_collides(seed, q_off, q_on):
+                reject("self-collision on path")
                 continue
             travel = max(abs(x - y) for x, y in zip(q_off, seed))
             cands.append((travel, deg, q_off, margin, clear))
@@ -244,15 +322,24 @@ def main() -> int:
         travel, deg, q_off, margin, clear = cands[0]
         return (travel, deg, q_off, margin, clear, len(cands)), reasons
 
-    def clearance(seed, goal):
-        """Closest the plunger tip gets to the panel along the joint-interpolated path."""
+    def clearance(seed, goal, org):
+        """Closest the plunger tip gets to the panel along the joint-interpolated path.
+
+        ``org`` must be the plane origin AS SEEN FROM THE CURRENT lift height. With
+        --lift the base frame rides the lift, so a plane measured before the move is
+        stale by the rise; the distance is taken along the panel normal, so the error
+        is only ``rise * normal_z`` — measured at 4.7-6.4 mm for rises of 242-328 mm,
+        which flipped no verdict here (real clearances are 45-52 mm against a 5 mm
+        threshold) and errs on the conservative side. Passed explicitly anyway,
+        because the day a path does graze the faceplate is not the day to discover it.
+        """
         worst = 1e9
         for i in range(21):
             q = [x + (y - x) * (i / 20.0) for x, y in zip(seed, goal)]
             fk = sdk.rm_algo_forward_kinematics(q, 1)
             p = np.array(fk[:3])
             R = rpy_to_matrix(*fk[3:], degrees=False)
-            worst = min(worst, float((p + R @ tcp - origin) @ normal) * 1000)
+            worst = min(worst, float((p + R @ tcp - org) @ normal) * 1000)
         return worst
 
     results = []
@@ -265,6 +352,21 @@ def main() -> int:
             results.append((name, False))
             continue
         button = buttons3d[name]
+        origin_now = origin
+        if args.lift:
+            cmd, rise = lift_plan(button[2])
+            print(f"    lift -> command {cmd:.0f} (raise {rise * 1000:+.0f} mm) to put "
+                  f"z={button[2]:.3f} m at target {lift_cfg['target_relative_z_m']:.3f} m")
+            if args.go and move_lift(cmd) is None:
+                print("    lift move did not confirm; skipping")
+                results.append((name, False))
+                continue
+            # Base-frame origin rides the lift: raising by `rise` lowers the button's
+            # base-frame z by `rise` (x, y unchanged). Compensate the cached coord.
+            button = np.asarray(button, dtype=np.float64) - np.array([0.0, 0.0, rise])
+            # The plane rides the lift with everything else, so compensate it too —
+            # otherwise the clearance check is measured against where the panel WAS.
+            origin_now = origin - np.array([0.0, 0.0, rise])
         seed = list(arm.get_joint_angles())
         if max(abs(a - b) for a, b in zip(seed, home)) > 3.0:
             if not arm.move_joints_sync(home):
@@ -272,7 +374,7 @@ def main() -> int:
                 results.append((name, False))
                 break
             seed = list(arm.get_joint_angles())
-        best, reasons = plan(button, seed)
+        best, reasons = plan(button, seed, origin_now)
         if best is None:
             print("    no pose satisfies the boundaries:")
             for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
@@ -309,6 +411,11 @@ def main() -> int:
             print("    press motion did not complete (retracted)")
         results.append((name, pressed))
 
+    if args.lift and lift_arm is not None:
+        if args.go and L0 is not None:
+            print(f"restoring lift to command {L0:.0f}")
+            move_lift(L0)
+        lift_arm.disconnect()
     cam.stop()
     arm.disconnect()
     if args.go:
