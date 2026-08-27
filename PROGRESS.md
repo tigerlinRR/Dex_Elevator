@@ -27,6 +27,94 @@ the button pixels come from Hough circles, not YOLO. Both were held constant on 
 a failed press could only be a geometry or motion problem. That paid off — every failure this
 session was diagnosable.
 
+### A collision, and what it cost to understand (2026-08-27)
+
+**The arm collided with the panel.** Cause: the arrival trigger had been changed from
+"AutoXing reports the task finished" to "the camera sees the panel visible and still",
+to save the 20-55 s of cloud latency. Those are not the same condition. Localisation
+takes ~200 ms per frame, so during the base's final deceleration consecutive frames
+fall inside the 2 mm stillness threshold while the robot is still travelling. The press
+locked coordinates and moved; the panel then kept moving. `--auto` had only ever been
+tested with the robot stationary, where this failure cannot appear — the module was
+fine, the mistake was wiring it into a scenario that was never re-verified.
+
+Three things I got wrong during the recovery, all the same shape — treating "nothing is
+happening on my side" as "the robot will not move":
+
+| assumed | actually |
+|---|---|
+| `kill -9` on the runner stops the robot | the task runs in AutoXing's cloud; the base drove the rest of its route by itself |
+| `move_joints_sync` returning False means the arm stopped | `rm_movej` keeps executing in the background; the joints were creeping toward the target between two of my status reads, which is what was colliding while I analysed paths |
+| self-collision clear + tip clear of the panel = safe | the controller's model covers the arm's own links only, not the torso, lift column or camera mount |
+
+Recovery: stop + delete trajectory + clear joint errors, then a two-stage return
+(retract 80-100 mm along -x, then home in verified legs). The direct path home would
+have taken the tip to 73 mm from the panel; retracting first kept it 190 mm clear.
+No hardware damage — every button still lights.
+
+### Plunger TCP re-measured, and it was 5.57 mm out (2026-08-27)
+
+After the plunger was adjusted by hand, the configured offset was stale:
+
+| | value |
+|---|---|
+| configured | `[26.00, -1.91, 24.74]` mm |
+| measured | `[24.15, -2.99, 29.88]` mm |
+| error | `[-1.85, -1.08, +5.14]` mm, norm **5.57 mm** |
+
+The +5.14 mm is along the approach axis, so a commanded 3 mm push was really pressing
+about 8 mm, with the contact point ~2.1 mm off centre. **The button still lit** — which
+is the whole reason this had to be measured rather than inferred.
+
+**The press log cannot detect this.** Its depth/lateral figures compare the commanded
+tip against `get_tcp_pose() @ tcp_offset`; the controller servos to the assumed TCP, so
+an error in it cancels out of both sides. Reported lateral stayed under 1 mm while the
+offset was 5.57 mm wrong. Only the button lighting and an independent measurement see it.
+
+Method: the operator held the tip on the centre of button `1`, that pose was read from
+the controller, the arm retracted, and the camera measured button 1's surface over 8
+frames (spread 0.27 / 0.55 / 0.65 mm). `offset = inv(base_T_tool) @ tip`. The camera
+side is solid; the uncertain part is the hand placement, and unlike the original
+calibration this has no second, independent cross-check yet.
+
+Validated by pressing `open 1 4 5 close`: **5/5 lit at a true 3 mm push**, and every
+button's lateral residual improved:
+
+| button | stale TCP (2 runs) | re-measured |
+|---|---|---|
+| `open` | 0.72 / 0.80 | **0.16** |
+| `1` | 0.87 / 0.39 | **0.28** |
+| `4` | 0.24 / 0.23 | **0.06** |
+| `5` | 0.63 / 0.65 | **0.39** |
+| `close` | 0.17 / 0.17 | **0.08** |
+
+Careful with that table though: it is corroboration, not proof. Changing the offset
+changes the commanded flange pose and therefore the IK solution and the roll chosen
+(`open` went 330 deg -> 0, `5` 270 -> 255), and the residual it measures is
+configuration-dependent servo error. The proof is the lights at 3 mm.
+
+### Detection got much more reliable (2026-08-27)
+
+Localisation went from **1 of 4 frames to 7 of 8**. Two causes, both found by looking at
+why frames were refused rather than by retrying harder:
+- The ROI clustering link distance was 2.2 button widths too generous at 3.0. The
+  cabinet's keyhole sits ~2.25 widths from the nearest button, so it merged on some
+  frames; when it did, the ROI stretched 100 px, the refined pass returned 11
+  "buttons", and the lattice fit failed outright. Neighbouring buttons are 1.6 widths
+  apart, so 2.2 keeps the grid and excludes the keyhole.
+- When the fit still fails, `assign` now drops the detection furthest from the group and
+  retries, instead of throwing the frame away.
+
+### Both arms have a symmetric resting pose (2026-08-27)
+
+`arm.home_joints_deg_left` = `[-39.76, -100.13, -79.28, 131.63, 117.0, -68.12]`. The
+mirror is "negate J1, J4, J6" — established by trying all five plausible sign patterns
+and checking with FK which one lands the left TCP on the mirror of the right TCP. Only
+that one does, to **0.0 mm**; the others miss by 324-488 mm, and four of the five look
+plausible. Both hands rest in a fist, and the fist goes on BEFORE the arm moves: the
+LinkerHand's fingertips are 172.87 mm from the flange against the plunger's ~154 mm, so
+extended fingers are the front-most part and hit the panel first.
+
 ### Pressing after driving — WORKING, and the lift is now searched (2026-08-26)
 
 **Re-docked and pressed, three times, at three different stopping positions.** The

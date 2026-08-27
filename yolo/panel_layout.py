@@ -133,7 +133,7 @@ def detect_positions(bgr: np.ndarray, roi: tuple[int, int, int, int],
 
 
 def panel_roi(bgr: np.ndarray, detector: Detector, min_conf: float = 0.10,
-              margin: float = 0.35, link: float = 3.0,
+              margin: float = 0.35, link: float = 2.2,
               verbose: bool = False) -> Optional[tuple[int, int, int, int]]:
     """ROI covering the faceplate, derived from the detections themselves.
 
@@ -146,6 +146,13 @@ def panel_roi(bgr: np.ndarray, detector: Detector, min_conf: float = 0.10,
     the ROI to 330x499 px and made the refined pass report 12 buttons in a (3,2,3,2,2)
     grid. Buttons on a faceplate form one dense cluster, while those extras sit alone,
     so single-linkage clustering and keeping the largest cluster separates them.
+
+    ``link`` was 3.0 and that was too loose. The cabinet's keyhole sits about 2.25
+    button widths from the nearest button, so it was merged on some frames and dropped
+    on others — and when merged the ROI stretched 100 px further left, the refined pass
+    returned 10-11 "buttons" including the keyhole and the warning label, and the
+    lattice fit failed outright. Neighbouring buttons are only ~1.6 widths apart, so
+    2.2 still links the grid while leaving the keyhole out.
     """
     dets = [d for d in detector.detect(bgr) if float(d.confidence) >= min_conf]
     if not dets:
@@ -388,9 +395,28 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
                       "in view to infer the rest")
         return {}, rep
 
-    lat = fit_lattice(found, rows, cols)
+    # If the fit fails outright there is usually one non-button in the set (the
+    # keyhole, a label). Drop the detection furthest from the group and retry rather
+    # than discarding an otherwise good frame — tightening `link` reduced this but the
+    # geometry is close enough to the threshold that it will still happen sometimes.
+    lat, used = fit_lattice(found, rows, cols), list(found)
+    dropped_outliers: list[str] = []
+    while lat is None and len(used) > n_cells:
+        P = np.array([[f.u, f.v] for f in used])
+        med = np.median(P, axis=0)
+        far = int(np.argmax(np.linalg.norm(P - med, axis=1)))
+        dropped_outliers.append(f"{used[far].label}@({used[far].u:.0f},"
+                                f"{used[far].v:.0f})")
+        used.pop(far)
+        lat = fit_lattice(used, rows, cols)
+    if dropped_outliers:
+        rep.inferred.append("(dropped as non-button: "
+                            + ", ".join(dropped_outliers) + ")")
+    found = used
+    rep.found = found
     if lat is None:
-        rep.reason = "could not fit a lattice to the detections"
+        rep.reason = ("could not fit a lattice to the detections even after dropping "
+                      f"{len(dropped_outliers)} outlier(s)")
         return {}, rep
     rep.residual = lat["residual"]
     if lat["residual"] > max_residual:

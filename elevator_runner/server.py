@@ -215,6 +215,37 @@ def make_task_point(poi, area_id, pause_time=0):
     }
 
 
+# AutoXing reports a task's outcome as `taskStatus` (4 = completed, with
+# `taskStatusNameEN: "completed"`), NOT as the boolean `isFinish`/`isCancel` that this
+# code used to read. Those keys simply are not in the response, so `.get()` returned
+# None and a task that had ALREADY completed was polled until the 240 s timeout and
+# then reported as "task did not finish". Observed live: robot parked 3.3 cm from the
+# elevator point with moveState "succeeded", taskStatus 4, endTime set, 8.2 m driven —
+# and the runner sat there waiting. Same failure shape as the POI coordinates: a field
+# name that does not exist, read through `.get()`, so it fails silently.
+#
+# The booleans are kept as a fallback in case a different API version does send them.
+TASK_STATUS_COMPLETED = 4
+
+
+def task_finished(st):
+    if st.get("isFinish"):
+        return True
+    if st.get("taskStatus") == TASK_STATUS_COMPLETED:
+        return True
+    return str(st.get("taskStatusNameEN", "")).lower() == "completed"
+
+
+def task_cancelled(st):
+    if st.get("isCancel"):
+        return True
+    name = str(st.get("taskStatusNameEN", "")).lower()
+    if name in ("cancelled", "canceled", "failed", "aborted"):
+        return True
+    # A non-zero failureCode on a task that has ended is a failure, not a completion.
+    return bool(st.get("failureCode")) and bool(st.get("endTime"))
+
+
 def dist_cm(ax, ay, bx, by):
     try:
         return ((float(ax) - float(bx)) ** 2 + (float(ay) - float(by)) ** 2) ** 0.5 * 100.0
@@ -264,7 +295,16 @@ def run_loop(params):
     floors = params["floors"]               # e.g. "3" or "1 4 2"
     loops = int(params["loops"])
     tol_cm = float(params["tolerance_cm"])
-    yaw_tol = float(params.get("yaw_tol_deg", 12))
+    # Yaw gating is OFF by default because a POI's stored yaw and robot_state's yaw
+    # are NOT the same convention here: the elevator POI records 154.70 while the
+    # robot arrives at ~2.7 every single time (two arrivals measured 2.71 and 2.69),
+    # and 2.7 is exactly the orientation the arm pressed 4/4 from all day. Comparing
+    # them rejected a perfectly good dock with a 152 deg "error". Set yaw_tol_deg
+    # together with yaw_ref_deg to gate against an orientation known to work.
+    yaw_tol = params.get("yaw_tol_deg")
+    yaw_tol = None if yaw_tol in (None, "", 0) else float(yaw_tol)
+    yaw_ref = params.get("yaw_ref_deg")
+    yaw_ref = None if yaw_ref in (None, "") else float(yaw_ref)
     max_retries = int(params["max_retries"])
     backoff = float(params["backoff_sec"])
     run_mode = int(params.get("run_mode", 2))
@@ -274,6 +314,7 @@ def run_loop(params):
     RUN.set(loops_total=loops, loop=0, phase="starting", dry_run=dry,
             successes=0, failures=0, last_error_cm=None, last_press=None)
     RUN.log(f"START robot={robot} loops={loops} floors='{floors}' tol={tol_cm}cm "
+            f"yawGate={'off' if yaw_tol is None else str(yaw_tol) + 'deg'} "
             f"maxRetries={max_retries} dry_run={dry}")
 
     area_id = elevator.get("areaId", "")
@@ -315,7 +356,15 @@ def run_loop(params):
             RUN.set(phase="navigating", task_id=task_id)
             RUN.log(f"{tag}: dispatched task {task_id}")
 
-            # --- poll until finish / cancel / timeout ---
+            # --- wait for the drive to FINISH, then press ---
+            # The trigger has to be "the base has finished driving", and the task status
+            # is the only source for that. Substituting the camera's "panel visible and
+            # still" caused a collision: during final deceleration consecutive frames
+            # fall inside the 2 mm stillness threshold, so the press locked coordinates
+            # and moved while the robot was still travelling, and the arm went for where
+            # the panel had been. Stillness over a short window is not arrival. The cloud
+            # costs 20-55 s of latency and that is the price of a trustworthy signal; a
+            # real fix needs a local arrival signal from the base, not a proxy for one.
             t0 = time.time()
             finished = cancelled = False
             while time.time() - t0 < poll_timeout:
@@ -326,27 +375,33 @@ def run_loop(params):
                     st = AX.task_status(task_id).get("data") or {}
                 except Exception as e:  # noqa: BLE001
                     RUN.log(f"{tag}: status poll error: {e}"); continue
-                if st.get("isFinish"):
+                if task_finished(st):
                     finished = True; break
-                if st.get("isCancel"):
+                if task_cancelled(st):
                     cancelled = True; break
             if RUN.stop_flag:
                 break
 
             if not finished:
-                # obstacle / auto-cancel / timeout -> retrying CAN help (spot may clear)
                 why = "cancelled/obstacle" if cancelled else "timeout"
-                RUN.log(f"{tag}: task did not finish ({why}). Backoff {backoff}s then retry.")
+                RUN.log(f"{tag}: task did not finish ({why}). Backoff {backoff}s "
+                        "then retry.")
                 RUN.set(phase=f"retry({why})"); time.sleep(backoff); continue
 
-            # --- arrived: gate on real measured error ---
+            # --- arrived: gate on the measured position error ---
             RUN.set(phase="checking-arrival")
             state = AX.robot_state(robot)
             rx, ry = state.get("x"), state.get("y")
             err = dist_cm(rx, ry, elevator["x"], elevator["y"])
             yaw_err = None
-            if state.get("yaw") is not None and elevator.get("yaw") is not None:
-                dy = abs(float(state["yaw"]) - float(elevator["yaw"])) % 360
+            # ONLY an explicit yaw_ref_deg may gate on yaw. A POI's stored yaw is a
+            # different convention from robot_state's: the elevator point reads 154.70
+            # while the robot arrives at ~2.7 every time, physically facing the panel —
+            # the orientation every successful press was made from. Comparing them
+            # rejected a correct dock with a 152 deg "error".
+            ref = yaw_ref
+            if yaw_tol is not None and state.get("yaw") is not None and ref is not None:
+                dy = abs(float(state["yaw"]) - float(ref)) % 360
                 yaw_err = min(dy, 360 - dy)
             RUN.set(last_error_cm=None if err is None else round(err, 1),
                     last_yaw_err=None if yaw_err is None else round(yaw_err, 1))
@@ -354,12 +409,22 @@ def run_loop(params):
                     f"(gate {tol_cm}cm / {yaw_tol}deg)")
 
             if err is None:
-                RUN.log(f"{tag}: no live position from robot — cannot verify; retry."); time.sleep(backoff); continue
-            if err > tol_cm or (yaw_err is not None and yaw_err > yaw_tol):
-                # Finished but geometrically off. This is usually a SYSTEMATIC docking
-                # offset that repeating won't fix, so retry a bounded number of times
-                # then surface it — do NOT press (arm can't reach past the envelope).
-                RUN.log(f"{tag}: OUT OF REACH ({err}cm > {tol_cm}cm) — not pressing; retry.")
+                RUN.log(f"{tag}: no live position from robot — cannot verify; retry.")
+                time.sleep(backoff); continue
+            pos_bad = err > tol_cm
+            yaw_bad = yaw_tol is not None and yaw_err is not None and yaw_err > yaw_tol
+            if pos_bad or yaw_bad:
+                # Usually a SYSTEMATIC docking offset that repeating will not fix, so
+                # retry a bounded number of times then surface it. Name WHICH gate
+                # failed: the old message always quoted the position numbers, so a yaw
+                # rejection read as "OUT OF REACH (1.41cm > 8.0cm)", which is not even
+                # arithmetically true and sent the diagnosis the wrong way.
+                why = []
+                if pos_bad:
+                    why.append(f"position {err:.1f}cm > {tol_cm}cm")
+                if yaw_bad:
+                    why.append(f"yaw {yaw_err:.1f}deg > {yaw_tol}deg")
+                RUN.log(f"{tag}: NOT PRESSING — {'; '.join(why)}")
                 RUN.set(phase="out-of-reach"); time.sleep(backoff); continue
 
             # --- within reach: press ---
@@ -370,9 +435,8 @@ def run_loop(params):
                 RUN.log(f"{tag}: PRESS OK — {out}")
                 pressed = True
                 break
-            else:
-                RUN.log(f"{tag}: PRESS FAILED — {out}; retry.")
-                time.sleep(backoff); continue
+            RUN.log(f"{tag}: PRESS FAILED — {out}; retry.")
+            time.sleep(backoff); continue
 
         if pressed:
             successes += 1
@@ -401,9 +465,11 @@ def press_on_agx(floors):
     else:
         full = ["ssh", CFG["agx_ssh"], cmd]    # remote: over SSH from a laptop
     try:
-        r = subprocess.run(full, capture_output=True, text=True, timeout=300)
+        # 240 s of --auto watching plus a ~51 s press already reaches 291 s, so
+        # 300 left no margin at all.
+        r = subprocess.run(full, capture_output=True, text=True, timeout=420)
     except subprocess.TimeoutExpired:
-        return False, "press timed out (300s)"
+        return False, "press timed out (420s)"
     except Exception as e:  # noqa: BLE001
         return False, f"ssh error: {e}"
     tail = (r.stdout or "").strip().splitlines()[-3:]

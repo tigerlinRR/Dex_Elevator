@@ -230,6 +230,15 @@ Measured, not assumed:
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
 | plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
 
+**Plunger TCP re-measured after a collision (2026-08-27).** The configured offset was 5.57 mm
+out — 5.14 mm of it along the approach axis, so a commanded 3 mm push was really pressing about
+8 mm. The button still lit, which is why this had to be *measured*: the press log's own
+depth/lateral figures cannot see a TCP error, because the controller servos to the assumed offset
+and it cancels out of both sides of that comparison. Re-measuring (tip held on a button, then the
+camera measuring that button over 8 frames) and pressing `open 1 4 5 close` gave 5/5 lit at a true
+3 mm push. Detection also went from 1 of 4 frames to 7 of 8 by tightening the ROI clustering and
+retrying the lattice fit without its worst outlier.
+
 **Pressing after driving — working (2026-08-26).** Re-docked three times at three
 different stopping positions and pressed 4 of 4 each time; the worst docking error absorbed was
 123 mm further out, 44 mm sideways and 4.5° of yaw, with no constant changed. Getting there took

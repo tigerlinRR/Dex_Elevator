@@ -273,7 +273,14 @@ misalignment is caught rather than pressed. Measured, and each number changed th
 - **The ROI is derived, not hard-coded** (`panel_roi`): the union of ALL detections is
   too crude, because a low-confidence pass also fires on the cabinet's keyhole and
   stretched the ROI 145 px past the faceplate. Single-linkage clustering on the
-  centres, keeping the largest cluster, separates the grid from those strays. Then
+  centres, keeping the largest cluster, separates the grid from those strays. The link
+  distance is **2.2** button widths, not 3.0: the keyhole sits ~2.25 widths from the
+  nearest button, so at 3.0 it merged on some frames and not others — and when it
+  merged the ROI stretched 100 px, the refined pass returned 11 "buttons", and the
+  lattice fit failed. Neighbouring buttons are only ~1.6 widths apart. `assign` also
+  drops the detection furthest from the group and retries when the fit fails, rather
+  than discarding the frame. Together these took localisation from 1 of 4 frames to
+  7 of 8. Then
   `tight_roi` re-boxes the fit around the confirmed buttons only — the wall and cabinet
   behind are separate parallel planes and bias the depth fit.
 - **Verification is a LATTICE FIT, not a row-shape match** (`fit_lattice`). Requiring
@@ -438,6 +445,35 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   button was unreachable — single-button retests proved otherwise. Use
   `RealmanArm.move_joints_sync` / `move_line_sync`, which poll joints/TCP until
   arrival, retry 3x, and settle 0.35 s between moves.
+- **Killing the local process does NOT stop the robot.** An AutoXing task is executed
+  by the cloud, not by our process: after `kill -9` on the runner the base carried on
+  and drove the rest of its route by itself. Stopping means cancelling the task
+  (`AX.cancel_task`) or going through `/api/stop`, which does. `kill` alone leaves the
+  robot driving.
+- **`move_joints_sync` returning False does NOT mean the arm stopped.** It means
+  arrival was not observed within the timeout; `rm_movej` keeps executing in the
+  background. Reading that False as "it did not move" and going off to plan a retry is
+  how an arm ends up crossing the room while nobody thinks anything is happening —
+  confirmed by watching the joints creep toward the target between two status reads. On
+  a timeout, call `rm_set_arm_stop` + `rm_set_delete_current_trajectory` FIRST, then
+  decide.
+- **The self-collision check does not include the robot's own body.**
+  `rm_algo_safety_robot_self_collision_detection` covers the arm's links and end
+  effector only — not the torso, the lift column, the camera mount or the chassis. A
+  path that passes it, and whose plunger tip stays clear of the panel, can still hit
+  the robot itself. There is no model for that, so a large re-positioning move needs
+  eyes on it or hand-guiding; two computed checks passing is not "it will not collide".
+- **The press log's own depth/lateral figures CANNOT detect a wrong TCP.** They compare
+  the commanded tip against `get_tcp_pose() @ tcp_offset` — the controller servos to
+  the assumed TCP and both sides of the comparison use the same offset, so an error in
+  it cancels out. Measured: after the plunger was adjusted by hand the offset was
+  5.57 mm out and the reported lateral error stayed under 1 mm. The only signals that
+  see it are the button lighting up and an independent re-measurement (touch the tip to
+  a button, then `offset = inv(base_T_tool) @ camera_measured_button_point`).
+- **Close the hand into a fist BEFORE moving the arm.** The LinkerHand's fingertips sit
+  172.87 mm from the flange while the plunger tip is at ~154 mm, so with the fingers
+  extended the HAND is the front-most part and reaches the panel first. A fist folds
+  them behind the plunger. This is a pressing prerequisite, not tidiness.
 - **A camera that enumerates but never delivers colour is fixed by
   `device.reboot()`, no root and no replug.** The chest 335 got into this state after a
   USB re-enumeration: `lsusb` and `query_devices()` both listed it, and every

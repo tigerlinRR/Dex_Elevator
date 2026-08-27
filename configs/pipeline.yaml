@@ -21,6 +21,17 @@ arm:
   # Required joint travel (117-166 deg) is larger than the rejected candidate's
   # (33-143), which is the price paid for not blocking the camera.
   home_joints_deg: [39.76, -100.13, -79.28, -131.63, 117.0, 68.12]
+  # Resting pose for the OTHER arm, mirroring the one above. The mirror is
+  # "negate J1, J4 and J6" — established by trying all five plausible sign patterns
+  # and checking with forward kinematics which one lands the left TCP on the mirror of
+  # the right TCP. Only this one does, to 0.0 mm; the others miss by 324-488 mm. Do
+  # not re-derive it by guessing which joints flip, since four of the five guesses
+  # look plausible and are wrong.
+  #   right TCP [0.1983, -0.2082, 0.5720]   left TCP [0.1983, +0.2082, 0.5719]
+  # Both hands are closed into a fist at rest. Close the hand BEFORE moving the arm:
+  # an open hand puts the fingers out where they are the first thing to catch on
+  # something during a large swing.
+  home_joints_deg_left: [-39.76, -100.13, -79.28, 131.63, 117.0, -68.12]
   # BOUNDARIES for choosing a press pose. These say what is NOT allowed; the
   # approach roll itself is still searched, never hard-coded.
   #
@@ -160,7 +171,21 @@ end_effector:
   #   axial  24.7 mm  vs  24.0 mm   -> 0.7 mm
   #   radial 26.1 mm  vs  28.6 mm   -> 2.5 mm
   # Skipping the protrusion correction biases the axial term +4.8 mm.
-  tcp_offset: [0.02600, -0.00191, 0.02474]
+  # RE-MEASURED 2026-08-27 after the plunger was adjusted by hand. The previous value
+  # [26.00, -1.91, 24.74] mm was 5.57 mm out — mostly +5.14 mm along the approach axis,
+  # i.e. the rod is effectively 5 mm longer than the config believed. With the stale
+  # value a commanded 3 mm push was really pressing about 8 mm, and the contact point
+  # sat ~2.1 mm off centre. The button still lit, which is exactly why this needed
+  # measuring rather than inferring: the press log's own depth/lateral figures CANNOT
+  # see a TCP error, because the controller servos to the assumed TCP and both sides of
+  # that comparison use the same wrong number.
+  #
+  # Method: the operator held the tip on the centre of button `1` by hand, that pose was
+  # read from the controller, then the arm retracted and the camera measured button 1's
+  # surface over 8 frames (spread 0.27 / 0.55 / 0.65 mm). offset = inv(base_T_tool) @ tip.
+  # The uncertain part is the hand placement, not the camera — worth a second opinion
+  # (tape, or a repeat touch) before treating this as final.
+  tcp_offset: [0.02415, -0.00299, 0.02988]
 
 button_yolo:
   weights: data/weights/buttons.pt   # TODO: train on the robot's ~/dataset; single class `button`

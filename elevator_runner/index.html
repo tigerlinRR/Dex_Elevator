@@ -81,7 +81,7 @@
       <div><label>Backoff (s)</label><input type="number" id="backoff" value="20" min="0"></div>
     </div>
     <div class="row">
-      <div><label>Yaw tolerance (deg)</label><input type="number" id="yawtol" value="12" min="1"></div>
+      <div><label title="0 = off. A POI's stored yaw and the robot's reported yaw are not the same convention on this map: the elevator POI reads 154.7 while the robot arrives at ~2.7 every time, physically facing the panel — the orientation every successful press was made from. Gating on that difference rejected a correct dock with a 152 deg error.">Yaw tolerance (deg, 0 = off)</label><input type="number" id="yawtol" value="0" min="0"></div>
       <div><label>Run mode</label>
         <select id="runmode">
           <option value="2" selected>2 · track + limited avoidance</option>

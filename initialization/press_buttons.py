@@ -79,6 +79,12 @@ def main() -> int:
                     help="max panel movement between frames to count as still (mm)")
     ap.add_argument("--auto-timeout", type=float, default=300.0,
                     help="give up if nothing settles within this many seconds")
+    ap.add_argument("--arm-after-move", type=float, default=0.0, metavar="MM",
+                    help="with --auto, do not arm until the panel has first gone away "
+                         "(not locatable, or moved more than this many mm). Needed when "
+                         "the sequence STARTS parked at the panel: otherwise the panel "
+                         "is already visible and still, and the press fires before the "
+                         "robot has driven anywhere. 0 = arm immediately.")
     ap.add_argument("--countdown", type=int, default=3,
                     help="seconds of warning before --auto starts moving the arm")
     ap.add_argument("--no-verify", action="store_true",
@@ -288,14 +294,22 @@ def main() -> int:
         network is an unidentified service on port 9090 with no client library here.
         """
         need = args.settle_frames
-        tol = args.settle_mm / 1000.0
         deadline = time.time() + args.auto_timeout
         stable, prev, last = 0, None, None
         misses = 0
+        # When the run STARTS parked at the panel, the panel is already visible and
+        # still, so arming immediately would press before the robot drove anywhere.
+        # Require it to have gone away first: either not locatable, or displaced by
+        # more than --arm-after-move.
+        armed = args.arm_after_move <= 0
+        first_c = None
         while time.time() < deadline:
             got = locate(verbose=False)
             if got is None:
                 misses += 1
+                if not armed:
+                    armed = True
+                    print("    panel left the view — armed")
                 if stable:
                     print(f"    lost the panel after {stable} stable frame(s)")
                 stable, prev = 0, None
@@ -304,6 +318,16 @@ def main() -> int:
                 continue
             pts, pl = got
             c = centroid(pts)
+            if first_c is None:
+                first_c = c
+            if not armed:
+                moved = float(np.linalg.norm(c - first_c)) * 1000
+                if moved > args.arm_after_move:
+                    armed = True
+                    print(f"    panel moved {moved:.0f} mm — armed")
+                else:
+                    prev, last = c, (pts, pl)
+                    continue
             if prev is not None:
                 moved = float(np.linalg.norm(c - prev)) * 1000
                 if moved <= args.settle_mm:
