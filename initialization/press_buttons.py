@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -90,6 +91,27 @@ def main() -> int:
     ap.add_argument("--no-verify", action="store_true",
                     help="skip anchor verification. UNSAFE: a shifted grid then "
                          "presses the wrong floor silently")
+    ap.add_argument("--lift-objective", choices=("margin", "still"), default=None,
+                    help="how the torso height is chosen per button (default: "
+                         "arm.lift.objective in the config). `margin` moves to the "
+                         "height with the best joint margin for THAT button, so the "
+                         "torso visibly tracks the panel row by row; `still` keeps it "
+                         "where it is whenever the current height is good enough.")
+    ap.add_argument("--no-fist", action="store_true",
+                    help="skip closing the LinkerHand before moving. ONLY for a robot "
+                         "with no hand fitted — with the hand on, the fingers are the "
+                         "front-most part of the end-effector and hit the panel first.")
+    ap.add_argument("--wait-go", metavar="PATH", default=None,
+                    help="PRE-WARM MODE: do all the position-independent startup "
+                         "(connect the arm, open the camera, load the TensorRT engine, "
+                         "ramp the GPU clocks), print PREWARM_READY, then block until "
+                         "PATH appears before locating the panel. Lets a caller start "
+                         "this process while the base is still driving and pay the ~7 s "
+                         "of startup in parallel with the drive. The caller still "
+                         "decides WHEN to press — nothing here infers arrival, which is "
+                         "the mistake that drove the arm into the panel once already.")
+    ap.add_argument("--wait-go-timeout", type=float, default=600.0,
+                    help="give up waiting for --wait-go PATH after this many seconds")
     ap.add_argument("--lift", action="store_true",
                     help="LOOK LOW, PRESS HIGH: detect once at the current (visible) "
                          "height, then per button raise the torso lift to bring that "
@@ -109,6 +131,51 @@ def main() -> int:
     arm = RealmanArm(side=cfg["arm"]["side"])
     arm.connect()
     sdk = arm._require()
+
+    # ---- close the hand BEFORE anything moves -----------------------------
+    # This is a prerequisite of pressing, not tidiness. The LinkerHand's fingertips
+    # sit 172.87 mm from the flange while the plunger tip is at ~154 mm, so with the
+    # fingers extended the HAND is the front-most part of the end-effector and reaches
+    # the panel before the plunger does. A fist folds them behind it.
+    #
+    # It lives here, in the press, because it used to be done out-of-band by whoever
+    # was driving — and an out-of-band prerequisite is one someone eventually forgets.
+    # The hand also loses power across an emergency stop, so "it was a fist last time"
+    # is not a state that survives.
+    if not args.no_fist:
+        from core.hand.linkerhand import LinkerHand, POSES  # noqa: E402
+        hand = LinkerHand(arm)
+        try:
+            hand.power_on()
+            hand.set_speed()
+            hand.pose("fist")
+            # Verify by READING it back rather than trusting the write. The check is
+            # "nothing is sticking out" rather than "each joint hit its target": in a
+            # fist the index finger bottoms out against the thumb at ~70 instead of 0,
+            # measured on both hands, so an exact-match test would fail every time.
+            deadline = time.time() + 4.0
+            joints = None
+            while time.time() < deadline:
+                joints = hand.read_joints()
+                if joints is not None and max(joints) <= 100:
+                    break
+                time.sleep(0.3)
+            if joints is None:
+                print("!! the hand did not answer — refusing to move. Power-cycle it, "
+                      "or pass --no-fist if no hand is fitted.")
+                arm.disconnect()
+                return 1
+            if max(joints) > 100:
+                print(f"!! the hand did not close (joints {joints}) — refusing to move; "
+                      "extended fingers reach the panel before the plunger.")
+                arm.disconnect()
+                return 1
+            print(f"hand: fist confirmed {joints}")
+        except Exception as e:  # noqa: BLE001
+            print(f"!! could not close the hand ({type(e).__name__}: {e}) — refusing "
+                  "to move. Pass --no-fist only if no hand is fitted.")
+            arm.disconnect()
+            return 1
     handle = CameraManager().build().get(args.camera)
     base_T_cam = handle.extrinsic
     cam = handle.camera
@@ -176,17 +243,30 @@ def main() -> int:
         """Real vertical rise, in metres, of going from L0 to `cmd`."""
         return (cmd - L0) / lift_cfg["command_per_mm"] / 1000.0
 
-    def plan_over_lift(button0, seed):
+    def plan_over_lift(button0, seed, l_now):
         """Search (lift height, approach roll) together.
 
-        Returns ``(cmd, rise, best, reasons, tried)``. Selection: among heights whose
-        best pose clears `prefer_margin_deg`, take the one needing the LEAST torso
-        motion (ties to the larger margin); if none clears it, take the largest margin
-        available. Preferring stillness matters — moving the torso costs seconds, and
-        it drops the panel out of the camera's view, so it should happen only when the
-        arm genuinely cannot do the job from where it is.
+        Returns ``(cmd, rise, best, reasons, tried)``. Two objectives:
+
+        `still`  — among heights whose best pose clears `prefer_margin_deg`, take the
+          one needing the LEAST torso motion. Keeps the torso still at a comfortable
+          docking distance; moving it costs seconds and drops the panel out of view.
+
+        `margin` — take the height with the BEST joint margin for this button. The
+          torso then tracks the panel row by row, which is what an operator watching
+          the robot expects to see, and it is not merely cosmetic: the margins it
+          selects are the largest available. If that height is where the torso already
+          is, the next-best height at least `min_move_command` away is taken instead —
+          but only from poses that ALREADY cleared the boundaries, so the visible
+          motion never costs safety, only optimality.
+
+        Either way the candidates come from `plan`, which has already rejected
+        anything on a joint stop, through a self-collision, or inside the panel.
         """
         prefer = float(lift_cfg.get("prefer_margin_deg", 20.0))
+        objective = (args.lift_objective
+                     or str(lift_cfg.get("objective", "still")).lower())
+        min_move = float(lift_cfg.get("min_move_command", 0.0))
         feasible, last_reasons, tried = [], {}, 0
         for cmd in lift_options():
             rise = rise_of(cmd)
@@ -200,8 +280,15 @@ def main() -> int:
         if not feasible:
             return None, 0.0, None, last_reasons, tried
         good = [f for f in feasible if f[2][3] >= prefer]
-        if good:
-            cmd, rise, best = min(good, key=lambda f: (abs(f[0] - L0), -f[2][3]))
+        if objective == "margin":
+            pool = good or feasible
+            cmd, rise, best = max(pool, key=lambda f: f[2][3])
+            if min_move and abs(cmd - l_now) < min_move:
+                moved = [f for f in pool if abs(f[0] - l_now) >= min_move]
+                if moved:
+                    cmd, rise, best = max(moved, key=lambda f: f[2][3])
+        elif good:
+            cmd, rise, best = min(good, key=lambda f: (abs(f[0] - l_now), -f[2][3]))
         else:
             cmd, rise, best = max(feasible, key=lambda f: f[2][3])
         return cmd, rise, best, {}, tried
@@ -226,6 +313,28 @@ def main() -> int:
         print(f"panel {layout.id!r}: {layout.shape} grid, "
               f"{len(layout.anchors)} anchors, engine {detector.engine_path.name}")
     cam.start()
+
+    if args.wait_go is not None:
+        # Warm the GPU before releasing the barrier, not after. The Orin idles its
+        # GPU at 306 MHz under `schedutil`, so the first inference in a process pays
+        # the clock ramp — and here that ramp would otherwise land AFTER the go
+        # signal, i.e. inside the time we are trying to remove.
+        _warm = cv2.cvtColor(cam.capture().rgb, cv2.COLOR_RGB2BGR)
+        if detector is not None:
+            for _ in range(30):
+                detector.detect(_warm)
+        go = Path(args.wait_go)
+        if go.exists():
+            go.unlink()          # a stale token from a previous run is not a signal
+        print("PREWARM_READY", flush=True)
+        _t0 = time.time()
+        while not go.exists():
+            if time.time() - _t0 > args.wait_go_timeout:
+                print(f"!! no go signal at {go} after {args.wait_go_timeout:.0f} s")
+                return 1
+            time.sleep(0.1)
+        go.unlink()
+        print(f"go signal received after {time.time() - _t0:.1f} s of waiting")
 
     def locate(verbose=True, tag=""):
         """One attempt at locating the panel and every button. None if it failed.
@@ -507,6 +616,11 @@ def main() -> int:
         return worst
 
     results = []
+    # Where the torso actually is right now. `L0` is where it was when the buttons
+    # were localised and stays the reference for compensating their coordinates; the
+    # lift is NOT returned to it between buttons, so "how far would this move the
+    # torso" has to be measured from here, not from L0.
+    L_now = L0
     print(f"sequence {' -> '.join(args.buttons)}   push={push * 1000:.1f} mm")
     started = time.time()
     for name in args.buttons:
@@ -529,7 +643,7 @@ def main() -> int:
             seed = list(arm.get_joint_angles())
 
         if args.lift:
-            cmd, rise, best, reasons, tried = plan_over_lift(button, seed)
+            cmd, rise, best, reasons, tried = plan_over_lift(button, seed, L_now)
             if best is None:
                 print(f"    no pose satisfies the boundaries at ANY of {tried} lift "
                       "heights:")
@@ -537,15 +651,20 @@ def main() -> int:
                     print(f"      {n:>2}/24 rolls  {why}")
                 results.append((name, False))
                 continue
-            if abs(cmd - L0) < 1.0:
-                print(f"    lift stays at {L0:.0f} (no torso motion needed)")
+            if abs(cmd - L_now) < 1.0:
+                print(f"    lift stays at {L_now:.0f} (margin "
+                      f"{best[3]:.1f} deg)")
             else:
-                print(f"    lift -> command {cmd:.0f} (raise {rise * 1000:+.0f} mm), "
-                      f"chosen from {tried} heights")
+                print(f"    lift {L_now:.0f} -> {cmd:.0f} "
+                      f"(body {(cmd - L_now) / lift_cfg['command_per_mm']:+.0f} mm, "
+                      f"{rise * 1000:+.0f} mm from where it was localised), "
+                      f"margin {best[3]:.1f} deg, chosen from {tried} heights")
                 if args.go and move_lift(cmd) is None:
                     print("    lift move did not confirm; skipping")
                     results.append((name, False))
                     continue
+                if args.go:
+                    L_now = cmd
             # Both the button and the plane ride the lift: raising by `rise` lowers
             # their base-frame z by `rise` (x, y unchanged).
             button = np.asarray(button, dtype=np.float64) - np.array([0.0, 0.0, rise])

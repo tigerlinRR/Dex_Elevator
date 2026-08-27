@@ -217,6 +217,21 @@ measured z over four cycles), which is what makes **look low, press high** viabl
 camera rides the lift, so past ~175 mm of real rise the bottom button row leaves the
 frame, while the arm wants another 200 mm on top of that.
 
+**The height is chosen per button by `arm.lift.objective`** (2026-08-27). `still` keeps
+the torso where it is whenever the current height already clears `prefer_margin_deg`;
+**`margin` (the default now) moves to the height with the BEST joint margin for that
+button**, so the body visibly tracks the panel row by row. That was asked for as a
+presentation choice — a robot that stands perfectly still while only its arm works
+looks broken — but it is not merely cosmetic: the heights it picks carry the largest
+margins on offer rather than the first sufficient one. Both objectives choose only
+from poses that already passed the joint-limit, wrist, self-collision and
+panel-clearance checks, so this trades optimality and time, never safety. Two buttons
+on the same row share a best height, so `min_move_command` (100 units = 50 mm of body
+travel) makes the second one take the next-best SAFE height instead, purely so there
+is motion to see. Measured: `1 4 2 5` went 51.2 s -> **71.2 s**, still 4/4 lit,
+depth -3.10 mm, lateral 0.36 mm (0.08 mm when the torso did not move — worth watching,
+since every lift move re-compensates the cached coordinates).
+
 **`press_buttons.py --lift` implements that** (contributed 2026-08-26): detect once at
 the current visible height, then per button move the lift, compensate the cached 3D
 coord by the achieved rise, press, and restore the lift at the end. **The height is
@@ -376,6 +391,50 @@ shared box); credentials live in a gitignored `.env`.
 - This map uses none of the AutoXing elevator POI types (`[6, 28]`) — the elevator point
   is type 11 like any other waypoint — so the UI's auto-highlight never fires and the
   operator picks the point by name.
+- **Arrival is gated on the BASE, not on the cloud's task status** (`base_arrived` +
+  `wait_for_arrival`, 2026-08-27). `robot_state` is a level below the task: it carries
+  the base's own `moveState`, `speed`, `hasPersonAhead`, `locQuality` and `battery`,
+  and the base reports it **event-driven** — parked, its timestamp goes 60 s without
+  moving, but the report that follows a change arrives ~2 s old. Measured side by side
+  on one drive: the base said "arrived" at **51 s**, the task-status poll at **75 s**,
+  and the two positions differed by **0.6 mm**, i.e. the base really had stopped.
+  Four conditions, all required, plus two guards:
+  - timestamp after dispatch (not last run's stale report), `moveState` done AND
+    `speed` 0, and within tolerance of the elevator point (filters intermediate
+    route points, where a multi-point task also completes a move);
+  - **departure must be observed first.** Every loop after the first STARTS parked at
+    the elevator point with `moveState` already "succeeded", which satisfies all four
+    at once — without this guard the press fires as the robot is about to drive away;
+  - **position must not drift between the two confirming reports** (>1 cm = still
+    travelling). This is the only way the signal can be early, and it is exactly the
+    failure that put the arm into the panel when the camera was the trigger.
+  The task status stays in the loop as the BACKSTOP — it catches a cancelled task, or
+  one that ended somewhere the fast gate never accepts. `fast_arrival: "observe"`
+  computes the fast signal and logs when it WOULD have fired while still waiting for
+  the cloud: one loop in that mode measures the real saving at no risk, which is how
+  the 24 s above was obtained.
+- **Careful what "the cloud is 20-55 s late" means.** An earlier note said that, from
+  comparing a task's `endTime` to when the runner acted. Wrong decomposition: `endTime`
+  is only **6-8 s** after the base itself reports arrival (57 vs 51; 99 vs 91). The lag
+  is between `endTime` and when a poll can SEE `taskStatus == 4` — 18 s on the measured
+  run. The operationally honest number is the one measured end to end: **the base
+  signal beats the task-status poll by ~24 s.**
+- **The press process is PRE-WARMED during the drive** (`press_prewarm` /
+  `press_release`, `press_buttons.py --wait-go PATH`). ~7.3 s of the press's startup
+  does not depend on where the robot is — 2.8 s loading the TensorRT engine, 2.5 s
+  opening the camera, ~1.5 s ramping the GPU off its 306 MHz idle clock, 0.4 s
+  connecting the arm — so it is paid in parallel with the drive. The child does
+  everything position-independent, prints `PREWARM_READY`, and BLOCKS on a token file
+  that only the runner writes, after arrival is confirmed. **Nothing about the arrival
+  decision moves into the press**; letting the press infer arrival from the camera is
+  what drove the arm into the panel once. Measured: 8.3 s -> **1.6 s** between arrival
+  and the first motion. Every path that abandons an attempt must call `press_kill`,
+  or the child keeps the camera open and the next attempt fails with "no color frame
+  after 40 tries".
+- **The full press transcript goes to `/tmp/dex_press_last.log`** (`press_log`). Only a
+  three-line tail reaches the UI, and when a press failed mid-sequence that tail was
+  the camera's startup banner — which says nothing about why. The per-button lift
+  height, joint margin, clearance and residual are in the transcript.
 
 **Pressing on its own** (`press_buttons.py --auto`) — waits until the panel is both
 visible AND still (5 consecutive frames within 2 mm), then presses ONCE and exits;
@@ -474,6 +533,31 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   172.87 mm from the flange while the plunger tip is at ~154 mm, so with the fingers
   extended the HAND is the front-most part and reaches the panel first. A fist folds
   them behind the plunger. This is a pressing prerequisite, not tidiness.
+  **`press_buttons.py` now does it itself**, as the first thing after connecting and
+  before any motion (2026-08-27) — it used to be done out-of-band by whoever was
+  driving, and an out-of-band prerequisite is one someone eventually forgets. The hand
+  also loses power across an emergency stop, so "it was a fist last time" is not a
+  state that survives. The fist is VERIFIED by reading the joints back, and the test is
+  "nothing is sticking out" (all six <= 100) rather than per-joint target matching: in
+  a fist the index bottoms out against the thumb at ~70, not 0 (measured 67 here, 69/75
+  on the two hands earlier), so an exact test would fail every time. If the hand does
+  not answer or does not close, the press REFUSES to move. `--no-fist` is for a robot
+  with no hand fitted.
+- **The base's port 9090 is the FACE camera, not navigation.** It is a binary push
+  stream (`a5` magic, 1 byte version, 1 byte type, 4-byte LE length, 2-byte sequence),
+  and everything on it is HRI: a one-off map-metadata JSON, MJPEG frames at 1.8 Hz, and
+  a per-frame `hasFace`/`wakeup`/`hasHand` list. **No pose, no odometry** — so it is not
+  a local arrival signal, and it is not rosbridge despite the port number. Port 5555 is
+  also open (almost certainly ADB, the base's Android side); left alone. Recorded so
+  nobody re-derives this: the only local-looking route to the base does not carry what
+  a local arrival signal would need.
+- **An interrupted tool call may already have started the remote process.** A
+  `rsync && ssh ... nohup` that was cancelled mid-flight had ALREADY launched a live
+  run, which then kept driving and pressing while the next command was being composed;
+  worse, the `pkill` sent to stop it returned SSH exit 255 and that was not retried.
+  Before starting anything on this robot, check `pgrep -af "liverun|press_buttons"` AND
+  the cloud task, and confirm the previous one is actually gone — "I cancelled it" is
+  not the same as "it stopped".
 - **A camera that enumerates but never delivers colour is fixed by
   `device.reboot()`, no root and no replug.** The chest 335 got into this state after a
   USB re-enumeration: `lsusb` and `query_devices()` both listed it, and every

@@ -155,6 +155,7 @@ plans, printing every target — always dry-run before letting it move.
 ```bash
 python3 initialization/press_buttons.py 1 4 2 5            # plan only, no motion
 python3 initialization/press_buttons.py 1 4 2 5 --go       # press the sequence
+python3 initialization/press_buttons.py 1 4 2 5 --go --lift  # let the torso track the panel
 python3 initialization/press_buttons.py 1 --go --push=2    # override push depth (mm)
 ```
 
@@ -162,6 +163,16 @@ Each press is `home → standoff (50 mm) → linear approach through contact →
 with the joint-interpolated path checked for panel clearance beforehand. The panel plane and
 the button 3D positions are **measured live** from the current camera frame every run — nothing
 about the panel's position is stored, because the base docks with centimetres of error.
+
+Before anything moves, the script closes the LinkerHand into a fist and **verifies it by
+reading the joints back** — with the fingers extended the hand, not the plunger, is the
+front-most part of the end-effector. If the hand does not answer or does not close, the press
+refuses to move (`--no-fist` is for a robot with no hand fitted).
+
+With `--lift`, the torso goes to each button's **best-margin height** rather than staying put
+(`arm.lift.objective: margin`). The body visibly tracks the panel row by row, and the heights
+it picks carry the largest joint margins available. Both objectives choose only from poses that
+already passed the joint-limit, wrist, self-collision and clearance checks.
 
 ## Usage — button detector (YOLO)
 
@@ -229,6 +240,30 @@ Measured, not assumed:
 | push depth | 3 mm (1 and 2 mm failed to light the button; 3 mm lit it repeatably) |
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
 | plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
+
+**Driving and pressing, end to end (2026-08-27).** `elevator_runner/` drives the robot to the
+elevator point and presses. Two things that used to make it look broken are fixed, both
+measured on real drives:
+
+| | before | after |
+|---|---|---|
+| arrival declared by | the cloud's task status | the base's own `moveState` + `speed` + position |
+| ...on one side-by-side drive | 75 s | **51 s** |
+| startup after arrival | 8.3 s | **1.6 s** — the press is pre-warmed during the drive |
+| torso while pressing | still | **moves to each button's best-margin height** |
+| `1 4 2 5` after driving | 51.2 s, 4/4 lit | **71.2 s, 4/4 lit** |
+
+The base reports its state **event-driven**: parked, its timestamp goes 60 s without moving,
+but the report following a change arrives ~2 s old. The two positions taken 24 s apart differed
+by 0.6 mm, so the base really had stopped before the cloud admitted it. Arrival still requires
+four conditions *and* two guards — departure must be observed first (every loop after the first
+starts parked at the elevator with a stale "succeeded"), and the position must not drift between
+confirmations. The cloud task status remains the backstop.
+
+The pre-warm pays the press's ~7.3 s of position-independent startup (TensorRT engine, camera,
+GPU clock ramp, arm connect) in parallel with the drive; the child then BLOCKS until the runner
+says go. **The arrival decision does not move into the press** — inferring arrival from the
+camera is what drove the arm into the panel once.
 
 **Plunger TCP re-measured after a collision (2026-08-27).** The configured offset was 5.57 mm
 out — 5.14 mm of it along the approach axis, so a commanded 3 mm push was really pressing about

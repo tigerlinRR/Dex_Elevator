@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -71,6 +72,25 @@ def load_config() -> dict:
             "cd ~/Dex_Elevator && PYTHONPATH=. /usr/bin/python3 "
             "initialization/press_buttons.py {floors} --go --lift",
         ),
+        # PRE-WARM. The press process spends ~7.3 s on startup that does not depend on
+        # where the robot is: 2.8 s loading the TensorRT engine, 2.5 s opening the
+        # camera, ~1.5 s ramping the GPU off its 306 MHz idle clock, 0.4 s connecting
+        # to the arm. Started at DISPATCH instead of on arrival, all of it overlaps the
+        # drive. It does NOT move the arrival decision into the press process — the
+        # child blocks on a token file that only this loop writes, and only after the
+        # cloud has confirmed the task finished AND the position gate has passed.
+        # (Letting the press infer arrival from the camera is what drove the arm into
+        # the panel once already; that mistake is not being repeated here.)
+        # Set PREWARM=0 to fall back to the serial cold start.
+        "prewarm": os.environ.get("PREWARM", "1") not in ("0", "false", "no"),
+        "prewarm_token": os.environ.get("PREWARM_TOKEN", "/tmp/dex_press_go"),
+        # Where each press's FULL output is kept. Only a three-line tail reaches the
+        # UI, and when a press failed mid-sequence that tail was the camera's startup
+        # banner, which says nothing about why. The press prints the chosen lift
+        # height, joint margin, clearance and residual for every button; that is the
+        # record of what the robot did, and throwing it away is how a failure becomes
+        # undiagnosable after the fact.
+        "press_log": os.environ.get("PRESS_LOG", "/tmp/dex_press_last.log"),
     }
     f = HERE / "config.json"
     if f.exists():
@@ -228,6 +248,48 @@ def make_task_point(poi, area_id, pause_time=0):
 TASK_STATUS_COMPLETED = 4
 
 
+# Values robot_state.moveState takes when the base's own move controller considers
+# the move over. Anything else (moving / running / idle / failed) is not arrival.
+MOVE_DONE = {"succeeded", "success", "finished", "completed", "idle_succeeded"}
+
+
+def base_arrived(st, dispatched_ms, elevator, tol_cm):
+    """Has the BASE itself reported that it finished driving, at the elevator point?
+
+    Why this exists: the navigation TASK status is 20-55 s behind reality (measured
+    against three loops' endTime: 49 s, 20 s, 55 s), and that latency lands entirely
+    between the robot parking and the arm pressing. robot_state is a level lower — it
+    is the base's own move controller — and it is event-driven: parked, its timestamp
+    goes 60 s without moving, but the report that FOLLOWS a change arrives ~2 s old.
+
+    Four conditions, all required, because each covers a different way of being wrong:
+      * timestamp after dispatch -> not a stale report from the previous run, which is
+        the failure that matters most (moveState reads "succeeded" the whole time the
+        robot sits parked from last time).
+      * moveState done + speed 0  -> the base says it stopped, rather than us guessing
+        from the outside. Inferring arrival from the camera's "panel still" is what put
+        the arm into the panel once; this is the base's own word, not a proxy.
+      * within tolerance of the elevator point -> filters intermediate route points,
+        where a multi-point task also reports a completed move.
+
+    Returns (arrived, err_cm, why) — `why` names the condition that is not met yet.
+    """
+    ts = st.get("timestamp")
+    if not ts or ts <= dispatched_ms:
+        return False, None, "stale report"
+    if str(st.get("moveState", "")).lower() not in MOVE_DONE:
+        return False, None, f"moveState={st.get('moveState')}"
+    sp = st.get("speed")
+    if sp is not None and abs(float(sp)) > 0.02:
+        return False, None, f"speed={sp}"
+    err = dist_cm(st.get("x"), st.get("y"), elevator["x"], elevator["y"])
+    if err is None:
+        return False, None, "no position"
+    if err > tol_cm:
+        return False, err, f"{err:.1f}cm from the point"
+    return True, err, "arrived"
+
+
 def task_finished(st):
     if st.get("isFinish"):
         return True
@@ -285,6 +347,122 @@ class Run:
 RUN = Run()
 
 
+def wait_for_arrival(robot, task_id, target, tol_cm, poll_timeout,
+                     fast_arrival, observe, tag):
+    """Wait until the robot has arrived at `target`. Returns (finished, cancelled,
+    fast, would_fire).
+
+    ONE implementation, shared by the route and by the small repositioning moves
+    between button presses — an arrival gate with two copies is an arrival gate with
+    two behaviours.
+
+    Two independent signals:
+      * FAST  — the base's own moveState / speed / position. Measured side by side on
+        one drive it beat the cloud task-status poll by 24 s (51 s vs 75 s), and the
+        position it reported differed from the one taken 24 s later by 0.6 mm, i.e.
+        the base really had stopped.
+      * SLOW  — the cloud task status, kept as the backstop: it is what catches a task
+        that was cancelled, or that ended somewhere the fast gate never accepts.
+    """
+    t0 = time.time()
+    dispatched_ms = int(t0 * 1000)
+    finished = cancelled = False
+    fast = False
+    confirms = 0                 # consecutive base reports that say "arrived"
+    last_why = ""
+    # The robot may ALREADY be parked at the elevator point when the route is
+    # dispatched (it is, every loop after the first). Its stale "succeeded"
+    # then satisfies every arrival condition at once, and we would press while
+    # it is about to drive away. So arrival is only accepted after departure
+    # has actually been observed.
+    departed = False
+    would_fire = None            # observe mode: when the fast gate first agreed
+    prev_xy = None               # position at the previous agreeing report
+    last_task_poll = 0.0
+    while time.time() - t0 < poll_timeout:
+        if RUN.stop_flag:
+            AX.cancel_task(task_id); RUN.log(f"{tag}: cancelled on stop"); break
+        time.sleep(1)
+
+        # FAST PATH: the base's own move controller, ~2 s behind reality.
+        if fast_arrival:
+            try:
+                rs = AX.robot_state(robot)
+            except Exception:  # noqa: BLE001
+                rs = {}
+            ok_now, ferr, why = base_arrived(rs, dispatched_ms, target, tol_cm)
+            if not departed:
+                moving = (str(rs.get("moveState", "")).lower() not in MOVE_DONE
+                          or abs(float(rs.get("speed") or 0)) > 0.02)
+                away = False
+                d = dist_cm(rs.get("x"), rs.get("y"),
+                            target["x"], target["y"])
+                if d is not None and d > max(tol_cm * 3, 50):
+                    away = True
+                if moving or away:
+                    departed = True
+                    RUN.log(f"{tag}: base has left the point "
+                            f"({'moving' if moving else f'{d:.0f}cm away'})")
+                ok_now = False
+                why = "waiting for departure"
+            if why != last_why:
+                RUN.set(phase=f"navigating ({why})"); last_why = why
+            # Two consecutive agreeing reports, AND the position must not have
+            # drifted between them. Everything else here tests "the base says
+            # it stopped"; this tests whether it actually did. A base still
+            # creeping to its goal is the one way this signal can be early,
+            # and it is exactly the failure that put the arm into the panel
+            # when the camera was the trigger. Measured on the observe run:
+            # 0.6 mm of drift over the 24 s between this signal and the
+            # cloud's, so a 1 cm gate is loose against real settling and tight
+            # against travel.
+            xy = (rs.get("x"), rs.get("y"))
+            if ok_now and confirms and prev_xy is not None:
+                drift = dist_cm(xy[0], xy[1], prev_xy[0], prev_xy[1])
+                if drift is not None and drift > 1.0:
+                    RUN.log(f"{tag}: base still drifting ({drift:.1f}cm between "
+                            "reports) — not arrival yet")
+                    ok_now = False
+            confirms = confirms + 1 if ok_now else 0
+            prev_xy = xy if ok_now else None
+            if confirms >= 2:
+                elapsed = time.time() - t0
+                if observe:
+                    if would_fire is None:
+                        would_fire = elapsed
+                        RUN.log(f"{tag}: [observe] base reported arrival "
+                                f"({ferr:.1f}cm) at {elapsed:.0f}s — still "
+                                "waiting for the cloud, for comparison")
+                else:
+                    fast = finished = True
+                    RUN.log(f"{tag}: base reports arrival ({ferr:.1f}cm) after "
+                            f"{elapsed:.0f}s — pressing without waiting for "
+                            "the cloud's task status")
+                    break
+
+        # BACKSTOP: the task status. Slower, but it is what catches a task
+        # that was cancelled or that ended somewhere the fast path never
+        # accepts, so it stays in the loop rather than being replaced.
+        if time.time() - last_task_poll < 3:
+            continue
+        last_task_poll = time.time()
+        try:
+            st = AX.task_status(task_id).get("data") or {}
+        except Exception as e:  # noqa: BLE001
+            RUN.log(f"{tag}: status poll error: {e}"); continue
+        if task_finished(st):
+            slow = time.time() - t0
+            RUN.log(f"{tag}: cloud task status says finished ({slow:.0f}s)")
+            if would_fire is not None:
+                RUN.log(f"{tag}: [observe] the base signal was {slow - would_fire:.0f}s "
+                        f"earlier ({would_fire:.0f}s vs {slow:.0f}s)")
+            finished = True; break
+        if task_cancelled(st):
+            cancelled = True; break
+
+    return finished, cancelled, fast, would_fire
+
+
 def run_loop(params):
     """The orchestration loop. See the retry policy inline."""
     RUN.active = True
@@ -306,10 +484,23 @@ def run_loop(params):
     yaw_ref = params.get("yaw_ref_deg")
     yaw_ref = None if yaw_ref in (None, "") else float(yaw_ref)
     max_retries = int(params["max_retries"])
+    # Corrective drives are separate from max_retries: a retry re-runs the whole route,
+    # a corrective drive just closes the remaining distance to the elevator point.
+    corrective = max(0, int(params.get("corrective_drives", 2)))
     backoff = float(params["backoff_sec"])
     run_mode = int(params.get("run_mode", 2))
     dry = bool(params.get("dry_run", True))
     poll_timeout = float(params.get("poll_timeout_sec", 240))
+    # How arrival is decided:
+    #   True      -> the base's own moveState (fast: the report after a change is ~2 s
+    #                old, where the cloud's task status ran 20-55 s behind).
+    #   "observe" -> compute the fast signal and LOG when it would have fired, but
+    #                still wait for the cloud. One loop in this mode measures the real
+    #                saving against the real cloud lag, on the same drive, at no risk.
+    #   False     -> cloud task status only (the original behaviour).
+    fast_arrival = params.get("fast_arrival", True)
+    observe = str(fast_arrival).lower() == "observe"
+    fast_arrival = observe or bool(fast_arrival)
 
     RUN.set(loops_total=loops, loop=0, phase="starting", dry_run=dry,
             successes=0, failures=0, last_error_cm=None, last_press=None)
@@ -356,6 +547,10 @@ def run_loop(params):
             RUN.set(phase="navigating", task_id=task_id)
             RUN.log(f"{tag}: dispatched task {task_id}")
 
+            # Pay the press process's position-independent startup NOW, in parallel
+            # with the drive. It blocks on a token file until this loop says go.
+            warm = press_prewarm(floors)
+
             # --- wait for the drive to FINISH, then press ---
             # The trigger has to be "the base has finished driving", and the task status
             # is the only source for that. Substituting the camera's "panel visible and
@@ -365,28 +560,19 @@ def run_loop(params):
             # the panel had been. Stillness over a short window is not arrival. The cloud
             # costs 20-55 s of latency and that is the price of a trustworthy signal; a
             # real fix needs a local arrival signal from the base, not a proxy for one.
-            t0 = time.time()
-            finished = cancelled = False
-            while time.time() - t0 < poll_timeout:
-                if RUN.stop_flag:
-                    AX.cancel_task(task_id); RUN.log(f"{tag}: cancelled on stop"); break
-                time.sleep(3)
-                try:
-                    st = AX.task_status(task_id).get("data") or {}
-                except Exception as e:  # noqa: BLE001
-                    RUN.log(f"{tag}: status poll error: {e}"); continue
-                if task_finished(st):
-                    finished = True; break
-                if task_cancelled(st):
-                    cancelled = True; break
+            finished, cancelled, fast, _ = wait_for_arrival(
+                robot, task_id, elevator, tol_cm, poll_timeout,
+                fast_arrival, observe, tag)
             if RUN.stop_flag:
+                press_kill(warm)
                 break
 
             if not finished:
                 why = "cancelled/obstacle" if cancelled else "timeout"
                 RUN.log(f"{tag}: task did not finish ({why}). Backoff {backoff}s "
                         "then retry.")
-                RUN.set(phase=f"retry({why})"); time.sleep(backoff); continue
+                RUN.set(phase=f"retry({why})"); press_kill(warm)
+                time.sleep(backoff); continue
 
             # --- arrived: gate on the measured position error ---
             RUN.set(phase="checking-arrival")
@@ -410,6 +596,7 @@ def run_loop(params):
 
             if err is None:
                 RUN.log(f"{tag}: no live position from robot — cannot verify; retry.")
+                press_kill(warm)
                 time.sleep(backoff); continue
             pos_bad = err > tol_cm
             yaw_bad = yaw_tol is not None and yaw_err is not None and yaw_err > yaw_tol
@@ -424,13 +611,80 @@ def run_loop(params):
                     why.append(f"position {err:.1f}cm > {tol_cm}cm")
                 if yaw_bad:
                     why.append(f"yaw {yaw_err:.1f}deg > {yaw_tol}deg")
-                RUN.log(f"{tag}: NOT PRESSING — {'; '.join(why)}")
-                RUN.set(phase="out-of-reach"); time.sleep(backoff); continue
+                RUN.log(f"{tag}: not close enough — {'; '.join(why)}")
+                RUN.set(phase="out-of-reach")
+
+                # Drive the rest of the way rather than stopping dead. An avoidance
+                # manoeuvre can leave the robot short of the goal with the task still
+                # reporting "completed" (measured: 73 cm short after someone stepped in
+                # front of it), and simply re-dispatching closed the gap first time.
+                corrected = False
+                for c in range(1, corrective + 1):
+                    RUN.log(f"{tag}: corrective drive {c}/{corrective} to "
+                            f"'{elevator['name']}' ({err:.1f}cm to close)")
+                    try:
+                        r2 = AX.create_task(
+                            robot, [make_task_point(elevator, area_id)],
+                            f"{name} correct {c}", run_mode)
+                    except Exception as e:  # noqa: BLE001
+                        RUN.log(f"{tag}: corrective create_task failed: {e}")
+                        break
+                    tid2 = ((r2.get("data") or {}).get("taskId") or r2.get("taskId")
+                            or (r2.get("data") or {}).get("id"))
+                    if not tid2:
+                        RUN.log(f"{tag}: corrective task got no id")
+                        break
+                    t2 = time.time()
+                    while time.time() - t2 < poll_timeout:
+                        if RUN.stop_flag:
+                            AX.cancel_task(tid2); break
+                        time.sleep(3)
+                        try:
+                            s2 = AX.task_status(tid2).get("data") or {}
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if task_finished(s2) or task_cancelled(s2):
+                            break
+                    if RUN.stop_flag:
+                        break
+                    stt = AX.robot_state(robot)
+                    err = dist_cm(stt.get("x"), stt.get("y"),
+                                  elevator["x"], elevator["y"])
+                    RUN.set(last_error_cm=None if err is None else round(err, 1))
+                    RUN.log(f"{tag}: after corrective {c}: position error={err}cm")
+                    if err is not None and err <= tol_cm:
+                        corrected = True
+                        break
+                if RUN.stop_flag:
+                    press_kill(warm)
+                    break
+                if not corrected:
+                    RUN.log(f"{tag}: still not within {tol_cm}cm after {corrective} "
+                            "corrective drive(s) — surfacing rather than shuffling")
+                    press_kill(warm)
+                    time.sleep(backoff); continue
+                RUN.log(f"{tag}: now within reach ({err:.1f}cm)")
 
             # --- within reach: press ---
             RUN.set(phase="pressing")
-            ok, out = press_on_agx(floors)
+            ok, out = press_release(warm) if warm is not None else press_on_agx(floors)
             RUN.set(last_press=out)
+            if fast:
+                # We pressed before the cloud admitted the task was over, so the task
+                # may still read "running". Let it settle before the next dispatch
+                # rather than stacking tasks on top of each other. This costs nothing
+                # in the normal case: the press already takes as long as the cloud's
+                # worst measured lag.
+                t_drain = time.time()
+                while time.time() - t_drain < 60:
+                    try:
+                        stt = AX.task_status(task_id).get("data") or {}
+                    except Exception:  # noqa: BLE001
+                        break
+                    if task_finished(stt) or task_cancelled(stt):
+                        break
+                    time.sleep(2)
+                RUN.log(f"{tag}: cloud caught up {time.time() - t_drain:.0f}s after the press")
             if ok:
                 RUN.log(f"{tag}: PRESS OK — {out}")
                 pressed = True
@@ -450,8 +704,101 @@ def run_loop(params):
     RUN.active = False
 
 
+def _press_argv(cmd):
+    """Wrap a press command for local (on-AGX) or remote (SSH) execution."""
+    if CFG["agx_ssh"] in ("", "local", "localhost"):
+        return ["bash", "-lc", cmd]
+    return ["ssh", CFG["agx_ssh"], cmd]
+
+
+def press_prewarm(floors):
+    """Start the press process in pre-warm mode; return it once it reports READY.
+
+    Returns None if pre-warm is disabled or the child failed to come up, in which
+    case the caller falls back to the ordinary serial press.
+
+    The child holds the camera and the arm connection open while it waits, so EVERY
+    path that abandons an attempt has to call press_kill — otherwise the next
+    attempt cannot open the camera and fails with "no color frame after 40 tries".
+    """
+    if not CFG.get("prewarm"):
+        return None
+    token = CFG["prewarm_token"]
+    cmd = (CFG["press_cmd"].format(floors=floors)
+           + f" --wait-go {shlex.quote(token)} --wait-go-timeout 900")
+    try:
+        proc = subprocess.Popen(_press_argv(cmd), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except Exception as e:  # noqa: BLE001
+        RUN.log(f"prewarm: could not start ({e}) — serial press instead")
+        return None
+    proc._pre = []
+    # Block until PREWARM_READY so a startup failure (camera busy, engine missing)
+    # surfaces here, during the drive, instead of as a mystery stall after arrival.
+    t0 = time.time()
+    while time.time() - t0 < 90:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        proc._pre.append(line.rstrip())
+        if "PREWARM_READY" in line:
+            RUN.log(f"prewarm: ready in {time.time() - t0:.1f}s — engine, camera and "
+                    "GPU warm, waiting for the go signal")
+            return proc
+    tail = " | ".join(proc._pre[-3:])
+    RUN.log(f"prewarm: did not come up ({tail or 'no output'}) — serial press instead")
+    press_kill(proc)
+    return None
+
+
+def press_kill(proc):
+    """Stop a pre-warm child so it releases the camera and the arm connection."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def press_release(proc):
+    """Write the go token, then wait for the pre-warmed press. Same contract as
+    press_on_agx: (ok, output_tail)."""
+    token = CFG["prewarm_token"]
+    try:
+        subprocess.run(_press_argv(f"touch {shlex.quote(token)}"), timeout=20, check=True)
+    except Exception as e:  # noqa: BLE001
+        press_kill(proc)
+        return False, f"could not write the go token: {e}"
+    lines = list(getattr(proc, "_pre", []))
+    try:
+        for line in proc.stdout:
+            lines.append(line.rstrip())
+        proc.wait(timeout=420)
+    except Exception as e:  # noqa: BLE001
+        press_kill(proc)
+        return False, f"press did not finish: {e}"
+    return _press_result(lines, proc.returncode)
+
+
+def _press_result(lines, returncode):
+    """Keep the whole press transcript on disk; return the short tail for the UI."""
+    body = "\n".join(lines)
+    try:
+        Path(CFG["press_log"]).write_text(body + f"\n(exit {returncode})\n")
+    except Exception:  # noqa: BLE001
+        pass
+    tail = " | ".join([ln for ln in lines if ln.strip()][-3:])
+    ok = returncode == 0 and "pressed" in body.lower()
+    return ok, tail or f"(exit {returncode})"
+
+
 def press_on_agx(floors):
-    """Run the button press. Returns (ok, output_tail).
+    """Run the button press with NO pre-warm (fallback). Returns (ok, output_tail).
 
     Two modes, chosen by AGX_SSH:
       * "local" / "" / "localhost" -> the tool is RUNNING ON THE AGX; run
@@ -472,10 +819,8 @@ def press_on_agx(floors):
         return False, "press timed out (420s)"
     except Exception as e:  # noqa: BLE001
         return False, f"ssh error: {e}"
-    tail = (r.stdout or "").strip().splitlines()[-3:]
-    out = " | ".join(tail) if tail else (r.stderr or "").strip()[-200:]
-    ok = r.returncode == 0 and "pressed" in (r.stdout or "").lower()
-    return ok, out or f"(exit {r.returncode})"
+    return _press_result(((r.stdout or "") + (r.stderr or "")).splitlines(),
+                         r.returncode)
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +886,8 @@ def api_run():
         "floors": (body.get("floors") or "").strip(),
         "loops": max(1, int(body.get("loops", 1))),
         "tolerance_cm": float(body.get("tolerance_cm", 8)),
+        # True | False | "observe" — see run_loop.
+        "fast_arrival": body.get("fast_arrival", True),
         "yaw_tol_deg": float(body.get("yaw_tol_deg", 12)),
         "max_retries": max(0, int(body.get("max_retries", 3))),
         "backoff_sec": float(body.get("backoff_sec", 20)),

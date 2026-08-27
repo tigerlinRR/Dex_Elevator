@@ -116,6 +116,22 @@ arm:
     # while still using the full travel when the arm genuinely cannot reach otherwise.
     # 20 deg is well clear of the 1 deg floor that `2` used to press on.
     prefer_margin_deg: 20.0
+    # How the height is chosen per button:
+    #   margin -> the height with the BEST joint margin for that button. The torso
+    #             visibly tracks the panel row by row, which is what an operator
+    #             watching the robot expects, and the margins it picks are the
+    #             largest on offer rather than merely sufficient.
+    #   still  -> keep the torso where it is whenever the current height already
+    #             clears prefer_margin_deg. Fewer seconds, no motion to watch.
+    # Both choose only from poses that already passed the joint-limit, wrist,
+    # self-collision and panel-clearance checks, so this trades optimality and time,
+    # never safety.
+    objective: margin
+    # With `margin`, if the best height IS where the torso already sits, take the
+    # next-best one at least this far away so there is visible motion between two
+    # buttons on the same row (`1` and `2` share a row, and so share a best height).
+    # 100 command units = 50 mm of real body travel. Set to 0 to disable.
+    min_move_command: 100
     # The camera rides the lift too, so raising it drops the panel in the image: past
     # about 175 mm of real rise the bottom row leaves the frame. Hence LOOK LOW,
     # PRESS HIGH — localise at a height where the panel is visible, then raise and

@@ -3,6 +3,122 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
+## ▶ THE WAIT AT THE ELEVATOR IS GONE, AND THE TORSO NOW MOVES (2026-08-27)
+
+Two complaints, both fixed and both measured. The robot used to park at the elevator
+and then stand there for the better part of a minute before the arm moved; and while
+pressing, only the arm moved, which reads as a fault to anyone watching.
+
+| | before | after |
+|---|---|---|
+| arrival declared | cloud task-status poll | the base's own `moveState` |
+| ...measured on one drive | 75 s | **51 s** |
+| startup after arrival | 8.3 s | **1.6 s** (pre-warmed during the drive) |
+| torso during a press | still | **moves to each button's best-margin height** |
+| `1 4 2 5` | 51.2 s, 4/4 lit | **71.2 s, 4/4 lit** |
+
+Net: ~31 s less standing about, and the extra 20 s is deliberate motion.
+
+### Arrival now comes from the base, not the cloud
+
+`robot_state` sits a level below the navigation task and carries the base's own
+`moveState`, `speed`, `hasPersonAhead`, `locQuality` and `battery`. The base reports it
+**event-driven**: parked, its timestamp went 60 s without moving; the report that
+followed a change was **1.9 s** old. Measured side by side on one drive — the base said
+"arrived" at **51 s**, the task poll at **75 s**, and the two positions differed by
+**0.6 mm**, so the base really had stopped 24 s before the cloud admitted it.
+
+Four conditions, all required, plus two guards, each covering a different way of being
+wrong:
+
+| condition | what it stops |
+|---|---|
+| timestamp after dispatch | last run's stale report |
+| `moveState` done **and** `speed` 0 | guessing from outside; this is the base's own word |
+| within tolerance of the elevator point | a multi-point task also completes moves at intermediate points |
+| **departure observed first** | every loop after the first STARTS parked at the elevator with `moveState` already "succeeded" — all four pass at once, and the press would fire as the robot is about to drive away |
+| **no position drift between confirmations** | the base still creeping to its goal — the one way this signal can be early, and exactly the failure that put the arm into the panel when the camera was the trigger |
+
+The cloud task status stays as the BACKSTOP (it catches a cancelled task, or one that
+ends where the fast gate never accepts). `fast_arrival: "observe"` computes the fast
+signal and logs when it WOULD have fired while still waiting for the cloud — one loop
+in that mode measured the 24 s at no risk, which is how this was validated before
+being switched on.
+
+**Correcting an earlier claim of mine.** I wrote that the cloud was "20-55 s late",
+from comparing a task's `endTime` to when the runner acted. Wrong decomposition:
+`endTime` is only **6-8 s** behind the base's own arrival (57 vs 51; 99 vs 91). The lag
+is between `endTime` and when a poll can SEE `taskStatus == 4` — 18 s on the measured
+run. The honest number is the end-to-end one: **~24 s.**
+
+Ruled out along the way: the base's port **9090 is the face camera** — a binary push
+stream carrying MJPEG and `hasFace`/`hasHand` JSON, no pose, and not rosbridge despite
+the port. There is no local navigation interface we can reach.
+
+### The press is pre-warmed during the drive
+
+~7.3 s of the press's startup does not depend on where the robot is:
+
+| | |
+|---|---|
+| load the 44 MB TensorRT engine | 2.77 s |
+| open the camera | 2.54 s |
+| ramp the GPU off its 306 MHz idle clock | ~1.5 s |
+| connect the arm | 0.4 s |
+
+`press_buttons.py --wait-go PATH` does all of it, prints `PREWARM_READY`, and BLOCKS on
+a token file the runner writes only after arrival is confirmed. **The arrival decision
+does not move into the press** — inferring arrival from the camera is what drove the
+arm into the panel once. A/B, twice each: **8.3 / 8.4 s cold vs 1.59 / 1.70 s warm.**
+
+### The hand now closes itself, and refuses to move if it cannot
+
+`press_buttons.py` never touched the hand — the fist was done out-of-band by whoever
+was driving, so a run that skipped it drove the arm at the panel with the fingers
+extended (the fingertips are 172.87 mm from the flange against the plunger's ~154 mm).
+It is now the first thing after connecting, before any motion, and it is VERIFIED by
+reading the joints back. The test is "nothing is sticking out" (all six <= 100), not
+per-joint matching: in a fist the index bottoms out against the thumb at ~70, measured
+67 on this run. No answer or no closure -> the press refuses to move. `--no-fist` is
+for a robot with no hand fitted.
+
+An out-of-band prerequisite is one someone eventually forgets — and the hand loses
+power across an emergency stop, so "it was a fist last time" is not a state that
+survives.
+
+### The torso tracks the panel (`arm.lift.objective: margin`)
+
+The lift used to keep still whenever the current height already cleared
+`prefer_margin_deg`, so at a comfortable dock it never moved. It now goes to the height
+with the BEST joint margin for each button. Asked for as presentation — a robot that
+stands perfectly still while only its arm works looks broken — but the heights it picks
+carry the largest margins available rather than the first sufficient one. Both
+objectives choose only from poses that already passed the joint-limit, wrist,
+self-collision and panel-clearance checks, so this trades optimality and time, never
+safety. Two buttons on the same row share a best height, so `min_move_command` (100
+units = 50 mm of body travel) sends the second to the next-best SAFE height purely so
+there is motion to see.
+
+Result: 4/4 lit, depth -3.10 mm, lateral 0.36 mm, 71.2 s. Worth watching: lateral was
+0.08 mm on the run where the torso did not move, so every lift move costs a little
+accuracy through the coordinate re-compensation.
+
+### Also
+- The **full press transcript** now goes to `/tmp/dex_press_last.log`. Only a
+  three-line tail reaches the UI, and when a press failed mid-sequence that tail was
+  the camera's startup banner — the failure was undiagnosable afterwards.
+- **Corrective drives** merged from the robot: up to N single-point tasks to close the
+  remaining distance when the arrival gate fails, instead of stopping dead. An
+  avoidance manoeuvre left the robot 73 cm short with the task still reporting
+  "completed"; re-dispatching closed it first time.
+- `wait_for_arrival` is ONE implementation, shared by every wait. An arrival gate with
+  two copies is an arrival gate with two behaviours.
+
+### Not done
+- The per-button lift height table — the run that would have produced it predates the
+  transcript logging, so the heights `1 4 2 5` actually selected are not recorded yet.
+- Second independent cross-check of the re-measured plunger TCP (still one touch).
+
 ## ▶ PRESSING WORKS (2026-08-20) — 4 buttons in a row, all lit
 The robot now presses real elevator buttons autonomously. From a fixed home pose it locates the
 panel and the buttons from the chest camera, then presses a requested sequence:
