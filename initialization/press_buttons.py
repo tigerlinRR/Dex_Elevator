@@ -388,6 +388,56 @@ def main() -> int:
         return pts, (org, nrm)
 
 
+    def path_obstructed(org_now, nrm_now, tag=""):
+        """Is anything between the robot and the panel? None if clear, else a reason.
+
+        THE CHEST CAMERA IS THE ONLY SENSOR THAT LOOKS WHERE THE ARM GOES. The base's
+        own obstacle sensors face its direction of travel, which on this robot is
+        **180 degrees away** from the panel — so `hasObstruction` structurally cannot
+        see the arm's workspace, and it is False anyway whenever the base is parked
+        (verified: an operator blocked the robot for 70 s and not one of the 35 fields
+        in `robot_state` moved). There is no other source.
+
+        The test is geometric, not learned: deproject the depth image into the base
+        frame and ask whether anything sits IN FRONT of the fitted panel plane, on the
+        robot's side. With the space empty that number is essentially zero — measured
+        over 56,813 sampled pixels, the 99.9th percentile is +4 mm and the maximum
+        +21 mm (the buttons' own protrusion), with **0.000%** past 30 mm, while the
+        wall sits 127 mm BEHIND the plane. A person or a chair in the gap reads
+        hundreds of mm. So the threshold has enormous margin either way.
+
+        Called with the arm at HOME, where it is deliberately outside the camera's
+        view, so the robot's own limbs are not what gets detected.
+
+        LIMITS, stated rather than papered over: it sees only the camera's field of
+        view, and it is a check BEFORE the motion — the arm is out for seconds
+        afterwards and nothing here watches that window.
+        """
+        gd = cfg["elevator"].get("press", {}).get("obstacle", {})
+        min_mm = float(gd.get("min_mm", 40.0))
+        min_frac = float(gd.get("min_frac", 0.002))
+        try:
+            fr = cam.capture()
+        except Exception as e:  # noqa: BLE001
+            return f"could not capture to check the path ({e})"
+        d = fr.depth[::4, ::4]
+        K = fr.intrinsics
+        ys, xs = np.mgrid[0:fr.depth.shape[0]:4, 0:fr.depth.shape[1]:4]
+        m = (d > 0.15) & (d < 4.0)
+        if m.sum() < 1000:
+            return "depth image is mostly invalid — cannot verify the path is clear"
+        z = d[m].astype(np.float64)
+        x = (xs[m] - K.cx) / K.fx * z
+        y = (ys[m] - K.cy) / K.fy * z
+        pts = np.stack([x, y, z], 1) @ base_T_cam[:3, :3].T + base_T_cam[:3, 3]
+        front = (pts - org_now) @ nrm_now * 1000.0
+        frac = float((front > min_mm).mean())
+        if frac > min_frac:
+            return (f"{100 * frac:.1f}% of the view is more than {min_mm:.0f} mm in "
+                    f"front of the panel (max {front.max():.0f} mm) — something is "
+                    "between the robot and the panel")
+        return None
+
     def centroid(pts):
         return np.mean(np.array(list(pts.values()), dtype=np.float64), axis=0)
 
@@ -687,6 +737,15 @@ def main() -> int:
         if not args.go:
             results.append((name, None))
             continue
+
+        # Last thing before the arm moves. The arm is at home here, i.e. outside the
+        # camera's view, so what this sees is the world and not the robot.
+        blocked = path_obstructed(origin_now, normal)
+        if blocked is not None:
+            print(f"    REFUSING to move: {blocked}")
+            results.append((name, False))
+            continue
+
         if not arm.move_joints_sync(goal):
             print("    failed to reach standoff")
             results.append((name, False))

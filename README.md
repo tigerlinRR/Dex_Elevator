@@ -293,6 +293,18 @@ The base's situation is now logged whenever it changes during a drive, which imm
 caught it declaring a task "succeeded" while still **95 cm** short — closed by a
 corrective drive in 25 s.
 
+*The arm refuses to move into anything (2026-08-28).* Before every button's motion, a
+fresh depth frame is checked for anything sitting in front of the fitted panel plane on
+the robot's side. **The chest camera is the only sensor that looks where the arm goes**:
+the base's obstacle sensors face its direction of travel, 180° away from the panel, and
+parked, the cloud API reports nothing about the surroundings at all — blocking the robot
+for 70 s moved none of `robot_state`'s 35 scalar fields. The separation is wide: an empty
+scene has **0.000%** of pixels past 30 mm (99.9th percentile +4 mm, max +21 mm — the
+buttons themselves), the wall behind sits at −127 mm, and a hand in the gap reads
+**+197 mm over 20.8% of the view**. Verified on hardware: button `1` pressed normally, a
+hand went in, button `4` was refused with IK, clearance and self-collision all passing.
+It sees only the camera's field of view, and it checks *before* the motion — not during.
+
 *Obstacle handling verified.* Deliberately blocked with people and chairs, the base stops,
 waits, re-routes and still reaches the point: a block 17 cm from the goal held it for 63 s,
 after which it completed the route and arrived at **0.4 cm** (4/4 lit). A blocked path

@@ -3,6 +3,74 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
+## ▶ THE ARM NOW REFUSES TO MOVE INTO ANYTHING (2026-08-28)
+
+Asked for after the obstacle tests: the arm must not hit anything. The first attempt at
+that was built on the wrong sensor and would never have worked, which is the part worth
+recording.
+
+| | |
+|---|---|
+| what protects the arm | a depth check from the chest camera, before every button |
+| verified | hand in the gap -> button `4` REFUSED, arm did not move |
+| empty-scene baseline | 0.000% of pixels past 30 mm in front of the panel plane |
+| a hand in the gap | 197 mm, 20.8% of the view |
+| threshold | 40 mm — in the gap between those, not on an edge |
+
+### The base cannot see the arm's workspace, and never could
+
+**The arm and chest camera face 180 degrees away from the base's front.** The base
+drives with its own front — green light, obstacle sensors, face camera — pointing
+directly AWAY from the panel the arm reaches for. So `hasObstruction` watches the
+opposite hemisphere.
+
+It is worse than that: parked, the cloud API reports nothing about the surroundings at
+all. Blocking the robot for 70 s moved **none of `robot_state`'s 35 scalar fields** —
+`hasObstruction`, `hasPersonAhead` and both bumpers stayed False throughout, with only
+±2.5 mm of localisation jitter.
+
+I built a guard on `hasObstruction` first, said it would stop the arm, and believed it
+for an hour before measuring. It could never have fired. That function is now
+`base_safe_to_press`, keeping only what it can actually do — e-stop, bumpers, an active
+navigation obstruction — with the limitation written at the top of it.
+
+### What does work: the depth camera, which points where the arm goes
+
+Deproject the depth image into the base frame and ask what sits IN FRONT of the fitted
+panel plane, on the robot's side. The separation is not marginal:
+
+| | mm in front of the panel plane |
+|---|---|
+| the wall behind | **-127** |
+| empty scene, 99.9th percentile of 56,813 pixels | **+4** |
+| empty scene, maximum | **+21** (the buttons' own protrusion) |
+| a hand in the gap | **+197**, over 20.8% of the view |
+
+So 40 mm is not a tuned edge, it is the middle of a wide empty band. Checked from a
+fresh frame immediately before EVERY button's motion, with the arm at home — which is
+outside the camera's view by design, so the robot's own limbs are not what it detects.
+
+Verified on hardware: `1` pressed normally (-3.12 mm, lateral 0.27 mm), a hand went in,
+and `4` was refused with IK, 52 mm clearance and self-collision all passing. The arm
+stayed home and the run exited 1.
+
+Two limits, deliberately not papered over: it sees only the camera's field of view, and
+it is a check BEFORE the motion — the arm is out for seconds afterwards and nothing
+watches that window.
+
+### The terminal now follows the robot instead of lagging it
+
+The operator's complaint was that the display trailed the robot badly. Measured, SSH
+was never the cause: 108 ms RTT, and 0.16 s per call once `ControlMaster` reuses the
+connection (0.6 s without). The cause was waiting for a job to EXIT before looking at
+its log — which turned a press into 40-70 s of blank terminal, and then the waiting
+command itself timed out and went to the background on top of that. One measured gap
+was **2 min 40 s** during which the robot drove and pressed.
+
+`press_stream.sh` and `liverun_stream.sh` run the job and `tail -f` its log instead.
+Measured lag: **2 s**, which is the floor — the runner's own data comes from the cloud
+and the base reports event-driven.
+
 ## ▶ TWO FAILURES THAT LOOKED LIKE BAD LUCK WERE BOTH SELF-INFLICTED (2026-08-28)
 
 Three live runs failed today with the panel in view and the robot in the right place.

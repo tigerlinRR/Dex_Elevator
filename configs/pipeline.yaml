@@ -230,6 +230,19 @@ elevator:
   # already overpress by 2.3 mm; the target is
   #     plane_point + (button_protrusion - push_depth) * outward_normal
   press:
+    # Refuse to move the arm if anything is between the robot and the panel. The
+    # chest camera is the ONLY sensor that looks there: the base's own obstacle
+    # sensors face its direction of travel, which is 180 degrees away from the panel,
+    # and `hasObstruction` is False whenever the base is parked anyway (verified — an
+    # operator blocked the robot for 70 s and not one of robot_state's 35 fields
+    # moved). The test is how much of the depth view sits in FRONT of the fitted panel
+    # plane. Empty, that is 0.000% past 30 mm over 56,813 sampled pixels (99.9th
+    # percentile +4 mm, max +21 mm — the buttons themselves), while the wall behind is
+    # 127 mm the other way. A person or chair in the gap reads hundreds of mm, so
+    # 40 mm sits in a wide gap between the two cases rather than on a tuned edge.
+    obstacle:
+      min_mm: 40.0
+      min_frac: 0.002
     standoff: 0.06           # m backed off the panel before/after pressing
     button_protrusion: 0.0023  # m the button sits above the faceplate
     # 3 mm, established on hardware 2026-08-20 by walking it up: 1 mm and 2 mm

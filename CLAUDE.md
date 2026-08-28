@@ -70,6 +70,12 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
     check the peer's actual endpoint (`tailscale ping`), since it will happily use the LAN
     path when the cable IS plugged in and then look cable-independent when it is not.
 - **`sudo` requires a password**, so any root step has to be handed to the user.
+- **The arm and the chest camera face 180 degrees away from the base's front.** The
+  base drives with its own front (green light, obstacle sensors, face camera) pointing
+  directly AWAY from the panel the arm reaches for. Two consequences that are easy to
+  get wrong: the base's `hasObstruction` can never see the arm's workspace — it watches
+  the opposite hemisphere — and blocking one side is invisible to the other. Verified
+  by blocking each in turn and watching the other report nothing.
 - **Torso lift column** (RealMan lift API, mm) raises/lowers the upper body. The
   chest camera and arm bases ride it together, so `base_T_camera` stays constant.
 - **LinkerHand** dexterous hand as end-effector (driven by its own bridge, not the
@@ -113,6 +119,15 @@ python3 initialization/eval_localization.py    --camera cam_chest --web   # end-
 
 # No test suite or linter is configured yet.
 ```
+
+**Stream long robot commands; do not wait for them to exit.** `press_stream.sh` and
+`elevator_runner`'s `liverun_stream.sh` run the job and `tail -f` its log. Waiting for
+the process instead means the whole 40-70 s press happens with nothing on the terminal,
+and the waiting command then times out and goes to the background, adding another layer
+on top — measured, that turned a 2 s view of the robot into a 2 min 40 s blind spot.
+SSH itself was never the problem: 108 ms RTT over Tailscale, and 0.16 s per call once
+`ControlMaster` reuses the connection (0.6 s without). The floor is ~2 s, because the
+runner's own data comes from the cloud and the base reports event-driven.
 
 **The `--web` preview only works if the browser can route to the Jetson.** The dev Mac is
 on `192.168.40.x` and cannot reach the Jetson's WiFi subnet (`192.168.10.x`), so today
@@ -167,6 +182,33 @@ model). A button is a point target on the known **vertical panel plane**:
   the ROI (notably the robot's own hand) drags the fit** — measured 23 mm of error
   with the hand in frame. Once YOLO is wired, use the button detections' bounding
   box as the ROI, which excludes the hand automatically.
+
+**Nothing may be between the robot and the panel when the arm moves**
+(`path_obstructed` in `press_buttons.py`, `elevator.press.obstacle`, 2026-08-28).
+Checked from a fresh depth frame immediately before EVERY button's motion, with the arm
+at home — which is deliberately outside the camera's view, so what it sees is the world
+and not the robot's own limbs.
+
+**The chest camera is the only sensor that looks where the arm goes.** The base's
+obstacle sensors face its direction of travel, 180 degrees away from the panel, and
+`hasObstruction` is False whenever the base is parked in any case — verified by
+blocking the robot for 70 s and watching all 35 scalar fields of `robot_state`, none of
+which moved. A guard built on `hasObstruction` was written first and believed for an
+hour before that was measured; it could never have worked.
+
+The test is geometric, not learned: deproject the depth image into the base frame and
+ask what sits IN FRONT of the fitted panel plane, on the robot's side. Empty, that is
+essentially nothing — over 56,813 sampled pixels the 99.9th percentile is **+4 mm** and
+the maximum **+21 mm** (the buttons' own protrusion), with **0.000%** past 30 mm, while
+the wall behind sits **127 mm** the other way. A hand in the gap measured **197 mm**
+and 20.8 % of the view. So the 40 mm threshold sits in a wide gap between the two
+cases rather than on a tuned edge. Verified on hardware: button `1` pressed normally,
+a hand went in, button `4` was REFUSED with IK, clearance and self-collision all
+passing — the arm did not move.
+
+Two limits, stated rather than papered over: it sees only the camera's field of view,
+and it is a check BEFORE the motion — the arm is out for seconds afterwards and nothing
+watches that window.
 
 **Dexterous hand (`core/hand/linkerhand.py`)** — LinkerHand O6 as a Modbus RTU slave on
 the RIGHT arm's tool-side RS485, sharing the arm's connection. Bring-up:

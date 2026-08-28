@@ -347,6 +347,54 @@ class Run:
 RUN = Run()
 
 
+def base_safe_to_press(robot, tag, wait=30.0, poll=2.0):
+    """Base-side conditions that must hold before the arm moves. Returns (ok, detail).
+
+    **This does NOT see the arm's workspace, and must not be relied on for that.**
+    The base's obstacle sensors face its direction of travel, which on this robot is
+    180 degrees away from the panel the arm reaches for — and `hasObstruction` is
+    False whenever the base is parked in any case: verified by blocking the robot for
+    70 s and watching all 35 scalar fields of `robot_state`, none of which moved.
+    An earlier version of this function claimed to be the arm's obstacle guard. It
+    could never have been. The real check is `path_obstructed` in press_buttons.py,
+    which uses the chest camera's depth — the only sensor pointed where the arm goes.
+
+    What is left here is still worth having, because each of these means the arm must
+    not move and none of them is visible to the camera: an emergency stop, a bumper in
+    contact, and a navigation obstruction (which, when it IS reported, means the base
+    may still be trying to move). Obstructions are transient by design on this floor,
+    so it waits rather than failing at once.
+    """
+    t0 = time.time()
+    said = None
+    while time.time() - t0 < wait:
+        try:
+            st = AX.robot_state(robot)
+        except Exception as e:  # noqa: BLE001
+            said = f"cannot read the base ({e})"
+            time.sleep(poll)
+            continue
+        blockers = [n for n, v in (
+            ("obstruction", st.get("hasObstruction")),
+            ("person ahead", st.get("hasPersonAhead")),
+            ("front bumper", st.get("isFrontBumperPressed")),
+            ("rear bumper", st.get("isRearBumperPressed")),
+        ) if v]
+        if st.get("isEmergencyStop"):
+            blockers.append("emergency stop")
+        age = time.time() - (st.get("timestamp") or 0) / 1000.0
+        if not blockers:
+            if said:
+                RUN.log(f"{tag}: path clear after {time.time() - t0:.0f}s")
+            return True, "clear"
+        detail = f"{', '.join(blockers)} (report {age:.0f}s old)"
+        if detail != said:
+            said = detail
+            RUN.log(f"{tag}: NOT moving the arm yet — {detail}")
+        time.sleep(poll)
+    return False, said or "unknown"
+
+
 def wait_for_arrival(robot, task_id, target, tol_cm, poll_timeout,
                      fast_arrival, observe, tag, hard_cap=900.0):
     """Wait until the robot has arrived at `target`. Returns (finished, cancelled,
@@ -773,6 +821,19 @@ def run_loop(params):
                 RUN.log(f"{tag}: now within reach ({err:.1f}cm)")
 
             # --- within reach: press ---
+            # Base-side preconditions only — e-stop, bumpers, an active navigation
+            # obstruction. Whether the ARM's path is clear is decided inside
+            # press_buttons.py from the chest camera's depth, because the base's
+            # sensors face 180 degrees away from the panel and cannot see it.
+            RUN.set(phase="checking the base is safe to press from")
+            clear, detail = base_safe_to_press(robot, tag)
+            if not clear:
+                RUN.log(f"{tag}: REFUSING to press — {detail}. The arm stays home.")
+                RUN.set(phase="blocked")
+                press_kill(warm)
+                time.sleep(backoff)
+                continue
+
             RUN.set(phase="pressing")
             ok, out = press_release(warm) if warm is not None else press_on_agx(floors)
             RUN.set(last_press=out)
