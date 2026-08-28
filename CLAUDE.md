@@ -298,6 +298,23 @@ misalignment is caught rather than pressed. Measured, and each number changed th
   7 of 8. Then
   `tight_roi` re-boxes the fit around the confirmed buttons only — the wall and cabinet
   behind are separate parallel planes and bias the depth fit.
+- **The ROI must be able to look where the first pass MISSED, or the failure is
+  self-sealing** (`panel_roi(shape=...)`, 2026-08-28). The full-frame pass scales
+  1280x720 into the model's 640, so a 44 px button becomes ~22 px and a whole edge ROW
+  can drop out: measured live, `open`/`close` scored **0.16 and 0.06** full-frame while
+  the same two buttons scored **0.91 and 0.96** on a crop of that row alone. Since the
+  ROI is derived FROM those detections, a missed bottom row put the ROI's bottom edge
+  above it, the refined pass never looked there, and the lattice fit got four rows for
+  a five-row layout — residual 11-12.5 px against a 6 px threshold, **refused 15 of 15
+  attempts with the panel plainly in view**. Fix: when fewer rows (or columns) are
+  found than the layout registers, grow the ROI by the MISSING count times the measured
+  pitch, both ways along that axis. Bounded by what is missing rather than a bigger
+  blanket margin — a complete grid grows by nothing, so working frames are unchanged,
+  and it cannot run away. On the failing frame it took the bottom edge 410 -> 463 px
+  (still 81 px clear of the cabinet keyhole at 544 that `link` exists to exclude) and
+  the residual 11.3 -> **1.7 px**. Note the first hypothesis was WRONG and measuring
+  killed it: the scene was blown out, but the missed row's mean/std were 192.8/47.9
+  against 190.4/49.1 for a row that WAS found — brightness was not the variable.
 - **Verification is a LATTICE FIT, not a row-shape match** (`fit_lattice`). Requiring
   the detected grid to equal the registered shape exactly threw away good frames: at a
   re-docked distance 12 cm further out the buttons shrank from 50 to 44 px and one or
@@ -435,6 +452,37 @@ shared box); credentials live in a gitignored `.env`.
   three-line tail reaches the UI, and when a press failed mid-sequence that tail was
   the camera's startup banner — which says nothing about why. The per-button lift
   height, joint margin, clearance and residual are in the transcript.
+- **`poll_timeout_sec` is a STALL timeout, and progress means MOTION** (2026-08-28).
+  Measured from dispatch it conflates "slower than usual" with "stuck", which want
+  opposite responses: one drive took **316 s** where the same route normally takes
+  56 s — 9.30 m against 8.77 m, i.e. nearly the same path at a fifth of the speed — and
+  a 300 s budget gave up **6 s** before that task completed, with the robot already
+  3 cm from the target, killing the pre-warmed press with it. So the clock now measures
+  time since the base last moved.
+  **Progress is position change or non-zero speed, never what the base says about its
+  situation.** A first version counted `hasObstruction`/`hasPersonAhead` as progress,
+  reasoning that a base with a reason to wait is not stalled. That is wrong in the
+  worst direction: measured, the base finished its 7.22 m route, stopped 5 cm from the
+  elevator point, and held `moveState=moving, speed=0, hasObstruction=True` for over
+  **six minutes** without moving — which would have waited out the whole `hard_cap`.
+  Motion is a fact; "there is an obstruction" is an opinion, and they come apart
+  exactly when it matters.
+- **A stall AT the target is not a failure — but cancel the task before pressing.**
+  That six-minute case was the base parked exactly where it was asked and simply never
+  saying "succeeded". When the stall fires inside tolerance, the task is CANCELLED
+  first (so nothing can command a late docking nudge while the arm is out), stillness
+  is re-confirmed, and that counts as arrival. This is not the camera-based guess that
+  drove the arm into the panel: it is the base's own odometry showing no motion over a
+  long window, with nothing left that could move it.
+- **The base's situation is LOGGED whenever it changes** during a drive — moveState,
+  moving/stopped, personAhead/obstruction, distance to go. A slow drive has to be
+  diagnosable afterwards; with only mileage and duration, the obvious suspect (a person
+  in the way) could be guessed at but was never actually observed, and the real cause
+  turned out to be `hasObstruction` at the docking point. A handful of lines per drive.
+- **The base can report a task "succeeded" while still ~1 m short.** Observed: it
+  declared success at **95 cm** from the elevator point, and the corrective drive
+  closed it to 7.9 cm in 25 s. This is what `corrective_drives` exists for; it also
+  goes through the same `wait_for_arrival`, so it gets the fast gate too.
 
 **Pressing on its own** (`press_buttons.py --auto`) — waits until the panel is both
 visible AND still (5 consecutive frames within 2 mm), then presses ONCE and exits;

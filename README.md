@@ -265,6 +265,34 @@ GPU clock ramp, arm connect) in parallel with the drive; the child then BLOCKS u
 says go. **The arrival decision does not move into the press** — inferring arrival from the
 camera is what drove the arm into the panel once.
 
+**Two self-sealing failures fixed (2026-08-28).** Both looked like bad luck and neither
+was; in both, the instrumentation needed to tell the difference did not exist until it
+was added.
+
+*The ROI could not look where the detector had missed.* The full-frame pass scales
+1280x720 into the model's 640, so a 44 px button becomes ~22 px and a whole edge row can
+drop out — `open`/`close` scored **0.16 and 0.06** full-frame against **0.91 and 0.96**
+on a crop of that row alone. Because the ROI is derived FROM those detections, the
+refined pass never looked at the missing row, and the lattice fit got four rows for a
+five-row layout: refused on 15 of 15 attempts with the panel plainly in view. Now, when
+fewer rows or columns are found than the layout registers, the ROI grows by the missing
+count times the measured pitch — bounded by what is missing, so a complete grid grows by
+nothing. Residual on the failing frame: 11.3 -> **1.7 px**.
+
+*"Slower than usual" and "stuck" were the same condition.* One drive took 316 s where the
+same route takes 56 s (9.30 m against 8.77 m — nearly the same path at a fifth of the
+speed), and a 300 s wall-clock budget gave up 6 s before the task completed with the robot
+3 cm from the target. `poll_timeout_sec` is now a STALL timeout, and **progress means
+motion** — position change or non-zero speed, never what the base says about its
+situation. That distinction is not academic: the base once held
+`moveState=moving, speed=0, hasObstruction=True` for over six minutes, parked 5 cm from
+the goal, without moving. A stall inside tolerance is treated as arrival, but the task is
+cancelled first so nothing can nudge the base while the arm is out.
+
+The base's situation is now logged whenever it changes during a drive, which immediately
+caught it declaring a task "succeeded" while still **95 cm** short — closed by a
+corrective drive in 25 s.
+
 **Plunger TCP re-measured after a collision (2026-08-27).** The configured offset was 5.57 mm
 out — 5.14 mm of it along the approach axis, so a commanded 3 mm push was really pressing about
 8 mm. The button still lit, which is why this had to be *measured*: the press log's own

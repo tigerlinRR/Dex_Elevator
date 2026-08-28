@@ -132,8 +132,23 @@ def detect_positions(bgr: np.ndarray, roi: tuple[int, int, int, int],
     return out
 
 
+def _lines_along(vals: np.ndarray, gap: float) -> list[float]:
+    """Group 1-D coordinates into lines (rows or columns), returning their centres."""
+    order = np.argsort(vals)
+    lines, cur = [], [float(vals[order[0]])]
+    for i in order[1:]:
+        v = float(vals[i])
+        if v - cur[-1] > gap:
+            lines.append(sum(cur) / len(cur)); cur = [v]
+        else:
+            cur.append(v)
+    lines.append(sum(cur) / len(cur))
+    return lines
+
+
 def panel_roi(bgr: np.ndarray, detector: Detector, min_conf: float = 0.10,
               margin: float = 0.35, link: float = 2.2,
+              shape: tuple[int, ...] = (),
               verbose: bool = False) -> Optional[tuple[int, int, int, int]]:
     """ROI covering the faceplate, derived from the detections themselves.
 
@@ -153,6 +168,25 @@ def panel_roi(bgr: np.ndarray, detector: Detector, min_conf: float = 0.10,
     returned 10-11 "buttons" including the keyhole and the warning label, and the
     lattice fit failed outright. Neighbouring buttons are only ~1.6 widths apart, so
     2.2 still links the grid while leaving the keyhole out.
+
+    ``shape`` — the registered layout's row shape — closes a failure that is
+    self-sealing without it. The full-frame pass runs at 1280x720 scaled into the
+    model's 640, so a 44 px button becomes ~22 px, and it can miss a whole edge ROW:
+    measured on a live frame, `open`/`close` scored 0.16 and **0.06** full-frame while
+    the same two buttons scored **0.91 and 0.96** on a crop of that row alone. The ROI
+    is derived FROM these detections, so a missed bottom row put the ROI's bottom edge
+    above it, the refined pass never looked there, and the lattice fit was handed four
+    rows for a five-row layout — residual 11-12.5 px against a 6 px threshold, refused
+    on 15 of 15 attempts with the panel plainly in view.
+
+    So when fewer rows (or columns) are found than the layout registers, the ROI is
+    grown by the MISSING count times the measured pitch, in both directions along that
+    axis. Bounded by what is missing rather than a bigger blanket margin: a complete
+    grid expands by nothing, so a frame that works today behaves identically, and the
+    growth cannot run away. Sized in pitches because that is the distance a missed row
+    actually sits at — on the failing frame it extended the bottom edge from 410 to
+    463 px, still 81 px clear of the cabinet keyhole at 544 that `link` exists to
+    exclude.
     """
     dets = [d for d in detector.detect(bgr) if float(d.confidence) >= min_conf]
     if not dets:
@@ -187,9 +221,40 @@ def panel_roi(bgr: np.ndarray, detector: Detector, min_conf: float = 0.10,
 
     sub = xy[keep]
     pad = margin * w
+    x0, y0 = sub[:, 0].min() - pad, sub[:, 1].min() - pad
+    x1, y1 = sub[:, 2].max() + pad, sub[:, 3].max() + pad
+
+    if shape:
+        gap = 0.6 * w                       # centres within 0.6 widths are one line
+        rows = _lines_along(cy[keep], gap)
+        cols = _lines_along(cx[keep], gap)
+        want_rows, want_cols = len(shape), max(shape)
+        for found_lines, want, lo, hi, axis in (
+                (rows, want_rows, "y0", "y1", "row"),
+                (cols, want_cols, "x0", "x1", "col")):
+            missing = want - len(found_lines)
+            if missing <= 0:
+                continue
+            if len(found_lines) >= 2:
+                pitch = float(np.median(np.diff(found_lines)))
+            else:
+                # One line found: no pitch to measure. 1.3 button widths is this
+                # panel's row pitch (53 px against 44 px buttons) and is only ever
+                # used in a case that is already close to hopeless.
+                pitch = 1.3 * w
+            grow = missing * pitch
+            if axis == "row":
+                y0 -= grow; y1 += grow
+            else:
+                x0 -= grow; x1 += grow
+            if verbose:
+                print(f"    ROI: only {len(found_lines)} of {want} {axis}s found — "
+                      f"growing +-{grow:.0f}px (pitch {pitch:.0f}) so the refined pass "
+                      "can look where the full-frame pass missed")
+
     h, wid = bgr.shape[:2]
-    return (max(0, int(sub[:, 0].min() - pad)), max(0, int(sub[:, 1].min() - pad)),
-            min(wid, int(sub[:, 2].max() + pad)), min(h, int(sub[:, 3].max() + pad)))
+    return (max(0, int(x0)), max(0, int(y0)),
+            min(wid, int(x1)), min(h, int(y1)))
 
 
 def classify_solo(bgr: np.ndarray, f: Found, detector: Detector,

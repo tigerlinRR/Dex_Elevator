@@ -348,7 +348,7 @@ RUN = Run()
 
 
 def wait_for_arrival(robot, task_id, target, tol_cm, poll_timeout,
-                     fast_arrival, observe, tag):
+                     fast_arrival, observe, tag, hard_cap=900.0):
     """Wait until the robot has arrived at `target`. Returns (finished, cancelled,
     fast, would_fire).
 
@@ -363,6 +363,34 @@ def wait_for_arrival(robot, task_id, target, tol_cm, poll_timeout,
         the base really had stopped.
       * SLOW  — the cloud task status, kept as the backstop: it is what catches a task
         that was cancelled, or that ended somewhere the fast gate never accepts.
+
+    ``poll_timeout`` is a STALL timeout — time since the base last showed progress —
+    not a budget for the whole drive. Measured from dispatch it conflates "slower than
+    usual" with "stuck", and those want opposite responses. On one run a person in the
+    way turned an 8.77 m / 56 s route into 9.30 m / 316 s: nearly the same path at a
+    fifth of the speed, i.e. the base was doing exactly the right thing. A 300 s budget
+    gave up 6 s before that task completed, with the robot already 3 cm from the
+    target, and killed the pre-warmed press with it.
+
+    Progress means the robot ACTUALLY MOVED — position changed, or a non-zero speed.
+    Not what the base says about its situation: an earlier version counted
+    `hasObstruction` and `hasPersonAhead` as progress, reasoning that a base with a
+    reason to wait is not stalled, and that was wrong in the worst way. Measured: the
+    base finished its 7.22 m route, stopped 5 cm from the elevator point, and then held
+    `moveState=moving, speed=0, hasObstruction=True` for over six minutes without
+    moving a millimetre. Treating that as busy would have waited out the whole
+    ``hard_cap``. Motion is a fact; "there is an obstruction" is an opinion, and the
+    two come apart exactly when it matters. The 316 s drive that motivated the stall
+    timeout covered 9.30 m, so position-based progress keeps ITS clock alive too.
+
+    When the stall fires, being stuck is not the only possibility: the base may be
+    parked exactly where it was asked to go and simply never say "succeeded", which is
+    what the six-minute case was. So if it is stationary AND inside the tolerance, the
+    task is CANCELLED first — removing any chance of a late docking nudge while the arm
+    is out — the stillness is re-confirmed, and that counts as arrival. This is not the
+    camera-based guess that once drove the arm into the panel: it is the base's own
+    odometry showing no motion, over a long window, with nothing left that could
+    command a move.
     """
     t0 = time.time()
     dispatched_ms = int(t0 * 1000)
@@ -379,7 +407,62 @@ def wait_for_arrival(robot, task_id, target, tol_cm, poll_timeout,
     would_fire = None            # observe mode: when the fast gate first agreed
     prev_xy = None               # position at the previous agreeing report
     last_task_poll = 0.0
-    while time.time() - t0 < poll_timeout:
+    last_progress = t0           # when the base last actually moved
+    progress_xy = None           # where it was at that moment
+    last_rs = {}                 # most recent robot_state, for the stall handler
+    # A drive that is slower than usual has to be DIAGNOSABLE afterwards. One took
+    # 316 s where the same route normally takes 56 s, and with only mileage and
+    # duration to go on the cause could be guessed at but not established — the
+    # obvious suspect, a person in the way, was never actually observed. So log the
+    # base's situation whenever it CHANGES: a handful of lines per drive, and the
+    # answer is in them rather than in an inference.
+    situation = None
+    while True:
+        now = time.time()
+        if now - last_progress > poll_timeout:
+            derr = dist_cm(last_rs.get("x"), last_rs.get("y"),
+                           target["x"], target["y"])
+            why_stuck = []
+            if last_rs.get("hasObstruction"):
+                why_stuck.append("obstruction")
+            if last_rs.get("hasPersonAhead"):
+                why_stuck.append("person ahead")
+            note = (f" ({', '.join(why_stuck)})" if why_stuck else "")
+            if derr is not None and derr <= tol_cm:
+                # Parked where we asked, just never declared done. Cancel first so
+                # nothing can nudge it while the arm is out, then re-confirm.
+                RUN.log(f"{tag}: base has not moved for {poll_timeout:.0f}s and is "
+                        f"{derr:.1f}cm from the point{note} — cancelling the task, "
+                        "then checking it is really parked")
+                try:
+                    AX.cancel_task(task_id)
+                except Exception as e:  # noqa: BLE001
+                    RUN.log(f"{tag}: cancel failed ({e}) — not pressing")
+                    break
+                time.sleep(4)
+                try:
+                    rs2 = AX.robot_state(robot)
+                except Exception:  # noqa: BLE001
+                    rs2 = {}
+                drift = dist_cm(rs2.get("x"), rs2.get("y"),
+                                last_rs.get("x"), last_rs.get("y"))
+                still = (drift is not None and drift < 1.0
+                         and abs(float(rs2.get("speed") or 0)) <= 0.02)
+                if still:
+                    RUN.log(f"{tag}: confirmed parked (moved {drift:.1f}cm after the "
+                            "cancel) — pressing")
+                    finished = fast = True
+                else:
+                    RUN.log(f"{tag}: moved after the cancel — not pressing")
+                break
+            RUN.log(f"{tag}: base has not moved for {poll_timeout:.0f}s "
+                    f"({now - t0:.0f}s since dispatch"
+                    f"{'' if derr is None else f', {derr:.0f}cm from the point'})"
+                    f"{note} — giving up")
+            break
+        if now - t0 > hard_cap:
+            RUN.log(f"{tag}: hit the {hard_cap:.0f}s cap — giving up")
+            break
         if RUN.stop_flag:
             AX.cancel_task(task_id); RUN.log(f"{tag}: cancelled on stop"); break
         time.sleep(1)
@@ -390,6 +473,30 @@ def wait_for_arrival(robot, task_id, target, tol_cm, poll_timeout,
                 rs = AX.robot_state(robot)
             except Exception:  # noqa: BLE001
                 rs = {}
+            # Progress keeps the stall clock alive, and progress means MOTION.
+            pxy = (rs.get("x"), rs.get("y"))
+            moved = (dist_cm(pxy[0], pxy[1], progress_xy[0], progress_xy[1])
+                     if progress_xy is not None and pxy[0] is not None else None)
+            if (progress_xy is None or abs(float(rs.get("speed") or 0)) > 0.02
+                    or (moved is not None and moved > 5)):
+                last_progress = time.time()
+                if pxy[0] is not None:
+                    progress_xy = pxy
+            last_rs = rs
+
+            now_sit = (str(rs.get("moveState")), bool(rs.get("hasPersonAhead")),
+                       bool(rs.get("hasObstruction")),
+                       abs(float(rs.get("speed") or 0)) > 0.02)
+            if now_sit != situation:
+                situation = now_sit
+                flags = [n for n, f in (("personAhead", now_sit[1]),
+                                        ("obstruction", now_sit[2])) if f]
+                d_now = dist_cm(rs.get("x"), rs.get("y"), target["x"], target["y"])
+                RUN.log(f"{tag}: t+{time.time() - t0:.0f}s base {now_sit[0]}"
+                        f"{' moving' if now_sit[3] else ' stopped'}"
+                        f"{' ' + '+'.join(flags) if flags else ''}"
+                        f"{'' if d_now is None else f', {d_now:.0f}cm to go'}")
+
             ok_now, ferr, why = base_arrived(rs, dispatched_ms, target, tol_cm)
             if not departed:
                 moving = (str(rs.get("moveState", "")).lower() not in MOVE_DONE
@@ -490,7 +597,10 @@ def run_loop(params):
     backoff = float(params["backoff_sec"])
     run_mode = int(params.get("run_mode", 2))
     dry = bool(params.get("dry_run", True))
-    poll_timeout = float(params.get("poll_timeout_sec", 240))
+    # A STALL timeout — time since the base last showed progress — not a budget for
+    # the whole drive. See wait_for_arrival.
+    poll_timeout = float(params.get("poll_timeout_sec", 90))
+    hard_cap = float(params.get("max_wait_sec", 900))
     # How arrival is decided:
     #   True      -> the base's own moveState (fast: the report after a change is ~2 s
     #                old, where the cloud's task status ran 20-55 s behind).
@@ -562,7 +672,7 @@ def run_loop(params):
             # real fix needs a local arrival signal from the base, not a proxy for one.
             finished, cancelled, fast, _ = wait_for_arrival(
                 robot, task_id, elevator, tol_cm, poll_timeout,
-                fast_arrival, observe, tag)
+                fast_arrival, observe, tag, hard_cap)
             if RUN.stop_flag:
                 press_kill(warm)
                 break
@@ -634,17 +744,14 @@ def run_loop(params):
                     if not tid2:
                         RUN.log(f"{tag}: corrective task got no id")
                         break
-                    t2 = time.time()
-                    while time.time() - t2 < poll_timeout:
-                        if RUN.stop_flag:
-                            AX.cancel_task(tid2); break
-                        time.sleep(3)
-                        try:
-                            s2 = AX.task_status(tid2).get("data") or {}
-                        except Exception:  # noqa: BLE001
-                            continue
-                        if task_finished(s2) or task_cancelled(s2):
-                            break
+                    # Same wait as the route, rather than a second copy of it: the
+                    # corrective drive gets the fast gate and the stall timeout too.
+                    # The departure guard behaves correctly here — the robot is out of
+                    # tolerance by definition, so it either starts far enough away to
+                    # count as departed, or it has to move before it can arrive.
+                    wait_for_arrival(robot, tid2, elevator, tol_cm, poll_timeout,
+                                     fast_arrival, observe, f"{tag} correct {c}",
+                                     hard_cap)
                     if RUN.stop_flag:
                         break
                     stt = AX.robot_state(robot)

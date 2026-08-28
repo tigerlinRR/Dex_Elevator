@@ -3,6 +3,103 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
+## ▶ TWO FAILURES THAT LOOKED LIKE BAD LUCK WERE BOTH SELF-INFLICTED (2026-08-28)
+
+Three live runs failed today with the panel in view and the robot in the right place.
+Neither cause was what it first looked like, and in both the instrumentation to tell
+the difference did not exist until it was added.
+
+| | |
+|---|---|
+| `1 4 2 5` after driving | **4/4 lit, lateral 0.09 mm** (best of the day) |
+| per-button lift heights | recorded for the first time — see below |
+| localisation on the failing frame | residual 11.3 px (refused) -> **1.7 px** |
+| a base parked 5 cm from the goal but never saying "done" | waited **6+ minutes** -> now handled in 90 s |
+
+### The ROI could not look where the detector had missed
+
+The full-frame pass scales 1280x720 into the model's 640, so a 44 px button becomes
+~22 px — and a whole edge ROW dropped out. Measured on the failing frame:
+
+| | `open` | `close` |
+|---|---|---|
+| full frame | 0.16 (labelled `keyhole`) | **0.06** |
+| a crop of that row alone, 4x | **0.91** | **0.96** |
+
+The buttons were perfectly detectable. But the ROI is derived FROM the full-frame
+detections, so a missed bottom row put the ROI's bottom edge above it, the refined pass
+never looked there, and the lattice fit was handed four rows for a five-row layout:
+residual 11-12.5 px against a 6 px threshold, **refused on 15 of 15 attempts**. A
+failure that seals itself — what the first pass cannot see, nothing later can.
+
+Fix: when fewer rows or columns are found than the layout registers, grow the ROI by
+the MISSING count times the measured pitch. Bounded by what is missing rather than a
+bigger blanket margin, so a complete grid grows by nothing and frames that work today
+are untouched. On the failing frame: bottom edge 410 -> 463 px, still 81 px clear of
+the cabinet keyhole at 544 that the clustering exists to exclude.
+
+**The first hypothesis was wrong, and measuring is what killed it.** The scene was
+blown out and the obvious suspect was the light. But the missed row measured mean/std
+192.8/47.9 against 190.4/49.1 for a row that WAS found — indistinguishable. Brightness
+was not the variable.
+
+### "Slower than usual" and "stuck" were the same condition
+
+A drive took **316 s** where the same route normally takes 56 s — 9.30 m against
+8.77 m, i.e. nearly the same path at a fifth of the speed. The 300 s wall-clock budget
+gave up **6 s** before that task completed, with the robot already 3 cm from the
+target, and killed the pre-warmed press with it.
+
+So the timeout became a STALL timeout: time since the base last moved. Then the first
+version of that was wrong too — it counted `hasObstruction`/`hasPersonAhead` as
+progress, reasoning that a base with a reason to wait is not stalled. Measured: the
+base finished its 7.22 m route, stopped 5 cm from the elevator point, and held
+`moveState=moving, speed=0, hasObstruction=True` for **over six minutes** without
+moving a millimetre. That version would have waited out the entire 900 s cap — worse
+than the 300 s being complained about.
+
+**Progress now means motion: position change or non-zero speed.** Motion is a fact;
+"there is an obstruction" is an opinion, and the two come apart exactly when it matters.
+
+And a stall AT the target is not a failure — that six-minute case was the base parked
+where it was asked and simply never declaring success. When the stall fires inside
+tolerance the task is CANCELLED first, so nothing can command a late docking nudge
+while the arm is out, stillness is re-confirmed, and that counts as arrival. Not the
+camera-based guess that drove the arm into the panel once: this is the base's own
+odometry showing no motion over a long window, with nothing left that could move it.
+
+**I also had to correct myself here.** I reported the 316 s drive as an avoidance
+manoeuvre — someone in the way — from mileage and duration alone. `hasPersonAhead` was
+never actually observed to be true. The operator pushed back ("a person shouldn't be
+blocking that long"), and they were right: logging the base's situation showed
+`hasObstruction` at the docking point, not a person.
+
+### The base's situation is now logged whenever it changes
+
+A slow drive has to be diagnosable after the fact. moveState, moving/stopped,
+personAhead/obstruction, distance to go — a handful of lines per drive. It immediately
+paid for itself twice: it identified the obstruction above, and it caught the base
+declaring a task **"succeeded" while still 95 cm short**, which the corrective drive
+then closed to 7.9 cm in 25 s. The corrective drive now shares `wait_for_arrival`
+rather than carrying its own copy, so it gets the fast gate too.
+
+### Per-button lift heights, recorded at last
+
+| button | lift | body | joint margin | rolls | depth | lateral |
+|---|---|---|---|---|---|---|
+| `1` | 443 -> 744 | +150 mm | 49.9 deg | 24/24 | -3.08 mm | 0.39 mm |
+| `4` | 744 -> 894 | +75 mm | 55.4 deg | 24/24 | -2.99 mm | 0.31 mm |
+| `2` | 894 -> 794 | **-50 mm** | 55.2 deg | 24/24 | -3.01 mm | 0.32 mm |
+| `5` | 794 -> 894 | +50 mm | 49.6 deg | 24/24 | -3.02 mm | 0.22 mm |
+
+Clearance 52 mm throughout. The torso moves both ways, not just up.
+
+### Still open
+- Second independent cross-check of the re-measured plunger TCP (still one touch).
+- Why the base reports an obstruction at the docking point at all. It is handled now,
+  but handled is not understood — the cabinet the faceplate is mounted on is the
+  obvious candidate and has not been confirmed.
+
 ## ▶ THE WAIT AT THE ELEVATOR IS GONE, AND THE TORSO NOW MOVES (2026-08-27)
 
 Two complaints, both fixed and both measured. The robot used to park at the elevator

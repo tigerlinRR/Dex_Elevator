@@ -359,7 +359,8 @@ def main() -> int:
             # deliberately generous and can reach past the faceplate onto the
             # cabinet — a second, roughly parallel plane that would bias the fit.
             # Once the buttons are known, the fit gets a box around them alone.
-            coarse = panel_roi(bgr, detector, verbose=verbose)
+            coarse = panel_roi(bgr, detector, shape=layout.shape,
+                               verbose=verbose)
             if coarse is None:
                 if verbose:
                     print(f"{tag}no buttons in the frame at all")
