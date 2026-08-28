@@ -476,9 +476,22 @@ shared box); credentials live in a gitignored `.env`.
   long window, with nothing left that could move it.
 - **The base's situation is LOGGED whenever it changes** during a drive — moveState,
   moving/stopped, personAhead/obstruction, distance to go. A slow drive has to be
-  diagnosable afterwards; with only mileage and duration, the obvious suspect (a person
-  in the way) could be guessed at but was never actually observed, and the real cause
-  turned out to be `hasObstruction` at the docking point. A handful of lines per drive.
+  diagnosable afterwards: with only mileage and duration to go on, a slow drive and a
+  stuck one are indistinguishable. A handful of lines per drive.
+- **A person or object blocking the path shows up as `hasObstruction`, NOT
+  `hasPersonAhead`.** Operator-confirmed: the obstructions seen on 2026-08-28 were
+  people and chairs put in the robot's way deliberately, to test that it stops and
+  re-routes. So `hasPersonAhead` is a different signal (the HRI/face path), and
+  `hasObstruction` is the one that means "something is in the way right now". Worth
+  stating because the false inference runs both ways — a `hasPersonAhead` of False does
+  NOT mean no person, and reading it that way is how a correct first guess got
+  retracted for the wrong reason.
+- **Obstacle handling is verified, and the runner must not fight it.** Blocked, the base
+  stops, waits, re-routes and still reaches the point: measured across several drives —
+  a block at 17 cm from the point held it for 63 s before it escaped and completed to
+  **0.4 cm**; another produced 9.30 m of travel against a nominal 8.77 m and still
+  arrived. This is normal operation on a real floor, not an exception, which is exactly
+  why the stall timeout has to key on MOTION rather than on elapsed time.
 - **The base can report a task "succeeded" while still ~1 m short.** Observed: it
   declared success at **95 cm** from the elevator point, and the corrective drive
   closed it to 7.9 cm in 25 s. This is what `corrective_drives` exists for; it also

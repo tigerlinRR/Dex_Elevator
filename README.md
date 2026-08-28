@@ -293,6 +293,14 @@ The base's situation is now logged whenever it changes during a drive, which imm
 caught it declaring a task "succeeded" while still **95 cm** short — closed by a
 corrective drive in 25 s.
 
+*Obstacle handling verified.* Deliberately blocked with people and chairs, the base stops,
+waits, re-routes and still reaches the point: a block 17 cm from the goal held it for 63 s,
+after which it completed the route and arrived at **0.4 cm** (4/4 lit). A blocked path
+reports as `hasObstruction`, not `hasPersonAhead`. This is normal operation on a real
+floor, which is exactly why the stall timeout keys on motion rather than elapsed time — a
+run that gives up because the drive was slow is one that gives up whenever anyone walks
+past.
+
 **Plunger TCP re-measured after a collision (2026-08-27).** The configured offset was 5.57 mm
 out — 5.14 mm of it along the approach axis, so a commanded 3 mm push was really pressing about
 8 mm. The button still lit, which is why this had to be *measured*: the press log's own

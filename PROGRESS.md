@@ -68,11 +68,14 @@ while the arm is out, stillness is re-confirmed, and that counts as arrival. Not
 camera-based guess that drove the arm into the panel once: this is the base's own
 odometry showing no motion over a long window, with nothing left that could move it.
 
-**I also had to correct myself here.** I reported the 316 s drive as an avoidance
-manoeuvre — someone in the way — from mileage and duration alone. `hasPersonAhead` was
-never actually observed to be true. The operator pushed back ("a person shouldn't be
-blocking that long"), and they were right: logging the base's situation showed
-`hasObstruction` at the docking point, not a person.
+**Two corrections here, in opposite directions.** I first reported the 316 s drive as
+an avoidance manoeuvre from mileage and duration alone, with nothing observed to
+support it. Pushed on that, I retracted it — and the retraction was also wrong. The
+obstructions were people and chairs put in the robot's path deliberately, to test that
+it stops and re-routes (operator-confirmed). What I had actually established was
+narrower than either claim: **a blocked path reports as `hasObstruction`, not
+`hasPersonAhead`**, so `hasPersonAhead == False` never meant "no person". The lesson is
+not "guess less" but "say what was measured": the flag was measured, the cause was not.
 
 ### The base's situation is now logged whenever it changes
 
@@ -93,6 +96,21 @@ rather than carrying its own copy, so it gets the fast gate too.
 | `5` | 794 -> 894 | +50 mm | 49.6 deg | 24/24 | -3.02 mm | 0.22 mm |
 
 Clearance 52 mm throughout. The torso moves both ways, not just up.
+
+### Obstacle handling, verified
+
+Deliberately blocked with people and chairs, the base stops, waits, re-routes and still
+reaches the point. Measured today:
+
+| block | what happened |
+|---|---|
+| 17 cm from the point | held 63 s, escaped, completed the route, arrived at **0.4 cm** -> 4/4 lit |
+| mid-route | 9.30 m travelled against a nominal 8.77 m -> arrived |
+| at the docking point | declared "succeeded" 95 cm short; corrective drive closed it to 7.9 cm in 25 s -> 4/4 lit |
+
+This is normal operation on a real floor, not an exception — which is precisely why the
+stall timeout keys on MOTION and not on elapsed time. A run that gives up because the
+drive was slow is a run that gives up whenever anyone walks past.
 
 ### Still open
 - Second independent cross-check of the re-measured plunger TCP (still one touch).
