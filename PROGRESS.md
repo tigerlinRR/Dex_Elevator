@@ -2,218 +2,100 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE ARM WON'T MOVE INTO ANYTHING, AND A DETECTION DEAD END IS FIXED (2026-08-28)
 
-## ▶ THE ARM NOW REFUSES TO MOVE INTO ANYTHING (2026-08-28)
-
-Asked for after the obstacle tests: the arm must not hit anything. The first attempt at
-that was built on the wrong sensor and would never have worked, which is the part worth
-recording.
+Three things: an obstacle guard for the arm, a detection failure that could not recover
+from itself, and the terminal finally keeping up with the robot.
 
 | | |
 |---|---|
-| what protects the arm | a depth check from the chest camera, before every button |
-| verified | hand in the gap -> button `4` REFUSED, arm did not move |
-| empty-scene baseline | 0.000% of pixels past 30 mm in front of the panel plane |
-| a hand in the gap | 197 mm, 20.8% of the view |
-| threshold | 40 mm — in the gap between those, not on an edge |
+| arm obstacle guard | depth from the chest camera, before every button — verified by hand |
+| detection dead end | 15 of 15 refusals with the panel in view -> residual 11.3 px to **1.7 px** |
+| terminal lag behind the robot | minutes -> **2 s** |
+| `1 4 2 5` after driving | 4/4 lit, lateral 0.09 mm |
 
-### The base cannot see the arm's workspace, and never could
+### The arm now refuses to move into anything
 
-**The arm and chest camera face 180 degrees away from the base's front.** The base
-drives with its own front — green light, obstacle sensors, face camera — pointing
-directly AWAY from the panel the arm reaches for. So `hasObstruction` watches the
-opposite hemisphere.
+**The base cannot see the arm's workspace, and never could.** The arm and chest camera
+face **180 degrees away** from the base's front, so its obstacle sensors watch the
+opposite hemisphere. Worse, parked, the cloud API reports nothing about the
+surroundings at all: blocking the robot for 70 s moved **none of `robot_state`'s 35
+scalar fields**. I built a guard on `hasObstruction` first, said it would stop the arm,
+and believed it for an hour before measuring. It could never have fired.
 
-It is worse than that: parked, the cloud API reports nothing about the surroundings at
-all. Blocking the robot for 70 s moved **none of `robot_state`'s 35 scalar fields** —
-`hasObstruction`, `hasPersonAhead` and both bumpers stayed False throughout, with only
-±2.5 mm of localisation jitter.
+What works is the chest camera's depth, which points exactly where the arm goes.
+Deproject it into the base frame and ask what sits IN FRONT of the fitted panel plane:
 
-I built a guard on `hasObstruction` first, said it would stop the arm, and believed it
-for an hour before measuring. It could never have fired. That function is now
-`base_safe_to_press`, keeping only what it can actually do — e-stop, bumpers, an active
-navigation obstruction — with the limitation written at the top of it.
-
-### What does work: the depth camera, which points where the arm goes
-
-Deproject the depth image into the base frame and ask what sits IN FRONT of the fitted
-panel plane, on the robot's side. The separation is not marginal:
-
-| | mm in front of the panel plane |
+| | mm in front of the plane |
 |---|---|
-| the wall behind | **-127** |
-| empty scene, 99.9th percentile of 56,813 pixels | **+4** |
-| empty scene, maximum | **+21** (the buttons' own protrusion) |
-| a hand in the gap | **+197**, over 20.8% of the view |
+| the wall behind | −127 |
+| empty scene, 99.9th pct of 56,813 px | **+4** |
+| empty scene, max | +21 (the buttons' own protrusion) |
+| a hand in the gap | **+197**, over 20.8 % of the view |
 
-So 40 mm is not a tuned edge, it is the middle of a wide empty band. Checked from a
-fresh frame immediately before EVERY button's motion, with the arm at home — which is
-outside the camera's view by design, so the robot's own limbs are not what it detects.
-
-Verified on hardware: `1` pressed normally (-3.12 mm, lateral 0.27 mm), a hand went in,
-and `4` was refused with IK, 52 mm clearance and self-collision all passing. The arm
-stayed home and the run exited 1.
-
-Two limits, deliberately not papered over: it sees only the camera's field of view, and
-it is a check BEFORE the motion — the arm is out for seconds afterwards and nothing
-watches that window.
-
-### Waypoints: readable, not writable, and one of them docks badly
-
-A colleague added a `BBB` waypoint. Driving to it exposed two things:
-
-- **The API cannot write the map.** Both POI *list* endpoints answer 200, but fourteen
-  plausible write paths all return 404, so `BBB` had to be repositioned from the
-  AutoXing app rather than from here. Probed by sending the record's existing values,
-  so nothing was changed while finding that out.
-- **Docking quality is a property of the SPOT, not of the base or of our gate.** Same
-  ~2.5 m distance, three destinations:
-
-  | destination | time | how it ended |
-  |---|---|---|
-  | `BBB` (first position) | 121 s | four docking attempts, `moveState` **`failed`** three times |
-  | `BBB` (moved 50 cm) | 78 s | reached 4 cm, reported `obstruction`, backed off, stopped 21 cm short and declared success |
-  | `elevator test` | **20 s** | straight in, 2 cm, first try |
-
-  `moveState: failed` is a value we had not seen before — the base rejecting its own
-  docking attempt while the position was already 3 cm off target. The fast gate
-  correctly refused it (it only accepts `succeeded`/`success`/`finished`/`completed`),
-  and the base recovered on its fourth try.
-
-  `BBB` has since been moved onto the pose the robot actually reached. **That position
-  is unverified** — the robot was driven there by hand, not navigated to it, so
-  whether it docks cleanly is still an open question.
-
-### The terminal now follows the robot instead of lagging it
-
-The operator's complaint was that the display trailed the robot badly. Measured, SSH
-was never the cause: 108 ms RTT, and 0.16 s per call once `ControlMaster` reuses the
-connection (0.6 s without). The cause was waiting for a job to EXIT before looking at
-its log — which turned a press into 40-70 s of blank terminal, and then the waiting
-command itself timed out and went to the background on top of that. One measured gap
-was **2 min 40 s** during which the robot drove and pressed.
-
-`press_stream.sh` and `liverun_stream.sh` run the job and `tail -f` its log instead.
-Measured lag: **2 s**, which is the floor — the runner's own data comes from the cloud
-and the base reports event-driven.
-
-## ▶ TWO FAILURES THAT LOOKED LIKE BAD LUCK WERE BOTH SELF-INFLICTED (2026-08-28)
-
-Three live runs failed today with the panel in view and the robot in the right place.
-Neither cause was what it first looked like, and in both the instrumentation to tell
-the difference did not exist until it was added.
-
-| | |
-|---|---|
-| `1 4 2 5` after driving | **4/4 lit, lateral 0.09 mm** (best of the day) |
-| per-button lift heights | recorded for the first time — see below |
-| localisation on the failing frame | residual 11.3 px (refused) -> **1.7 px** |
-| a base parked 5 cm from the goal but never saying "done" | waited **6+ minutes** -> now handled in 90 s |
+0.000 % of an empty scene passes 30 mm, so the 40 mm threshold is the middle of a wide
+band, not a tuned edge. Checked from a fresh frame before EVERY button, with the arm at
+home — outside the camera's view by design, so it detects the world and not the robot.
+Verified on hardware: `1` pressed normally, a hand went in, `4` was refused with IK,
+52 mm clearance and self-collision all passing. Limits stated rather than hidden: it
+sees only the camera's field of view, and it checks *before* the motion, not during.
 
 ### The ROI could not look where the detector had missed
 
 The full-frame pass scales 1280x720 into the model's 640, so a 44 px button becomes
-~22 px — and a whole edge ROW dropped out. Measured on the failing frame:
-
-| | `open` | `close` |
-|---|---|---|
-| full frame | 0.16 (labelled `keyhole`) | **0.06** |
-| a crop of that row alone, 4x | **0.91** | **0.96** |
-
-The buttons were perfectly detectable. But the ROI is derived FROM the full-frame
-detections, so a missed bottom row put the ROI's bottom edge above it, the refined pass
-never looked there, and the lattice fit was handed four rows for a five-row layout:
-residual 11-12.5 px against a 6 px threshold, **refused on 15 of 15 attempts**. A
-failure that seals itself — what the first pass cannot see, nothing later can.
+~22 px and a whole edge row can drop out — `open`/`close` scored **0.16 and 0.06** full
+frame against **0.91 and 0.96** on a crop of that row alone. The ROI is derived FROM
+those detections, so the missed row put the ROI's edge above it, the refined pass never
+looked there, and the lattice got four rows for a five-row layout: **refused 15 of 15
+attempts with the panel plainly in view**. A failure that seals itself.
 
 Fix: when fewer rows or columns are found than the layout registers, grow the ROI by
-the MISSING count times the measured pitch. Bounded by what is missing rather than a
-bigger blanket margin, so a complete grid grows by nothing and frames that work today
-are untouched. On the failing frame: bottom edge 410 -> 463 px, still 81 px clear of
-the cabinet keyhole at 544 that the clustering exists to exclude.
+the MISSING count times the measured pitch. Bounded by what is missing, so a complete
+grid grows by nothing and working frames are untouched. Bottom edge 410 -> 463 px,
+still 81 px clear of the cabinet keyhole the clustering exists to exclude.
 
-**The first hypothesis was wrong, and measuring is what killed it.** The scene was
-blown out and the obvious suspect was the light. But the missed row measured mean/std
-192.8/47.9 against 190.4/49.1 for a row that WAS found — indistinguishable. Brightness
-was not the variable.
+**The first hypothesis was wrong and measuring killed it.** The scene was blown out and
+the light was the obvious suspect, but the missed row measured mean/std 192.8/47.9
+against 190.4/49.1 for a row that WAS found. Brightness was not the variable.
 
-### "Slower than usual" and "stuck" were the same condition
+### The terminal follows the robot now
 
-A drive took **316 s** where the same route normally takes 56 s — 9.30 m against
-8.77 m, i.e. nearly the same path at a fifth of the speed. The 300 s wall-clock budget
-gave up **6 s** before that task completed, with the robot already 3 cm from the
-target, and killed the pre-warmed press with it.
+Measured, SSH was never the cause: 108 ms RTT, 0.16 s per call with `ControlMaster`
+(0.6 s without). The cause was waiting for a job to EXIT before reading its log — which
+turned a 40-70 s press into a blank terminal, and the waiting command then timed out
+into the background on top. One measured gap was **2 min 40 s** while the robot drove
+and pressed. `press_stream.sh` and `liverun_stream.sh` `tail -f` instead: **2 s**, which
+is the floor, since the data comes from the cloud and the base reports event-driven.
 
-So the timeout became a STALL timeout: time since the base last moved. Then the first
-version of that was wrong too — it counted `hasObstruction`/`hasPersonAhead` as
-progress, reasoning that a base with a reason to wait is not stalled. Measured: the
-base finished its 7.22 m route, stopped 5 cm from the elevator point, and held
-`moveState=moving, speed=0, hasObstruction=True` for **over six minutes** without
-moving a millimetre. That version would have waited out the entire 900 s cap — worse
-than the 300 s being complained about.
-
-**Progress now means motion: position change or non-zero speed.** Motion is a fact;
-"there is an obstruction" is an opinion, and the two come apart exactly when it matters.
-
-And a stall AT the target is not a failure — that six-minute case was the base parked
-where it was asked and simply never declaring success. When the stall fires inside
-tolerance the task is CANCELLED first, so nothing can command a late docking nudge
-while the arm is out, stillness is re-confirmed, and that counts as arrival. Not the
-camera-based guess that drove the arm into the panel once: this is the base's own
-odometry showing no motion over a long window, with nothing left that could move it.
-
-**Two corrections here, in opposite directions.** I first reported the 316 s drive as
-an avoidance manoeuvre from mileage and duration alone, with nothing observed to
-support it. Pushed on that, I retracted it — and the retraction was also wrong. The
-obstructions were people and chairs put in the robot's path deliberately, to test that
-it stops and re-routes (operator-confirmed). What I had actually established was
-narrower than either claim: **a blocked path reports as `hasObstruction`, not
-`hasPersonAhead`**, so `hasPersonAhead == False` never meant "no person". The lesson is
-not "guess less" but "say what was measured": the flag was measured, the cause was not.
-
-### The base's situation is now logged whenever it changes
-
-A slow drive has to be diagnosable after the fact. moveState, moving/stopped,
-personAhead/obstruction, distance to go — a handful of lines per drive. It immediately
-paid for itself twice: it identified the obstruction above, and it caught the base
-declaring a task **"succeeded" while still 95 cm short**, which the corrective drive
-then closed to 7.9 cm in 25 s. The corrective drive now shares `wait_for_arrival`
-rather than carrying its own copy, so it gets the fast gate too.
-
-### Per-button lift heights, recorded at last
-
-| button | lift | body | joint margin | rolls | depth | lateral |
-|---|---|---|---|---|---|---|
-| `1` | 443 -> 744 | +150 mm | 49.9 deg | 24/24 | -3.08 mm | 0.39 mm |
-| `4` | 744 -> 894 | +75 mm | 55.4 deg | 24/24 | -2.99 mm | 0.31 mm |
-| `2` | 894 -> 794 | **-50 mm** | 55.2 deg | 24/24 | -3.01 mm | 0.32 mm |
-| `5` | 794 -> 894 | +50 mm | 49.6 deg | 24/24 | -3.02 mm | 0.22 mm |
-
-Clearance 52 mm throughout. The torso moves both ways, not just up.
-
-### Obstacle handling, verified
-
-Deliberately blocked with people and chairs, the base stops, waits, re-routes and still
-reaches the point. Measured today:
-
-| block | what happened |
-|---|---|
-| 17 cm from the point | held 63 s, escaped, completed the route, arrived at **0.4 cm** -> 4/4 lit |
-| mid-route | 9.30 m travelled against a nominal 8.77 m -> arrived |
-| at the docking point | declared "succeeded" 95 cm short; corrective drive closed it to 7.9 cm in 25 s -> 4/4 lit |
-
-This is normal operation on a real floor, not an exception — which is precisely why the
-stall timeout keys on MOTION and not on elapsed time. A run that gives up because the
-drive was slow is a run that gives up whenever anyone walks past.
+### Also
+- **`poll_timeout_sec` is now a STALL timeout, and progress means MOTION.** Measured
+  from dispatch it conflated "slow" with "stuck": a blocked drive took 316 s against a
+  normal 56 s, and the 300 s budget gave up 6 s before it finished, 3 cm from target. A
+  first fix counting `hasObstruction` as progress was worse — the base held that flag
+  for **six minutes** parked 5 cm from its goal without moving. A stall inside tolerance
+  now cancels the task first, re-confirms stillness, and counts as arrival.
+- **Obstacle handling verified.** Blocked deliberately with people and chairs, the base
+  stops, re-routes and still arrives: a block 17 cm from the goal held it 63 s, after
+  which it completed and docked at **0.4 cm**. Blocking reports as `hasObstruction`, not
+  `hasPersonAhead` — I got the causation wrong in both directions before measuring it.
+- **The base's situation is logged whenever it changes** during a drive. It immediately
+  caught the base declaring a task "succeeded" while still **95 cm** short; a corrective
+  drive closed that to 7.9 cm in 25 s.
+- **Per-button lift heights, recorded at last**: 443 -> 744 -> 894 -> 794 -> 894, margins
+  49.6-55.6 deg, 24/24 rolls, 52 mm clearance throughout. The torso moves both ways.
+- **Our AutoXing credentials are read-only for the map.** Both POI list endpoints answer
+  200; fourteen plausible write paths all 404. Probed by sending a record's existing
+  values, so nothing changed while finding out.
+- **Docking quality is a property of the SPOT.** Same ~2.5 m: `BBB` took 121 s and four
+  attempts (`moveState: failed`, a value not seen before); moved 50 cm, 78 s, stopping
+  21 cm short; `elevator test` took **20 s** straight in to 2 cm.
 
 ### Still open
 - Second independent cross-check of the re-measured plunger TCP (still one touch).
-- Whether `BBB`'s new position docks cleanly. The robot was driven there, not
-  navigated to it, so the thing that was wrong with the old position is untested at
-  the new one.
-- Why the base reports an obstruction at the docking point at all. It is handled now,
-  but handled is not understood — the cabinet the faceplate is mounted on is the
-  obvious candidate and has not been confirmed.
+- Whether `BBB`'s new position docks cleanly — the robot was driven there, not
+  navigated to it, so the problem with the old position is untested at the new one.
+- Why the base reports an obstruction at the docking point at all. Handled is not
+  understood; the cabinet the faceplate is mounted on is the obvious candidate.
 
 ## ▶ THE WAIT AT THE ELEVATOR IS GONE, AND THE TORSO NOW MOVES (2026-08-27)
 
