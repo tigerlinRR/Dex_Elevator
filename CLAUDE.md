@@ -450,6 +450,13 @@ shared box); credentials live in a gitignored `.env`.
 - This map uses none of the AutoXing elevator POI types (`[6, 28]`) — the elevator point
   is type 11 like any other waypoint — so the UI's auto-highlight never fires and the
   operator picks the point by name.
+- **Our AutoXing credentials are READ-ONLY for the map.** `/map/v1.1/poi/list` and
+  `/map/v2.0/poi/list` answer 200; fourteen plausible write paths (`poi/update`,
+  `poi/edit`, `poi/save`, `poi/create`, `poi/delete`, `feature/update`, PUT `/poi`, …)
+  all return 404. So waypoints can be listed and driven to, but not moved or created —
+  that is done in the AutoXing app. Probe such an API by sending a record's EXISTING
+  values: on a shared production map, discovering that a write endpoint works by
+  having changed something is the wrong way to find out.
 - **Arrival is gated on the BASE, not on the cloud's task status** (`base_arrived` +
   `wait_for_arrival`, 2026-08-27). `robot_state` is a level below the task: it carries
   the base's own `moveState`, `speed`, `hasPersonAhead`, `locQuality` and `battery`,

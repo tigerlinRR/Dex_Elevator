@@ -58,6 +58,32 @@ Two limits, deliberately not papered over: it sees only the camera's field of vi
 it is a check BEFORE the motion — the arm is out for seconds afterwards and nothing
 watches that window.
 
+### Waypoints: readable, not writable, and one of them docks badly
+
+A colleague added a `BBB` waypoint. Driving to it exposed two things:
+
+- **The API cannot write the map.** Both POI *list* endpoints answer 200, but fourteen
+  plausible write paths all return 404, so `BBB` had to be repositioned from the
+  AutoXing app rather than from here. Probed by sending the record's existing values,
+  so nothing was changed while finding that out.
+- **Docking quality is a property of the SPOT, not of the base or of our gate.** Same
+  ~2.5 m distance, three destinations:
+
+  | destination | time | how it ended |
+  |---|---|---|
+  | `BBB` (first position) | 121 s | four docking attempts, `moveState` **`failed`** three times |
+  | `BBB` (moved 50 cm) | 78 s | reached 4 cm, reported `obstruction`, backed off, stopped 21 cm short and declared success |
+  | `elevator test` | **20 s** | straight in, 2 cm, first try |
+
+  `moveState: failed` is a value we had not seen before — the base rejecting its own
+  docking attempt while the position was already 3 cm off target. The fast gate
+  correctly refused it (it only accepts `succeeded`/`success`/`finished`/`completed`),
+  and the base recovered on its fourth try.
+
+  `BBB` has since been moved onto the pose the robot actually reached. **That position
+  is unverified** — the robot was driven there by hand, not navigated to it, so
+  whether it docks cleanly is still an open question.
+
 ### The terminal now follows the robot instead of lagging it
 
 The operator's complaint was that the display trailed the robot badly. Measured, SSH
@@ -182,6 +208,9 @@ drive was slow is a run that gives up whenever anyone walks past.
 
 ### Still open
 - Second independent cross-check of the re-measured plunger TCP (still one touch).
+- Whether `BBB`'s new position docks cleanly. The robot was driven there, not
+  navigated to it, so the thing that was wrong with the old position is untested at
+  the new one.
 - Why the base reports an obstruction at the docking point at all. It is handled now,
   but handled is not understood — the cabinet the faceplate is mounted on is the
   obvious candidate and has not been confirmed.
