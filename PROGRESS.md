@@ -91,9 +91,12 @@ is the floor, since the data comes from the cloud and the base reports event-dri
   21 cm short; `elevator test` took **20 s** straight in to 2 cm.
 
 ### Still open
+- **NEXT: navigate to `BBB`'s new position** (25.319, -13.703) from the elevator point
+  and watch whether it docks cleanly. The waypoint was moved onto the pose the robot
+  reached, but the robot was DRIVEN there rather than navigated to it, so the thing that
+  was wrong with the old position is untested at the new one. `elevator_runner/goto.py
+  BBB` does exactly this and streams the base's situation.
 - Second independent cross-check of the re-measured plunger TCP (still one touch).
-- Whether `BBB`'s new position docks cleanly — the robot was driven there, not
-  navigated to it, so the problem with the old position is untested at the new one.
 - Why the base reports an obstruction at the docking point at all. Handled is not
   understood; the cabinet the faceplate is mounted on is the obvious candidate.
 

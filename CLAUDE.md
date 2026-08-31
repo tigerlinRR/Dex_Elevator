@@ -546,6 +546,20 @@ shared box); credentials live in a gitignored `.env`.
   closed it to 7.9 cm in 25 s. This is what `corrective_drives` exists for; it also
   goes through the same `wait_for_arrival`, so it gets the fast gate too.
 
+**Test harnesses for the drive + press loop** (`elevator_runner/`, added 2026-08-31 —
+they existed only on the robot before, which meant re-deriving them after any reset,
+and stray `.py` files at the repo root shadow the stdlib):
+- `liverun.py` — ONE live loop: `AAA` -> `elevator test`, press `1 4 2 5`. Pre-flight
+  checks e-stop, both arm controllers and the base being online BEFORE dispatching,
+  because an earlier attempt spent two route dispatches and ten minutes discovering
+  from a timeout that the e-stop was engaged.
+- `goto.py <waypoint>` — drive to a named waypoint. Uses the same `wait_for_arrival`,
+  so it behaves like a real run rather than being a second, differently-behaved path.
+- `liverun_stream.sh` / `initialization/press_stream.sh` — run the job and `tail -f` its
+  log. Use these, not "wait for it to exit": see the streaming note under Common
+  commands.
+- `start_runner.sh` — start the Flask runner detached and wait until 8765 is listening.
+
 **Pressing on its own** (`press_buttons.py --auto`) — waits until the panel is both
 visible AND still (5 consecutive frames within 2 mm), then presses ONCE and exits;
 re-running is the manual re-trigger, it never re-arms itself. The trigger is the
