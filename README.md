@@ -174,6 +174,36 @@ With `--lift`, the torso goes to each button's **best-margin height** rather tha
 it picks carry the largest joint margins available. Both objectives choose only from poses that
 already passed the joint-limit, wrist, self-collision and clearance checks.
 
+## Usage — driving the base in a straight line
+
+The chassis has a local LAN API (`192.168.25.25:8090`) that takes wheel velocities
+directly, bypassing AutoXing's cloud planner. That matters because the cloud's only
+abstraction is "go to this point" and its planner prefers to turn, while entering and
+leaving an elevator has to be straight in and straight out. Here the angular velocity is
+pinned to zero, so straight is structural rather than lucky.
+
+```bash
+python3 initialization/drive_straight.py state        # read-only: mode, estop, alerts
+python3 initialization/drive_straight.py clearance    # read-only: lidar corridor
+python3 initialization/drive_straight.py move 2.0     # forward 2 m (signed metres)
+python3 initialization/drive_straight.py move -- -2.0 # back 2 m
+python3 initialization/drive_straight.py calibrate    # achieved vs commanded distance
+```
+
+Measured over `+-2 m`: **1.5–2.9 cm of distance error, 9–43 mm lateral, under 1.2° of
+heading change**. Before any motion it checks the chassis serial number (this network
+carries other people's robots) and gates on the **lidar** clearance in the direction of
+travel; a stall aborts on battery current (30 A into an obstacle vs ~5 A driving); and
+every exit path brakes and restores `auto` mode, because leaving the base in `remote`
+silently disables AutoXing navigation.
+
+Two live browser previews help position the robot by hand, both read-only:
+
+```bash
+python3 initialization/lidar_preview.py   # top-down lidar, port 8011
+python3 initialization/aim_preview.py     # chest camera + button detection, port 8010
+```
+
 ## Usage — button detector (YOLO)
 
 No in-house elevator dataset exists yet, so the detector is bootstrapped from public **CC BY**
@@ -428,8 +458,12 @@ Still to do:
   Registering a layout is not the same as hard-coding the panel's position in space, which
   stays live-measured.
 - Implement **`read_floor_label`** (the "which floor" reader) — currently a stub.
-- **Press after driving and re-docking** — everything is already measured live per approach, but
-  it has never been tried.
+- ~~**Press after driving and re-docking**~~ — DONE. Verified 2026-08-26 at three different
+  stopping positions (worst docking error absorbed: 123 mm further out, 44 mm sideways,
+  4.5 deg of yaw), and again 2026-08-31 as one command end to end: `elevator_runner/liverun.py
+  BBB` drives `BBB` -> `elevator test` and presses `1 4 2 5`, **3 of 3 runs with 4/4 buttons**,
+  arriving 0.9-2.3 cm from the elevator point. Only the elevator point's docking accuracy
+  matters — the same runs stopped 3-68 cm from the *start* waypoint with no effect on the press.
 - Visual confirmation that a press registered: the plunger occludes the button, and the exposure
   that makes digits legible saturates the indicator lamp, so the two need different exposures.
 - Force-limited press (RealMan `rm_force_position_move_pose`) — optional now that the spring

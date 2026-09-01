@@ -434,6 +434,78 @@ are used (both permit commercial use with attribution); NC or unlicensed data is
 data. The largest academic set (CUHK, 3,718 images / 35,100 labels, arXiv 2103.09030) is **not**
 used — its download link is dead and it states no licence.
 
+**Driving the base LOCALLY, in a straight line** (`initialization/drive_straight.py`,
+2026-09-01) — the chassis has its own LAN API, independent of AutoXing's cloud:
+
+```
+POST http://192.168.25.25:8090/services/wheel_control/set_control_mode
+     {"control_mode":"remote","mode":"remote"}
+ws://192.168.25.25:8090/ws/v2/topics
+     -> {"enable_topic":"/tracked_pose"}
+     -> {"topic":"/twist","linear_velocity":v,"angular_velocity":0}
+     <- /tracked_pose{pos,ori}, /scan_matched_points2, /slam/state, /wheel_state,
+        /battery_state, /alerts, /planning_state
+```
+
+**Why it exists**: the cloud API's only abstraction is "go to this point", and its
+planner decides how — it prefers to turn. Entering and leaving an elevator has to be
+straight in and straight out to make the door window, and a planner that happened not
+to turn this time is not a guarantee. Here the angular velocity is pinned to 0 with no
+planner in the loop, so straight is structural. Measured `+-2 m`: **1.5-2.9 cm of
+distance error, 9-43 mm lateral, under 1.2 deg of heading change**.
+
+**Where the chassis actually is, because three earlier answers were wrong.** It is
+`192.168.25.25`, on the robot's OWN WIRED network — the same cable as the arms, but a
+**different subnet**, only reachable once the Jetson's `eno1` also carries
+`192.168.25.46`. Things that are NOT the chassis, each of which cost a detour:
+- `192.168.11.35` is a **`LubanCat-4` / EmbedFire Android 12 board** doing iFlytek AIUI
+  voice + face HRI (ports 9070/9080/9090 audio-video, 19199 AIUI control, 5555 ADB).
+  All 65535 ports scanned: no control interface. Do not look for 8090 here.
+- `192.168.11.34` is an lwIP device with HTTP Basic auth on port 80 — still unidentified.
+- Three AutoXing chassis DO answer `/device/info` on the WiFi subnet
+  (`192.222.10.102/.161/.235`) and **none of them are ours** — they are other people's
+  `longjack` and `hawk_longtray` robots. `drive_straight.py` checks the serial
+  (`1352512k06960Og`) before it will send anything, and that check is not optional.
+
+So this robot's parts sit on **three mutually unreachable networks** (Jetson wired,
+Jetson WiFi, chassis subnet), which is why everything local had to go through the cloud
+until now.
+
+**Four measured facts the driver is built around:**
+- **twist keepalive must be >=20 Hz.** At ~4 Hz the base's watchdog stopped the wheels
+  after 2.3 cm, which reads exactly like "the command was rejected".
+- **`/tracked_pose` is 1.07 Hz AND repeats the same value while moving** (SLAM settles
+  late). See the gotcha below — this single fact produced five wrong conclusions.
+- **achieved/commanded distance is 0.90**, so the leg duration is divided by it.
+- **braking coasts ~11 cm at 0.2 m/s**, so the last 18 cm ramps down to a 0.06 m/s creep.
+
+**Safety, in the order it applies**: serial check -> lidar clearance gate (before any
+twist) -> current-based stall abort -> heading/estop/timeout -> brake and restore
+`auto` on EVERY exit path. Leaving the base in `remote` silently disables AutoXing
+navigation for whatever runs next, so the restore is retried three times and shouted
+about if it fails. Note the base's own move controller is NOT in the loop: nothing
+avoids obstacles *during* the motion, the clearance gate is a check *before* it.
+
+**Obstacle sensing for the BASE is the lidar, not a camera** (`/scan_matched_points2`).
+360 degrees, ~870 points/frame, map coordinates, **1.87 Hz with 74 ms median transport
+latency**. Transformed into the body frame it gives forward AND back clearance in one
+shot — which the chest camera structurally cannot do, since it faces only the arm side;
+reasoning about the other direction from it produced a wrong "it hit a wall". Verified
+against a person standing 0.9 m away: **two clusters, 14-15 cm wide, 32 cm apart** —
+two shins, and the gate refused to move.
+
+**The three sensors see different HEIGHTS and cannot substitute for each other:**
+
+| sensor | sees | owns |
+|---|---|---|
+| chassis lidar | z ~ 0, a **7 cm** thick plane (14,800 points spanned 0.07 m) | base obstacles: people, chairs, walls, door frames |
+| **arm-mounted camera** (planned) | the panel, from wherever the arm puts it | button detection and press verification |
+| chest camera | the arm's workspace at 0.7-1.2 m | assisting: workspace clearance before the arm moves |
+
+The lidar cannot see a hand reaching toward the panel (half a metre above its plane),
+nor low objects or overhangs outside that plane. The chest camera cannot see behind the
+robot. Neither gap is fixable by configuration.
+
 **Driving to the panel** (`elevator_runner/`, a Flask tool on the robot) — loads the
 robot's waypoints from **AutoXing's cloud API**, drives a chosen route, and when the
 robot arrives within tolerance of the point marked as the elevator, runs
@@ -545,16 +617,49 @@ shared box); credentials live in a gitignored `.env`.
   declared success at **95 cm** from the elevator point, and the corrective drive
   closed it to 7.9 cm in 25 s. This is what `corrective_drives` exists for; it also
   goes through the same `wait_for_arrival`, so it gets the fast gate too.
+- **Only the ELEVATOR point's docking accuracy matters; a route's other waypoints are
+  places to drive FROM** (measured 2026-08-31). `BBB` docks badly and inconsistently —
+  **3.0 / 7.6 / 8.6 / 26 / 68 cm** from its point over five navigated trips, 2 of 5
+  inside 8 cm — while `elevator test` closed to **1.5-2.3 cm on nine of nine arrivals**
+  the same day. It changes nothing: a run that stopped ~17 cm from `BBB` drove on,
+  reached the elevator point at **0.9 cm** and pressed **4/4**. Do not treat a start
+  waypoint's docking error as a blocker, and do not measure it as if it were.
+  Docking quality is a property of the SPOT: at `BBB` the base stops wherever it is,
+  declares `moveState: succeeded` and never converges — no `hasObstruction`, no
+  `hasPersonAhead`, no `failed` — and re-recording the waypoint onto a reached pose did
+  not fix it. Yaw there IS repeatable (4.43-4.45), so orientation is not the variable.
+  **The arrival gate is not what fails**: the fast base gate correctly refused the 26 cm
+  and 68 cm cases, and what returned "finished" was the cloud task-status backstop, which
+  does not look at distance. `run_loop` re-reads the position afterwards and gates on the
+  measured error, so those go to `corrective_drives` rather than to the arm.
+
+**Live previews for positioning the robot by hand** (both read-only, both safe to leave
+running — neither commands anything):
+- `initialization/lidar_preview.py` — top-down chassis lidar in a browser (port 8011):
+  forward/back clearance inside the base's own width, corridor width, and **which side
+  it is off-centre**, which a single "nearest obstacle" number hides.
+- `initialization/aim_preview.py` — chest camera with live button detection, bearing off
+  the camera axis, distance, and the panel's position in the ARM BASE frame (port 8010),
+  plus a READY/NOT READY banner. Built because aiming the robot at a panel by hand
+  otherwise meant grab a still, copy it off, look, nudge, repeat.
+  Both are reachable from the dev Mac now that it shares the robot's WiFi subnet, so
+  `--web`-style previews no longer need the Ethernet cable.
 
 **Test harnesses for the drive + press loop** (`elevator_runner/`, added 2026-08-31 —
 they existed only on the robot before, which meant re-deriving them after any reset,
 and stray `.py` files at the repo root shadow the stdlib):
-- `liverun.py` — ONE live loop: `AAA` -> `elevator test`, press `1 4 2 5`. Pre-flight
-  checks e-stop, both arm controllers and the base being online BEFORE dispatching,
-  because an earlier attempt spent two route dispatches and ten minutes discovering
-  from a timeout that the e-stop was engaged.
+- `liverun.py [start] [floors]` — ONE live loop: drive via `start` (default `BBB`, `-`
+  skips it) to `elevator test`, then press `floors` (default `1 4 2 5`). Verified
+  2026-08-31: `BBB` -> elevator -> `1 4 2 5` ran **3 of 3, 4/4 buttons each**, arrival
+  0.9-2.3 cm, 66.9-68.1 s per press. Pre-flight checks e-stop, both arm controllers and
+  the base being online BEFORE dispatching, because an earlier attempt spent two route
+  dispatches and ten minutes discovering from a timeout that the e-stop was engaged.
 - `goto.py <waypoint>` — drive to a named waypoint. Uses the same `wait_for_arrival`,
   so it behaves like a real run rather than being a second, differently-behaved path.
+  **Read the cm figure it prints, never its `arrived=` flag**: it passes a 15 cm
+  tolerance where production uses 8 cm, and it prints `wait_for_arrival`'s return value
+  without the position gate that follows it in `run_loop` — so it reported
+  `arrived=True` while parked 68 cm from the point.
 - `liverun_stream.sh` / `initialization/press_stream.sh` — run the job and `tail -f` its
   log. Use these, not "wait for it to exit": see the streaming note under Common
   commands.
@@ -628,6 +733,40 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   button was unreachable — single-button retests proved otherwise. Use
   `RealmanArm.move_joints_sync` / `move_line_sync`, which poll joints/TCP until
   arrival, retry 3x, and settle 0.35 s between moves.
+- **`/tracked_pose` is 1 Hz and REPEATS ITSELF while the base is moving — never read
+  it as live feedback.** Measured 1.07 Hz (median gap 1.03 s), and consecutive messages
+  carry the same value during motion because SLAM settles late. At 0.2 m/s that is a
+  20 cm position resolution, against an elevator reachable window of +-8 cm. Reading it
+  as if it were live produced FIVE wrong conclusions in one session: a 0.20 m move
+  "overshooting" to 0.31 m; three separate "STALLED — something is in the way" aborts
+  while the robot was driving at 0.18 m/s; and a "wheel slip" that cut a move short.
+  The clean measurement that settled it — 100 twists over 5 s, **120 `/twist_feedback`
+  replies, 0.903 m travelled, 0.181 m/s** — showed the chassis had been executing
+  perfectly the whole time. Drive distance **open-loop on time** with the calibrated
+  0.90 ratio; use the pose only for a settled before/after measurement (0.0 mm of
+  scatter while stationary) and a correction leg.
+- **`/slam/state`'s `wheel_slipping` is not a stall signal.** It goes true during
+  ordinary driving — it cut a 1.00 m move short at 0.695 m while the current sat at a
+  healthy 5.7 A. Like the pose, it is unreliable *while moving*. Log it, never abort on
+  it; the distance loop reads before/after pose rather than odometry, so a slip cannot
+  corrupt the measurement anyway.
+- **Stall detection uses battery CURRENT.** Driving into the charging dock drew
+  **30.4 A** against ~4.4 A idle and ~5 A driving normally, with zero displacement. It
+  is a physical quantity with no SLAM lag. 20 A held for 0.8 s. (`/battery_state` is
+  also only ~1 Hz, so pair it with the lidar gate rather than relying on it alone.)
+- **Restore `control_mode` to `auto` on every exit path.** Leaving the chassis in
+  `remote` silently disables AutoXing navigation for whatever runs next, and nothing
+  warns you — the next cloud task simply does not move. `/wheel_state` reports the mode,
+  so it can be verified rather than assumed.
+- **Re-assert `remote` and keep sending zero twist between legs.** A 2-3 s gap with no
+  twist at all appears to drop the base out of its remote-driving state, which showed up
+  as "the first leg always moves and every later one stops after a few centimetres".
+- **A chassis reboot clears some alerts and a stuck action, but not all.** It cleared
+  `6007` (head_unit link) and a `charge / failed / platform_alert_error` action that had
+  been stuck in `/planning_state`, leaving the base `idle`; `6010 System down
+  unexpectedly!` and `9502 Debugging config file exists` survived, and `6007` came back
+  later. Confirm a reboot actually happened by watching `planning_state.action_id` reset
+  — the first time, it did not (`action_id` stayed 643) and nothing had changed.
 - **Killing the local process does NOT stop the robot.** An AutoXing task is executed
   by the cloud, not by our process: after `kill -9` on the runner the base carried on
   and drove the rest of its route by itself. Stopping means cancelling the task
@@ -691,6 +830,13 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   in ~25 s. Note the misleading first hypothesis: the failure appeared right after
   TensorRT was added to the same process, so it looked like engine init was starving
   the camera stream; reordering changed nothing, and the camera failed on its own too.
+  **It costs a whole drive when it hits mid-run, and nothing recovers automatically**
+  (seen 2026-08-31): the pre-warm died on it, the runner fell back to a serial press, and
+  the press then died the same way — `successes=0 failures=1` after driving the full
+  route. Two API details for the reboot: `Context` and `DeviceList` must be held in LIVE
+  references (temporaries fail with `NULL pointer passed for argument "deviceMgr"`), and
+  the device re-appears in `query_devices()` within ~2 s while still delivering nothing,
+  so poll an actual `capture()` rather than enumeration.
 - **`pip install --extra-index-url` will happily pick the WRONG index.** The
   jetson-ai-lab index and PyPI both offer `torch==2.10.0`; with both indexes visible pip
   chose PyPI's **CPU** build and `torch.cuda.is_available()` stayed False. Install GPU
@@ -830,6 +976,32 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   `cp -r ~/pyorbbecsdk/install/lib/pyorbbecsdk/. ~/.local/lib/python3.10/site-packages/pyorbbecsdk/`.
 
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
+
+- **Camera moving to the ARM** (decided 2026-09-01, not built). The chest camera is
+  fixed, so the positions where it can SEE the panel and where the arm can REACH it must
+  overlap — and at the new site they do not: the panel sits at `y = -0.55, z = +0.69` in
+  the arm base frame, where **336 combinations (14 lift heights x 24 approach rolls)
+  have no IK solution**, while detection was perfectly healthy (lattice residual
+  0.7-0.9 px). Mounting the camera on the arm decouples viewing from standing position.
+  What it costs, to be planned together: a different calibration problem
+  (`gripper_T_camera`; the existing `cam_chest.npy` and its 41 samples are void), a
+  geometry chain that can no longer treat `base_T_camera` as constant, cabling along the
+  arm, measurements only while stationary, and — most importantly — **the obstacle check
+  breaks**: it currently works because the home pose puts the arm entirely outside the
+  chest camera's view, so the depth image shows the world and not the robot's own limb.
+  With the camera on the arm that property is gone.
+- **Which floor the car is on** — unsolved, and the next perception problem after the
+  above. Three candidate signals, to be COMBINED and chosen per site rather than picked
+  blindly, because they fail in different ways:
+  - **button lamps** (lit/unlit) — occluded by the plunger during a press, and the
+    locked exposure that makes digits legible saturates the lamp;
+  - **the elevator's own floor display** — may not exist, may be outside any camera's
+    view, and its font/format varies per building;
+  - **the robot's IMU** — vertical acceleration integrates to which way and how far the
+    car moved, needs no view of anything, but drifts and cannot give an absolute floor
+    without a known starting point.
+  Whichever is used, the system should state which signal it is relying on rather than
+  fusing them into an unattributable answer.
 
 - Button YOLO: tooling BUILT + a **multi-class** baseline trained (yolo11m — detects AND
   identifies each floor) → `data/weights/buttons.pt`, and **running on the Orin's GPU** via

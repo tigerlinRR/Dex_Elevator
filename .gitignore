@@ -315,3 +315,12 @@ README.zh-CN.md
 elevator_runner/.env
 elevator_runner/config.json
 elevator_runner/__pycache__/
+
+# Reference scripts from a colleague's DEX, kept locally for their protocol only.
+# NOT committed: they target another machine (different chassis, suction gripper), and
+# the repo root must contain no .py files at all — a flattened rsync once put the whole
+# package here and every python started from the repo root died with a circular import
+# out of enum/dataclasses. What mattered from chassis_ctl.py (the 8090 twist protocol)
+# is written up in CLAUDE.md instead.
+/chassis_ctl.py
+/gripper_ctl.py
