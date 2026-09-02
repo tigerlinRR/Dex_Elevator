@@ -2,6 +2,92 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE BASE TURNS IN PLACE, AND PRESSED 4/4 AT A NEW SITE IT DROVE ITSELF TO (2026-09-02)
+
+The robot went from the charging dock to a pressable pose under its own power — straight
+legs plus the new in-place turn — and pressed four buttons. **4/4 in 62.8 s**, depth
+−3.00 to −3.10 mm against a commanded −3.00, lateral 0.16–0.34 mm, which is the same
+accuracy as the best runs at the old cell.
+
+| button | lift | joint margin | rolls passing | depth | lateral |
+|---|---|---|---|---|---|
+| `1` | 441 → 644 | 54.0° | 14/24 | −3.00 mm | 0.30 mm |
+| `4` | 644 → 544 | 50.9° | **1/24** | −3.05 mm | 0.28 mm |
+| `open` | 544 → 644 | 54.0° | 14/24 | −3.00 mm | 0.34 mm |
+| `close` | 644 → 794 | 50.4° | **2/24** | −3.10 mm | 0.16 mm |
+
+### The pose it worked from — recorded so it need not be re-derived
+
+| | value |
+|---|---|
+| chassis pose (SLAM map) | **x = 16.492, y = −18.225, ori = −0.73 rad** |
+| panel centre, ARM BASE frame | **x = +0.695, y = −0.171 m** |
+| panel button heights, base frame | z = **+0.588 … +0.765 m** (≈ 1.10–1.28 m off the floor) |
+| camera distance / bearing | 0.610 m / +15.9° |
+| lift at localisation | command 441 |
+
+Getting there from the dock: back **3.1 m** → turn **−27°** to aim → forward **1.06 m** →
+turn −90°, translate **0.265 m**, turn +90° (the lateral fix) → forward **7.6 cm**. The
+lateral leg is an artefact of starting at the charging dock, whose axis misses the panel
+by 0.95 m; a designed approach would not need it.
+
+### The reachable window is THIN, and that is the number that governs elevator entry
+
+Two measurements, both from the same panel on the same afternoon:
+
+| change | effect |
+|---|---|
+| **7.5 cm** closer along the approach | all four buttons **0/24 rolls → all four solvable** |
+| **5.4 cm** of lateral offset (y −0.233 → −0.179) | button `4` **24/24 → 1/24 rolls**, margins 65–68° → 50–54° |
+
+So "park within a few centimetres" is not a rule of thumb here — lateral position is the
+sensitive axis, and it cannot be corrected after entering a car if the flow allows only
+one turn. It has to be built into the entry line, outside the door, where time is free.
+
+### In-place turns, and a 47 % overshoot that was really a stale pose
+
+`drive_straight.py turn` — `move` sends angular 0, `turn` sends linear 0, two separate
+functions so no caller can emit an arc. Swept radius **0.476 m**, taken from the chassis's
+own 19-point footprint (the bounding box would have said 0.55 m). Measured
+achieved/commanded: **0.688 at 10°, 0.874 at 23°, 0.880 at 28°, 0.957/0.963 at 90°**,
+position drift 0–6 mm. A turn −90 / translate / turn +90 round trip came back within
+**0.57°** — the pose feed's own quantisation.
+
+The straight legs got a real fix on the way. Correction legs were overshooting badly
+(0.40 m commanded → **0.589 m**) because the end-of-leg pose was read before SLAM had
+settled: that leg reported 0.127 m, i.e. 68 % short, so the corrections chased a
+difference that was not there. Reading the pose only once two consecutive fresh samples
+agree took 0.80 m commanded to **0.753 m achieved, 1 mm lateral**. An independent camera
+fiducial confirms the settled pose is sound: a 0.50 m leg measured 0.401 m by camera and
+0.384 m by pose.
+
+### The press had to bypass the identity check, and that is the arm-camera argument
+
+At the pose the arm can reach, **all four anchors read `empty`** — 0/4 agreement — so the
+press was refused 15 of 15 times and only ran with `--no-verify`. Not exposure (faceplate
+mean 116–173, **0.0 % saturated** at every value swept from 60 to 200) and not detection
+(9–10 of 10 buttons, lattice residual 2.0–2.4 px against a 6 px threshold). It is pixel
+size: buttons are **28.4 px** here, so `classify_solo` sees a 60 px crop, and the measured
+curve for that crop size is 2–3 correct out of 10.
+
+This reproduces, at a second site and from the opposite direction, the 2026-09-01 finding
+that the positions where the camera can SEE and where the arm can REACH do not overlap.
+There it was "detection healthy, 336 combinations with no IK"; here it is "reach solved,
+identity unverifiable". Same gap, and it is what an arm-mounted camera is for.
+
+### Still open
+- **Identity verification at the reachable distance.** Unsolved. Next cheap test: classify
+  all ten cells individually and see whether any survives at 28 px — the green star on `1`
+  is the highest-contrast marking on the faceplate.
+- **Door open/closed and floor arrival** — neither built. Note the chest camera
+  structurally cannot see the door before entry (the robot backs in, so it faces away),
+  which leaves the lidar as the only sensor for the door, with no cross-check.
+- **In-car time budget.** One turn plus one button is roughly 18–25 s on today's numbers
+  (4 buttons + 5 lift moves took 62.8 s; a 27° turn ~3 s, a 90° turn ~10 s). The 0.30 rad/s
+  yaw cap is a conservative choice of ours, not a chassis limit, and is the obvious lever.
+- `boundary_sweep.py` is dead against the current config (see the gotcha).
+- Second independent cross-check of the re-measured plunger TCP (still one touch).
+
 ## ▶ THE BASE CAN NOW BE DRIVEN IN A STRAIGHT LINE, LOCALLY (2026-09-01)
 
 `+-2 m` straight, commanded directly to the chassis, with the angular velocity pinned

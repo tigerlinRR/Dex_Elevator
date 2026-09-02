@@ -187,6 +187,8 @@ python3 initialization/drive_straight.py state        # read-only: mode, estop, 
 python3 initialization/drive_straight.py clearance    # read-only: lidar corridor
 python3 initialization/drive_straight.py move 2.0     # forward 2 m (signed metres)
 python3 initialization/drive_straight.py move -- -2.0 # back 2 m
+python3 initialization/drive_straight.py turn 30      # turn 30 deg in place (signed)
+python3 initialization/drive_straight.py turn --corrections 1 -- -90
 python3 initialization/drive_straight.py calibrate    # achieved vs commanded distance
 ```
 

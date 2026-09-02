@@ -1,4 +1,4 @@
-"""Drive the chassis in a STRAIGHT LINE only, over its local 8090 API.
+"""Drive the chassis in straight lines and in-place turns, over its local 8090 API.
 
 Why not an AutoXing navigation task: the cloud API's only abstraction is "go to this
 point", and its planner decides how — measured, it prefers to turn. Entering and
@@ -10,8 +10,18 @@ pinned to 0 and no planner is involved, so straight is structural, not lucky.
     python3 initialization/drive_straight.py clearance          # read-only, lidar
     python3 initialization/drive_straight.py move 2.0           # signed metres
     python3 initialization/drive_straight.py move -- -2.0
+    python3 initialization/drive_straight.py turn 30            # signed degrees, in place
+    python3 initialization/drive_straight.py turn -- -30
     python3 initialization/drive_straight.py calibrate          # achieved vs commanded
     python3 initialization/drive_straight.py stop
+
+A LEG IS NEVER BOTH AT ONCE. `move` sends angular 0 and `turn` sends linear 0, so
+there are no arcs and "straight is structural" survives the addition: a path through a
+doorway is still a pure translation, and any re-aiming happens as a separate turn
+before or after it, where it can be gated and measured on its own. Turns exist because
+the flow needs them outside the door — the pose that lets the arm press the call panel
+is not the pose that backs into the car — and because a panel that is not square to the
+robot cannot be reached by translating, only by turning.
 
 Protocol:
     POST /services/wheel_control/set_control_mode {"control_mode":"remote"}
@@ -97,6 +107,20 @@ CREEP_MPS = 0.06
 # over a clean 5 s run (0.903 m at a commanded 0.20 m/s). Start-up and braking losses
 # are what it captures, so the leg duration is divided by it.
 SPEED_RATIO = 0.90
+
+# In-place turns. The radius is the chassis's OWN footprint (/robot/footprint, 19
+# points) at its furthest corner from the pose origin — measured 0.476 m, where the
+# 0.80 x 0.76 m bounding box would have said 0.55 m and refused turns in gaps that fit.
+TURN_RADIUS_M = 0.476
+TURN_MARGIN_M = 0.15           # required gap beyond the swept circle
+MAX_TURN_DEG = 100.0           # ceiling per command, independent of the CLI
+MAX_YAW_RATE = 0.30            # rad/s
+TURN_RAMP_DEG = 8.0            # ramp down over the last few degrees, as RAMP_M does
+CREEP_YAW = 0.06               # rad/s
+# Achieved / commanded turn. 1.0 until measured on this chassis: unlike SPEED_RATIO
+# this one has no measurement behind it yet, so `turn` prints the ratio it achieved on
+# every run and the correction legs absorb the difference meanwhile.
+TURN_RATIO = 1.0
 
 # STALL DETECTION DOES NOT USE THE POSE. /tracked_pose is 1 Hz AND repeats the same
 # value across consecutive messages while the base is moving (SLAM settles late), so
@@ -283,6 +307,24 @@ class Chassis:
             raise SystemExit(f"ABORT: only {_fmt_m(ahead)} of clearance along {label}; "
                              f"{need:.2f} m needed")
 
+    def nearest(self) -> float:
+        """Distance to the closest lidar return in ANY direction, from the base's
+        centre. A turn sweeps every direction at once, so the corridor test that gates
+        a straight leg says nothing useful about it."""
+        x0, y0, _ = self.wait_pose()
+        pts = self.wait_scan()
+        return min(math.hypot(p[0] - x0, p[1] - y0) for p in pts) if pts else float("inf")
+
+    def gate_spin(self) -> None:
+        near = self.nearest()
+        need = TURN_RADIUS_M + TURN_MARGIN_M
+        print(f"lidar nearest in any direction: {_fmt_m(near)} from centre — need "
+              f"{need:.2f} m ({TURN_RADIUS_M:.3f} swept radius "
+              f"+ {TURN_MARGIN_M:.2f} margin)")
+        if near < need:
+            raise SystemExit(f"ABORT: nearest obstacle {_fmt_m(near)}; a turn sweeps "
+                             f"{TURN_RADIUS_M:.3f} m in every direction")
+
     # --- motion -------------------------------------------------------------
     def send_twist(self, linear: float) -> None:
         """Angular velocity is ALWAYS zero here. That is the point of this file."""
@@ -291,6 +333,19 @@ class Chassis:
         self._ws.send(json.dumps({"topic": "/twist",
                                   "linear_velocity": linear,
                                   "angular_velocity": 0.0}))
+
+    def send_spin(self, angular: float) -> None:
+        """LINEAR velocity is always zero here — the mirror of send_twist.
+
+        Two functions rather than one with both arguments, so neither caller can emit
+        an arc by passing the wrong pair. The keepalive rate is the same: below ~20 Hz
+        the base's watchdog cuts the wheels mid-turn exactly as it does mid-drive.
+        """
+        assert self._ws is not None
+        angular = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, angular))
+        self._ws.send(json.dumps({"topic": "/twist",
+                                  "linear_velocity": 0.0,
+                                  "angular_velocity": angular}))
 
     def brake(self) -> None:
         if self._ws is None:
@@ -331,6 +386,41 @@ class Chassis:
                 except Exception:               # noqa: BLE001
                     pass
                 self._ws = None
+
+
+def _settled_pose(ch: Chassis, tol_m: float = 0.01, tol_deg: float = 0.5,
+                  timeout: float = 8.0):
+    """Read the pose only once two consecutive FRESH samples agree.
+
+    Waiting for "a couple of fresh samples" was not enough. The feed is 1 Hz and SLAM
+    settles LATE, so the sample that arrives right after braking still describes a
+    place the robot has already left. Measured 2026-09-02: a leg commanded 0.40 m read
+    back 0.127 m that way — 68 % short — and the correction legs that fired to make up
+    the difference took the move to 0.589 m, a 47 % OVERSHOOT of the original request.
+    Legs run with `--corrections 0`, which is to say legs whose end pose was read
+    minutes later, agreed with an independent camera measurement to 17 mm.
+
+    So the test is agreement, not arrival: keep pumping until the position stops
+    changing between samples. Zero twist keeps flowing throughout — a 2-3 s silent gap
+    drops the base out of its remote-driving state.
+    """
+    prev = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ch.send_twist(0.0)
+        except Exception:              # noqa: BLE001
+            break
+        got = ch.wait_fresh_pose(timeout=2.0)
+        if got is None:
+            continue
+        if prev is not None:
+            moved = math.hypot(got[0] - prev[0], got[1] - prev[1])
+            turned = abs(_wrap_deg(got[2] - prev[2]))
+            if moved <= tol_m and turned <= tol_deg:
+                return got
+        prev = got
+    return ch.pose
 
 
 def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
@@ -412,20 +502,7 @@ def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
             break
 
     ch.brake()
-    # 1 Hz feed: wait for genuinely fresh samples after the coast rather than reading a
-    # value captured mid-move — but keep sending ZERO twist while waiting. A 2-3 s gap
-    # with no twist at all drops the base out of its remote-driving state, which is why
-    # the first leg always moved and every later one stopped after a few centimetres.
-    want_seq = ch.pose_seq + 2
-    wait_until = time.time() + 4.0
-    while time.time() < wait_until and ch.pose_seq < want_seq:
-        try:
-            ch.send_twist(0.0)
-        except Exception:              # noqa: BLE001
-            break
-        ch.pump()
-        time.sleep(1.0 / TWIST_HZ)
-    end = ch.pose or start
+    end = _settled_pose(ch) or start
     dx, dy = end[0] - start[0], end[1] - start[1]
     along = dx * math.cos(start[2]) + dy * math.sin(start[2])
     if slip_seen and verbose:
@@ -476,6 +553,140 @@ def drive(ch: Chassis, metres: float, speed: float, ori_tol: float, tol: float,
           f"(error {along - metres:+.3f} m)")
     print(f"lateral deviation {lateral * 1000:.0f} mm   "
           f"heading change {_wrap_deg(end[2] - start[2]):+.2f} deg")
+
+
+def _spin_leg(ch: Chassis, degrees_: float, yaw_rate: float,
+              verbose: bool = True) -> tuple[float, float, str]:
+    """One open-loop timed in-place turn. Returns (achieved deg, drift m, reason).
+
+    Same shape as `_leg` and for the same reason: the pose feed is 1 Hz, so a turn
+    cannot be closed on it either. Position is watched as the SANITY check here —
+    an in-place turn that translates is a turn the wheels are not executing.
+    """
+    start = ch.wait_pose()
+    if ch.estop:
+        return 0.0, 0.0, "emergency stop is pressed"
+
+    target = abs(math.radians(degrees_))
+    angular = math.copysign(yaw_rate, degrees_)
+    duration = target / (yaw_rate * TURN_RATIO)
+    timeout = duration + 6.0
+    ramp = math.radians(TURN_RAMP_DEG)
+
+    if verbose:
+        print(f"    (base reports control_mode={ch.mode})")
+    period = 1.0 / TWIST_HZ
+    next_tick = t0 = time.time()
+    stall_since = None
+    last_log = t0
+    reason = "turn complete"
+
+    while True:
+        elapsed = time.time() - t0
+        done = min(1.0, elapsed / duration) if duration > 0 else 1.0
+        remaining = target * (1.0 - done)
+        if remaining < ramp:
+            scale = max(CREEP_YAW / yaw_rate, remaining / ramp)
+            ch.send_spin(math.copysign(yaw_rate * scale, angular))
+        else:
+            ch.send_spin(angular)
+        ch.pump()
+
+        next_tick += period
+        sleep_for = next_tick - time.time()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:
+            next_tick = time.time()
+        now = time.time()
+
+        if elapsed >= duration:
+            break
+        if _stop_requested:
+            reason = "interrupted"
+            break
+        if ch.estop:
+            reason = "emergency stop pressed"
+            break
+        if ch.current is not None and ch.current >= STALL_CURRENT_A:
+            if stall_since is None:
+                stall_since = now
+            elif now - stall_since >= STALL_CURRENT_S:
+                reason = (f"STALLED — {ch.current:.1f} A for {STALL_CURRENT_S}s "
+                          f"(idle ~4.4 A); something is in the way")
+                break
+        else:
+            stall_since = None
+
+        if verbose and now - last_log >= 1.0:
+            print("    t+%4.1fs  commanded %.1f/%.1f deg   current %s A"
+                  % (elapsed, math.degrees(target * done), abs(degrees_),
+                     "?" if ch.current is None else f"{ch.current:.1f}"))
+            last_log = now
+
+        if now - t0 > timeout:
+            reason = f"timed out after {timeout:.0f} s"
+            break
+
+    ch.brake()
+    end = _settled_pose(ch) or start
+    turned = _wrap_deg(end[2] - start[2])
+    drift = math.hypot(end[0] - start[0], end[1] - start[1])
+    return turned, drift, reason
+
+
+def spin(ch: Chassis, degrees_: float, yaw_rate: float, tol_deg: float,
+         corrections: int, skip_gate: bool = False) -> None:
+    if abs(degrees_) > MAX_TURN_DEG:
+        raise SystemExit(f"ABORT: {degrees_} deg exceeds the {MAX_TURN_DEG} deg ceiling")
+    yaw_rate = min(abs(yaw_rate), MAX_YAW_RATE)
+
+    if not skip_gate:
+        ch.gate_spin()
+
+    start = ch.wait_pose()
+    print(f"start pose  x={start[0]:.3f} y={start[1]:.3f} ori={start[2]:.4f}")
+    print(f"target {degrees_:+.1f} deg at {yaw_rate:.2f} rad/s  (linear pinned to 0)")
+
+    ch.enter_remote()
+    ch.pump(0.3)
+
+    total = 0.0
+    want = degrees_
+    for attempt in range(corrections + 1):
+        if abs(want) < 0.5:
+            break
+        leg_rate = yaw_rate if attempt == 0 else min(yaw_rate, 0.12)
+        ch.enter_remote()                     # re-assert; see the keepalive note
+        got, drift, reason = _spin_leg(ch, want, leg_rate)
+        total += got
+        print(f"  turn {attempt + 1}: commanded {want:+.1f} deg -> achieved "
+              f"{got:+.1f} deg ({reason}), position drift {drift * 1000:.0f} mm")
+        if reason != "turn complete":
+            break
+        want = degrees_ - total
+        if abs(want) <= tol_deg:
+            break
+
+    end = ch.pose or start
+    turned = _wrap_deg(end[2] - start[2])
+    drift = math.hypot(end[0] - start[0], end[1] - start[1])
+    print(f"end pose    x={end[0]:.3f} y={end[1]:.3f} ori={end[2]:.4f}")
+    print(f"TOTAL turned {turned:+.1f} deg of {degrees_:+.1f} requested "
+          f"(error {turned - degrees_:+.1f} deg)")
+    ratio = turned / degrees_ if degrees_ else float("nan")
+    print(f"position drift {drift * 1000:.0f} mm   achieved/commanded {ratio:.3f}"
+          "   <- pin this into TURN_RATIO once it repeats")
+
+
+def cmd_turn(args) -> None:
+    ch = Chassis(args.host, args.port, args.secret)
+    ch.check_identity()
+    ch.open_stream()
+    try:
+        spin(ch, args.degrees, args.rate, args.tol, args.corrections, args.no_gate)
+    finally:
+        ch.close()
 
 
 def cmd_state(args) -> None:
@@ -603,6 +814,17 @@ def main() -> int:
     m.add_argument("--no-gate", action="store_true",
                    help="skip the lidar clearance check (not recommended)")
 
+    t = sub.add_parser("turn", parents=[common],
+                       help="signed degrees, in place (linear pinned to 0)")
+    t.add_argument("degrees", type=float)
+    t.add_argument("--rate", type=float, default=0.20, metavar="RADPS")
+    t.add_argument("--tol", type=float, default=1.0, metavar="DEG",
+                   help="stop correcting once within this of the target")
+    t.add_argument("--corrections", type=int, default=1,
+                   help="extra short turns allowed to close the remaining angle")
+    t.add_argument("--no-gate", action="store_true",
+                   help="skip the lidar all-round check (not recommended)")
+
     c = sub.add_parser("calibrate", parents=[common],
                        help="0.3/0.6/1.0 m legs measuring achieved vs commanded")
     c.add_argument("metres", type=float, nargs="?", default=1.0,
@@ -611,7 +833,7 @@ def main() -> int:
 
     args = p.parse_args()
     handlers = {"state": cmd_state, "clearance": cmd_clearance, "move": cmd_move,
-                "calibrate": cmd_calibrate, "stop": cmd_stop}
+                "turn": cmd_turn, "calibrate": cmd_calibrate, "stop": cmd_stop}
     try:
         handlers[args.action](args)
         return 0

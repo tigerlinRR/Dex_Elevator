@@ -454,6 +454,55 @@ to turn this time is not a guarantee. Here the angular velocity is pinned to 0 w
 planner in the loop, so straight is structural. Measured `+-2 m`: **1.5-2.9 cm of
 distance error, 9-43 mm lateral, under 1.2 deg of heading change**.
 
+**The agreed elevator flow** (operator's decision, 2026-09-02). Orientation is named
+with the ARM and CHEST CAMERA as the robot's front; the base's own front (green light,
+obstacle sensors, face camera) is its back. Outside the car the robot stands with its
+BACK to the doors, so it **reverses straight in** and ends up facing the doors from
+inside — which is also where the car's own button panel is. It then **turns once**,
+presses, turns back, and **drives forward straight out**. Two constraints fall out of
+this and both are hard:
+- **At most one turn inside the car, and it must be quick.** The car may already be
+  travelling for someone else, so a floor pressed late is a floor missed. Only the
+  straight legs are inside the door's open window; the turn and press are not, but they
+  are inside the car's own travel time.
+- **Lateral position must be set BEFORE entering.** It cannot be corrected inside
+  without more turns, and 5.4 cm of it costs almost all the approach-roll redundancy
+  (see PROGRESS 2026-09-02). Outside the door the time is free, so that is where the
+  entry line's lateral placement belongs — from the lidar, which can see into an open
+  car, since the chest camera faces away from the doors until the robot is inside.
+
+**In-place TURNS are a separate primitive** (`drive_straight.py turn`, 2026-09-02).
+`move` sends angular 0 and `turn` sends linear 0, in two different functions, so no
+caller can emit an arc and "straight is structural" survives: a path through a doorway
+stays a pure translation and any re-aiming is its own gated, measured leg. Turns exist
+because the flow needs them — outside the door the pose that lets the arm press the
+call panel is not the pose that backs into the car, and inside, a panel that is not
+square to the robot cannot be reached by translating.
+- **The swept radius is 0.476 m**, the furthest of the chassis's own 19 `/robot/footprint`
+  points from the pose origin. The 0.80 x 0.76 m bounding box would have said 0.55 m and
+  refused turns in gaps that fit. The gate is nearest-return-in-ANY-direction, since the
+  corridor test that gates a straight leg says nothing about a turn.
+- **Measured achieved/commanded**: 0.688 at 10 deg, 0.874 at 23, 0.880 at 28, **0.957 and
+  0.963 at 90** — the same fixed-loss-plus-proportional shape as the straight legs, so
+  short turns lose most. Position drift 0-6 mm, i.e. it really does turn in place.
+  `TURN_RATIO` is still 1.0 in the file: the correction legs absorb the difference and
+  every run prints the ratio it achieved.
+- **Right turn = NEGATIVE degrees = ori decreasing**, verified against the camera: a
+  commanded -10 deg moved the panel's bearing +31.5 -> +23.5.
+- A whole re-position — turn -90, translate 0.265 m, turn +90 — came back to within
+  **0.57 deg** of the original heading, which is the pose feed's own quantisation.
+
+**Read the pose only after it has SETTLED** (`_settled_pose`, 2026-09-02). Waiting for
+"a couple of fresh samples" after braking was not enough: SLAM settles late, so the
+sample arriving right after the brake still describes a place the robot has left. A leg
+commanded 0.40 m read back **0.127 m** that way, the correction legs fired to make up
+the difference, and the move ended at **0.589 m — a 47 % overshoot of the request**.
+The test is now agreement, not arrival: keep pumping zero twist until two consecutive
+fresh poses agree to 1 cm and 0.5 deg. After the fix, 0.80 m commanded achieved 0.753 m
+with 1 mm of lateral. Cross-checked against an independent camera fiducial (the panel's
+own measured distance): a 0.50 m leg moved 0.401 m by camera and 0.384 m by pose, so the
+settled pose is trustworthy — it was only ever the mid-move samples that were not.
+
 **Where the chassis actually is, because three earlier answers were wrong.** It is
 `192.168.25.25`, on the robot's OWN WIRED network — the same cable as the arms, but a
 **different subnet**, only reachable once the Jetson's `eno1` also carries
@@ -767,6 +816,20 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   unexpectedly!` and `9502 Debugging config file exists` survived, and `6007` came back
   later. Confirm a reboot actually happened by watching `planning_state.action_id` reset
   — the first time, it did not (`action_id` stayed 643) and nothing had changed.
+- **An engaged emergency stop silently EMPTIES the lidar point cloud.**
+  `/scan_matched_points2` keeps publishing at 1.33 Hz with `npoints = 0`, while
+  `/slam/state` still reports `lidar_reliable: true, lidar_matched: true` — so nothing
+  says the lidar is unavailable. Released, it returns to 2.00 Hz and 908-975 points.
+  An empty scan reads exactly like "nothing in the way", so any obstacle or door test
+  built on it must fail CLOSED; `drive_straight` aborts with "no lidar scan", which is
+  the correct behaviour and should not be relaxed. It also unpowers both arm
+  controllers, which come back a few seconds after the release.
+- **`initialization/boundary_sweep.py` no longer runs against the current config.** It
+  reads `arm.lift.usable_relative_z_m` and `target_relative_z_m`, both of which were
+  removed when the lift height became SEARCHED rather than computed, so it dies with a
+  `KeyError` before doing anything. Fixing it means teaching it to search the lift the
+  way `plan()` does — it is not a missing-key patch, because the fixed-height model it
+  encodes is the superseded one.
 - **Killing the local process does NOT stop the robot.** An AutoXing task is executed
   by the cloud, not by our process: after `kill -9` on the runner the base carried on
   and drove the rest of its route by itself. Stopping means cancelling the task
