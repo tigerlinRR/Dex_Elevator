@@ -847,7 +847,20 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   `config.py`; any python started from `~/Dex_Elevator` then died with a circular-import
   error out of `enum`/`dataclasses`. Moved to `~/Dex_Elevator_stray_root_backup_*`. The
   repo root legitimately contains NO `.py` files — if one appears, an rsync flattened
-  something.
+  something. **That same flatten also left duplicate `camera/`, `hand/`, `robot/` packages
+  and root-level `pipeline.yaml`/`cameras.yaml`/`buttons.yaml` on the robot** (still there
+  2026-09-02). Nothing imports them — `core/config.py` reads only `configs/` — so they are
+  inert, but the root `pipeline.yaml` is a DIVERGENT older copy (no left-arm home pose, no
+  `lift.objective`), which is exactly the kind of thing someone eventually reads by mistake.
+- **`rsync` to the robot must exclude `data/` — the model is trained ON the robot.**
+  `data/weights/buttons.pt` exists on both machines and the robot's is the newer one, so
+  a sync that includes it pushes the Mac's stale copy the WRONG WAY. Measured 2026-09-02:
+  the documented command (which excluded only `data/calibration/`) silently replaced the
+  5-source merge from 2026-08-25 with the Mac's July single-source build. It is easy to
+  miss because rsync reports only that a file differed, never which side was right, and
+  because nothing breaks — `trt_detector.py` loads the `.engine`, not the `.pt`, so
+  inference kept working with the correct model while its source was gone. Recover from
+  `runs/detect/buttons_merged5/weights/best.pt`, which is what `buttons.pt` was copied from.
 - **Never trust a Jetson benchmark that has not been warmed up.** The CPU governor is
   `schedutil` and the GPU idles at 306 MHz, so **whatever is measured first in a process
   pays for the clock ramp and everything after it looks faster**. This produced two wrong

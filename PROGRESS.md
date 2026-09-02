@@ -1120,10 +1120,18 @@ for the offline `buttons.pt -> ONNX` export, never in the loop. Rebuild the engi
 machine change (it is not portable); commands are in the module docstring.
 
 Push code to the robot: rsync from the Mac (repo is private, so `git clone` on the robot fails).
-`data/calibration/` is excluded on purpose — the Thor unit's artifacts must NOT be reused here.
+**`data/` is excluded WHOLESALE, and both halves of that matter.** `data/calibration/` holds the
+Thor unit's artifacts, which must never be reused here. `data/weights/` is the opposite problem:
+the model that matters is TRAINED ON THE ROBOT and does not exist on the Mac, so syncing that
+directory sends the Mac's stale copy the wrong way. Measured 2026-09-02 — a run of the old
+command overwrote the robot's `buttons.pt` (the 5-source merge, 2026-08-25) with the Mac's
+single-source July build, silently, because rsync only reports that a file changed and not which
+direction was right. Inference survived it (`trt_detector.py` loads the `.engine`, not the `.pt`),
+and the source was recoverable from `runs/detect/buttons_merged5/weights/best.pt`, but nothing
+warned at the time.
 ```
 rsync -az --exclude='.git/' --exclude='__pycache__/' --exclude='*.pyc' --exclude='.DS_Store' \
-  --exclude='data/calibration/' --exclude='乘梯相关接口.pdf' \
+  --exclude='data/' --exclude='乘梯相关接口.pdf' \
   ~/Desktop/Dex_Elevator/ dex5-wired:Dex_Elevator/
 ```
 
