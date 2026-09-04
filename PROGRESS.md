@@ -2,6 +2,92 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE WHOLE MANOEUVRE RUNS AS ONE PROCESS, AND VISION CLOSES THE LAST FEW CM (2026-09-04, later)
+
+`mock_elevator_run.py` drives the flow end to end from a registered start point: reverse
+in, turn once, **measure the panel and close the remaining centimetres**, press, aim the
+exit off the lidar, drive out. Three consecutive presses, **4/4 every time** (61.9 s,
+59.8 s, 58.7 s), depth −3.06 to −3.18 mm, lateral 0.16–0.62 mm.
+
+### The measured final approach is what makes the recipe repeatable
+
+A hard-coded distance cannot work here, and the numbers say why: a single 2.7 m leg
+scatters by about 5 % — 14 cm — while the window that decides whether the panel can be
+pressed at all is a few centimetres wide. Measured on this panel: at x 0.649 and 0.667
+all four buttons plan at 24/24 rolls with 63–69° of margin; at 0.695 they still press but
+two are down to 1/24 and 2/24; at **0.731 two buttons have no IK solution at all** and the
+other two are left with 5–6 mm of path clearance against a 5 mm limit.
+
+So the recipe only has to get close, and a camera measurement closes the rest. Across
+three runs the dead-reckoned legs put the panel at **x 0.661, 0.683, 0.696** against a
+0.670 target — 0.9, 1.3 and 2.6 cm out, all inside tolerance, so the correction correctly
+moved **nothing**. Same shape as the lift's `objective: still`: measure always, move only
+when it buys something. The measurement costs ~200 ms because the engine and camera are
+warmed up outside, before the robot enters, where the seconds are free.
+
+### Three defects this shook out, one of which the safety layer caught
+
+- **The exit aim had a sign error.** `heading_sweep` builds its travel frame by negating
+  both axes for a backward leg, which is a 180° rotation and therefore preserves
+  handedness — a clear heading `t` is reached by turning `+t` whichever way the leg
+  points. Multiplying by the direction sign sent the robot the wrong way by twice the
+  angle: the exit aimed −27.5° instead of +27.5°. **Nothing was hit, because the lidar
+  clearance gate refused the resulting path** — the guard fired on a real fault for the
+  first time.
+- **The chassis closes an idle websocket.** The press blocks for ~60 s with nothing
+  pumping the topic stream, so the next `wait_pose` died with "Connection to remote host
+  was lost" *after the press had already succeeded*. The stream is now reconnected and
+  `remote` re-asserted before the exit.
+- **`OrbbecCamera` releases with `stop()`, not `close()`**, and the wrong call sat inside
+  a bare `except: pass` — so the camera would have stayed open while the press tried to
+  open it, which is exactly how the chest 335 gets into the state where it enumerates but
+  delivers no colour. The failure would have surfaced one step later, wearing a different
+  face.
+
+### The base drives itself away between commands
+
+The chassis's own `control_unit` issues `charge` moves whenever it feels like it, and
+**holding `remote` does not stop it** — it takes the mode back to run one. Across separate
+`drive_straight` invocations this silently corrupted measurements: a turn-and-turn-back
+came back +40.7° for a commanded +25 with 0.53 m of translation, and an exit leg made
+0.646 m of a commanded 2.50 with 36.67° of heading change. A straight leg sends angular 0,
+so that heading change is the tell; the harness now aborts on it and cancels foreign moves
+before each phase (`PATCH /chassis/moves/current {"state":"cancelled"}`, verified).
+
+### `/scan_matched_points2` goes empty when the robot sits still
+
+It publishes the points from the last SLAM matching update, so a long-stationary robot
+produces no update and the topic returns `npoints = 0` at full rate — while `/slam/state`
+still reports `lidar_reliable: true, lidar_matched: true`. Moving 0.3 m restored it
+immediately (878–918 points, constraints 1 → 3). **This is the third explanation offered
+today and the first that survives the evidence**: it was blamed on the emergency stop in
+both directions before being measured properly, and both of those notes have been
+retracted. The operational rule is unchanged and matters more than the cause: an empty
+scan reads exactly like "nothing in the way", so everything built on it must fail closed.
+
+### Press depth raised 3.0 → 4.5 mm
+
+Operator reports the press is often too light — the plunger reaches the button and it does
+not light. 3 mm was the first value that worked in a walk-up (1 and 2 failed), which is
+not the same as a value with margin. 4.5 mm stays well inside what this tool has already
+survived: when the plunger TCP was found 5.57 mm stale a commanded 3 mm was really
+pressing about 8 mm, and the button lit with no damage. **Verify by the lamps, not the
+log** — the press log compares the command against the same assumed TCP on both sides, so
+it cannot see this class of error at all.
+
+### Still open
+- **Heading drift on long straight legs is the last systematic error**: +2.29° and +2.86°
+  over ~2.8 m, i.e. ~11 cm of lateral, while other legs run 0.00°. Angular is pinned to
+  zero, so heading is fully open loop and nothing corrects it. Closing that loop touches
+  the file's core promise and should be a deliberate decision, not a quiet change.
+- One exit leg issued its full 2.70 m of velocity and moved **1.564 m**. It did not
+  reproduce (a repeat leg landed 1.265 m of 1.27), and a `2008 Wheel is major slipping`
+  alert was standing — but the harness had `verbose=False` and so suppressed the one line
+  that would have confirmed it. Now un-suppressed.
+- Identity verification at the reachable distance (anchors still 0/4; every press this
+  session used `--no-verify`).
+- The lidar exit alignment cannot be validated in an open room — it needs a real doorway.
+
 ## ▶ ONE TURN IS ENOUGH TO REACH THE PANEL; COMING BACK BY ODOMETRY IS NOT (2026-09-04)
 
 The flow the operator wants — park at a fixed point, reverse in, turn once, press, turn

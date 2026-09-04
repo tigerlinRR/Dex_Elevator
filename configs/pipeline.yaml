@@ -255,5 +255,14 @@ elevator:
     # the button's chamfer. Hough-circle centres fixed that (see button_pixels).
     # If a stiffer button ever needs more than ~5 mm, suspect the spring is too
     # soft (compressing without transmitting force) rather than the stroke.
-    push_depth: 0.003
+    # RAISED 3.0 -> 4.5 mm on 2026-09-04: the operator reports the press is often too
+    # light — the plunger reaches the button and it does not light. 3 mm was set from a
+    # walk-up where 1 and 2 mm failed and 3 mm lit repeatably, so it was the first value
+    # that worked rather than one with margin, and nothing about a spring plunger says
+    # the first working value has any. 4.5 mm stays well inside what this tool has
+    # already survived: when the plunger TCP was found to be 5.57 mm stale, +5.14 mm of
+    # it along the approach axis, a commanded 3 mm was really pressing about 8 mm and the
+    # button still lit with no damage. Watch the lamps, not the log — the press log's own
+    # depth figure cannot see this, because both sides of it use the same assumed TCP.
+    push_depth: 0.0045
     up_hint: [0.0, 0.0, 1.0]

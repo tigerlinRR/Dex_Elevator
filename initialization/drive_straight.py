@@ -391,6 +391,23 @@ class Chassis:
             except Exception:              # noqa: BLE001
                 return
 
+    def reconnect(self) -> None:
+        """Drop and re-open the topic stream.
+
+        The chassis closes an idle websocket. That matters whenever something long and
+        blocking happens between two legs — a 62 s button press, measured 2026-09-04 —
+        because nothing is pumping the socket meanwhile and the next `wait_pose` dies with
+        "Connection to remote host was lost". Reconnecting is cheap; losing the run at the
+        exit leg, after the press has already succeeded, is not.
+        """
+        try:
+            if self._ws is not None:
+                self._ws.close()
+        except Exception:                       # noqa: BLE001
+            pass
+        self._ws = None
+        self.open_stream()
+
     def enter_remote(self) -> None:
         self.set_mode("remote")
         self._entered_remote = True
@@ -843,6 +860,91 @@ def clear_band(sweep, half):
     return lo, hi, best
 
 
+def wall_heading(ch: Chassis, metres: float, window: float, max_range: float = 3.0):
+    """Angle between the travel axis and the NORMAL of the dominant flat surface ahead.
+
+    Why a wall and not the pose: replaying a remembered turn is a RELATIVE reference, so
+    the ~3 deg the base cannot resolve accumulates every time it is used — measured, a
+    turn out and back left 9.2 deg of heading error. A wall is an ABSOLUTE reference,
+    available at any moment and independent of what the robot did before, so the residual
+    stays at one turn's worth instead of compounding. The measurement end is not the
+    limit either: a scan carries ~900 points, so the fitted angle is far finer than the
+    pose feed's own 0.573 deg quantisation.
+
+    Returns (angle_deg, n_inliers, distance_m) or None. Positive angle means the wall's
+    normal points to the LEFT of the travel axis, i.e. turn positive to square up to it.
+    """
+    x0, y0, ori = ch.wait_pose()
+    pts = ch.wait_scan()
+    c, sn = math.cos(ori), math.sin(ori)
+    sign = 1.0 if metres >= 0 else -1.0
+    P = []
+    for p in pts:
+        dx, dy = p[0] - x0, p[1] - y0
+        bx = (dx * c + dy * sn) * sign
+        by = (-dx * sn + dy * c) * sign
+        if 0.15 < bx < max_range and abs(by) < window:
+            P.append((bx, by))
+    if len(P) < 30:
+        return None
+
+    # RANSAC a line, then least-squares refit the inliers. Same shape as the panel plane
+    # fit in core/press.py and for the same reason: one stray cluster (a person, a bin)
+    # drags a plain least-squares fit badly, and there is always something else in a room.
+    best, rng = None, 12345
+    n = len(P)
+    for _ in range(80):
+        rng = (1103515245 * rng + 12345) % (1 << 31)
+        i = rng % n
+        rng = (1103515245 * rng + 12345) % (1 << 31)
+        j = rng % n
+        if i == j:
+            continue
+        (x1, y1), (x2, y2) = P[i], P[j]
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy)
+        if L < 0.20:
+            continue
+        nx, ny = -dy / L, dx / L
+        c0 = nx * x1 + ny * y1
+        inl = [q for q in P if abs(nx * q[0] + ny * q[1] - c0) < 0.03]
+        if best is None or len(inl) > len(best):
+            best = inl
+    if best is None or len(best) < 30:
+        return None
+
+    mx = sum(q[0] for q in best) / len(best)
+    my = sum(q[1] for q in best) / len(best)
+    sxx = sum((q[0] - mx) ** 2 for q in best)
+    syy = sum((q[1] - my) ** 2 for q in best)
+    sxy = sum((q[0] - mx) * (q[1] - my) for q in best)
+    # principal direction of the inliers = the wall; its normal is perpendicular
+    theta = 0.5 * math.atan2(2 * sxy, sxx - syy)
+    nx, ny = -math.sin(theta), math.cos(theta)
+    if nx > 0:                      # point the normal back toward the robot
+        nx, ny = -nx, -ny
+    angle = math.degrees(math.atan2(-ny, -nx))
+    return angle, len(best), abs(nx * mx + ny * my)
+
+
+def cmd_wall(args) -> None:
+    ch = Chassis(args.host, args.port, args.secret)
+    ch.check_identity()
+    ch.open_stream()
+    try:
+        r = wall_heading(ch, args.metres, args.window)
+        if r is None:
+            print("no flat surface with enough returns ahead — nothing to square up to")
+            return
+        angle, n, dist = r
+        print(f"wall ahead at {dist:.3f} m, fitted from {n} returns")
+        print(f"  travel axis is {angle:+.2f} deg off its normal")
+        print(f"  turn {-angle * (1.0 if args.metres >= 0 else -1.0):+.2f} deg to square up"
+              f"   (the base resolves ~{TURN_FLOOR_DEG:.0f} deg, so expect that much left)")
+    finally:
+        ch.close()
+
+
 def cmd_align(args) -> None:
     """Sweep the heading and report which ones let the whole robot through.
 
@@ -893,8 +995,14 @@ def cmd_align(args) -> None:
         mid = (lo + hi) / 2.0
         print(f"  clear headings: {lo:+d} to {hi:+d} deg ({hi - lo + 1} of "
               f"{len(sweep)} tried), middle {mid:+.1f} deg")
-        print(f"  turn {mid * sign:+.1f} deg to take the middle of the opening"
-              f"   (or {int(round(best_t * sign)):+d} deg for the least turn that clears)")
+        # NO `* sign` here. heading_sweep builds the travel frame by negating BOTH axes
+        # for a backward leg, which is a 180 deg rotation and therefore preserves
+        # handedness: a clear heading t is reached by turning +t whichever way the leg
+        # points. Multiplying by sign sent the robot the wrong way by twice the angle on
+        # a backward leg — caught 2026-09-04 when the exit aimed -27.5 instead of +27.5
+        # and the clearance gate refused the resulting path.
+        print(f"  turn {mid:+.1f} deg to take the middle of the opening"
+              f"   (or {int(round(best_t)):+d} deg for the least turn that clears)")
         print(f"  the {TURN_FLOOR_DEG:.0f} deg the base cannot resolve is "
               f"{resid * 100:.1f} cm of drift over this leg")
         room = (hi - lo) / 2.0
@@ -903,7 +1011,7 @@ def cmd_align(args) -> None:
             print(f"  VERDICT: go as you are — {slack_straight * 100:.0f} cm of slack "
                   f"each side against {resid * 100:.1f} cm of unresolvable drift")
         elif room * math.pi / 180.0 * abs(metres) > resid:
-            print(f"  VERDICT: aim for {mid * sign:+.1f} deg — the clear band is "
+            print(f"  VERDICT: aim for {mid:+.1f} deg — the clear band is "
                   f"+-{room:.0f} deg wide, comfortably more than the {TURN_FLOOR_DEG:.0f} "
                   f"deg the base cannot resolve")
         else:
@@ -1008,6 +1116,11 @@ def main() -> int:
     t.add_argument("--no-gate", action="store_true",
                    help="skip the lidar all-round check (not recommended)")
 
+    wl = sub.add_parser("wall", parents=[common],
+                        help="read-only: angle between the travel axis and the wall ahead")
+    wl.add_argument("metres", type=float, help="travel direction, signed like `move`")
+    wl.add_argument("--window", type=float, default=1.20, metavar="M")
+
     al = sub.add_parser("align", parents=[common],
                         help="read-only: the opening ahead, and how far off centre")
     al.add_argument("metres", type=float,
@@ -1027,7 +1140,7 @@ def main() -> int:
 
     args = p.parse_args()
     handlers = {"state": cmd_state, "clearance": cmd_clearance, "move": cmd_move,
-                "turn": cmd_turn, "align": cmd_align,
+                "turn": cmd_turn, "align": cmd_align, "wall": cmd_wall,
                 "calibrate": cmd_calibrate, "stop": cmd_stop}
     try:
         handlers[args.action](args)

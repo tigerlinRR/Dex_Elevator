@@ -44,6 +44,15 @@ from drive_straight import (  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 OURS = "dex_elevator_mock"
+# Where the panel has to sit, in the ARM BASE frame, for the press to have room. Measured
+# 2026-09-04 on this panel: x 0.649 and 0.667 both planned all four buttons at 24/24 rolls
+# with 63-69 deg of margin and 34-48 mm of path clearance; x 0.695 pressed 4/4 but two
+# buttons were down to 1/24 and 2/24; x 0.731 left two buttons with NO IK solution at all
+# and the other two with 5-6 mm of clearance against a 5 mm limit. So the usable window is
+# a few centimetres wide, and a single 2.7 m leg scatters by ~5 % — 14 cm — which is why
+# the distance cannot simply be hard-coded.
+TARGET_X_M = 0.67
+APPROACH_TOL_M = 0.03
 # A straight leg sends angular 0, so its heading cannot change by much. When one does,
 # something else has the wheels — measured 2026-09-04, an exit leg came back 0.646 m of a
 # commanded 2.50 with the heading 36.67 deg round, because move 647
@@ -84,6 +93,39 @@ def _clear_foreign(tag: str) -> None:
           f"({m.get('type')}) is running — cancelling it")
     ok = _cancel_move()
     print(f"  [{tag}] cancel {'accepted' if ok else 'FAILED'}")
+
+
+def _measure_panel(cam, det, base_T_cam, frames: int = 3):
+    """Panel centre in the ARM BASE frame, from the same perception the press uses.
+
+    Returns (x, y, n) or None. Costs ~200 ms once the engine and camera are warm, which
+    is why the warm-up is done OUTSIDE the car, before the entry leg: inside, the car may
+    already be moving for somebody else and the seconds are not ours to spend.
+    """
+    import numpy as np
+    from core.transforms import deproject_pixel, transform_point
+    acc = []
+    for _ in range(frames):
+        f = cam.capture()
+        rgb, depth, intr = f.rgb, f.depth, f.intrinsics
+        for d in det.detect(rgb):
+            x1, y1, x2, y2 = d.bbox_xyxy
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            patch = depth[int(y1):int(y2), int(x1):int(x2)]
+            good = patch[patch > 0.05]
+            if not good.size:
+                continue
+            z = float(np.median(good))
+            if z > 2.0:
+                continue
+            bx, by, bz = transform_point(base_T_cam, deproject_pixel(intr, cx, cy, z))
+            if bz < 0.3:            # floor clutter is not a button
+                continue
+            acc.append((bx, by))
+    if len(acc) < 3:
+        return None
+    a = np.array(acc)
+    return float(np.median(a[:, 0])), float(np.median(a[:, 1])), len(acc)
 
 
 def _report(tag: str, ch: Chassis, start) -> tuple:
@@ -134,6 +176,18 @@ def main() -> int:
     ap.add_argument("--margin", type=float, default=0.05, metavar="M")
     ap.add_argument("--window", type=float, default=1.20, metavar="M")
     ap.add_argument("--sweep", type=float, default=40.0, metavar="DEG")
+    ap.add_argument("--target-x", type=float, default=TARGET_X_M, metavar="M",
+                    help="where the panel should sit along the arm's forward axis")
+    ap.add_argument("--approach-tol", type=float, default=APPROACH_TOL_M, metavar="M",
+                    help="do not move at all if the panel is already this close to target")
+    ap.add_argument("--no-approach", action="store_true",
+                    help="skip the measured final approach and press from wherever the "
+                         "dead-reckoned legs land. Faster by ~2 s and occasionally "
+                         "unpressable — see TARGET_X_M for what that costs.")
+    ap.add_argument("--hold", action="store_true",
+                    help="stop after the turn and leave the robot there. For calibrating "
+                         "--back/--turn: measure the panel, adjust, repeat. Without it "
+                         "the run continues to press, aim and drive back out.")
     ap.add_argument("--dry", action="store_true",
                     help="plan and print, move nothing")
     args = ap.parse_args()
@@ -163,6 +217,29 @@ def main() -> int:
                   % (args.back, args.turn, args.press or "nothing", args.back))
             return 0
 
+        # Warm the perception up HERE, outside, where the seconds are free: loading the
+        # TensorRT engine and opening the camera is ~5 s, against ~200 ms for the
+        # measurement itself once warm. Inside the car that 5 s would come out of the
+        # ride, so it is paid before the robot has gone anywhere.
+        cam = det = base_T_cam = None
+        if not (args.no_approach or args.hold):
+            try:
+                import numpy as np
+                sys.path.insert(0, str(REPO))
+                from core.camera.orbbec import OrbbecCamera
+                from core.config import REPO_ROOT
+                from yolo.trt_detector import TrtButtonDetector
+                base_T_cam = np.load(REPO_ROOT / "data/calibration/cam_chest.npy")
+                det = TrtButtonDetector(conf=0.25)
+                cam = OrbbecCamera(camera_id="cam_chest", match_name="335",
+                                   exposure=156, gain=16)
+                cam.start()
+                print("perception warm (engine + camera up before entering)")
+            except Exception as e:                                 # noqa: BLE001
+                print(f"perception unavailable ({type(e).__name__}: {e}) — "
+                      f"continuing without the measured approach")
+                cam = det = None
+
         # remote is taken ONCE, here, and given back only in the finally block
         ch.enter_remote()
         ch.pump(0.3)
@@ -172,7 +249,7 @@ def main() -> int:
         _clear_foreign("in")
         ch.gate_clearance(args.back)
         got, d_ori, reason = _leg(ch, args.back, min(args.speed, MAX_SPEED), 4.0,
-                                  verbose=False)
+                                  verbose=True)
         print(f"  achieved {got:+.3f} m ({reason}), heading {d_ori:+.2f} deg")
         if abs(d_ori) > CONTAMINATED_DEG:
             _clear_foreign("in")
@@ -186,6 +263,51 @@ def main() -> int:
             _clear_foreign("turn")
             _turn(ch, args.turn, args.rate, args.corrections)
         at_panel = _report("at panel", ch, start)
+        if args.hold:
+            print("HOLD: stopping here as asked. Measure the panel, adjust --back/--turn, "
+                  "and re-run; `elevator_runner/goto.py start` drives back to the point.")
+            return 0
+
+        # --- 3b. close the last few centimetres by MEASURING, not by remembering -----
+        if cam is not None and det is not None:
+            m = _measure_panel(cam, det, base_T_cam)
+            if m is None:
+                print("APPROACH: panel not located — leaving the position as it is")
+            else:
+                px, py, n = m
+                err = px - args.target_x
+                print(f"APPROACH: panel at x {px:+.3f} y {py:+.3f} ({n} obs); "
+                      f"target x {args.target_x:+.3f}, off by {err * 100:+.1f} cm")
+                if abs(err) <= args.approach_tol:
+                    print(f"  already inside {args.approach_tol * 100:.0f} cm — not moving")
+                else:
+                    # Moving along the arm's own axis is the most accurate primitive we
+                    # have: short legs land within 2 mm. Negative `move` closes on the
+                    # panel. y is left alone — a straight leg cannot fix it, and the
+                    # measured window in y is wide (-0.15 to -0.40 all pressed).
+                    print(f"  nudging {-err:+.3f} m along the arm axis")
+                    _clear_foreign("approach")
+                    ch.enter_remote()
+                    got, d_ori, reason = _leg(ch, -err, min(args.speed, MAX_SPEED), 4.0,
+                                              verbose=False)
+                    print(f"  achieved {got:+.3f} m ({reason})")
+                    m2 = _measure_panel(cam, det, base_T_cam)
+                    if m2:
+                        print(f"  now at x {m2[0]:+.3f} y {m2[1]:+.3f}"
+                              f"   ({(m2[0] - args.target_x) * 100:+.1f} cm from target)")
+        if cam is not None:
+            # Release the device BEFORE the press starts: two processes on one Orbbec is
+            # how the chest camera gets into the state where it enumerates but never
+            # delivers colour. The method is stop(), not close() — and this must NOT be
+            # swallowed, because a silent failure here leaves the press contending for
+            # the device and the symptom appears one step later, as "no color frame".
+            try:
+                cam.stop()
+                print("camera released before the press")
+            except Exception as e:                                 # noqa: BLE001
+                print(f"  !! could NOT release the camera ({type(e).__name__}: {e}) — "
+                      f"the press may fail with 'no color frame'")
+            cam = None
 
         # --- 4. press -------------------------------------------------------------
         if args.press:
@@ -198,6 +320,13 @@ def main() -> int:
                 print("  " + l)
             if r.returncode != 0:
                 print(f"  press exited {r.returncode} — continuing to the exit anyway")
+            # The press blocks for ~60 s with nothing pumping the topic stream, and the
+            # chassis closes an idle socket. Reconnect and re-assert remote before the
+            # exit, or the next wait_pose dies after the press has already succeeded.
+            ch.reconnect()
+            ch.enter_remote()
+            ch.pump(0.3)
+            print("  chassis stream reconnected after the press")
 
         # --- 5. aim the way out, by MEASURING it ----------------------------------
         out_leg = -args.back
@@ -224,7 +353,12 @@ def main() -> int:
                           f"to aim at, so undoing the turn")
                     aim = -args.turn
                 else:
-                    aim = -mid          # heading_sweep is in the travel frame
+                    # +mid, not -mid: the travel frame negates both axes for a
+                    # backward leg, which preserves handedness, so a clear heading t is
+                    # reached by turning +t either way. The sign was wrong here first and
+                    # the exit turned 27.5 deg the wrong way; the clearance gate refused
+                    # the resulting path, which is the only reason nothing was hit.
+                    aim = mid
                     print(f"  clear band {lo:+d}..{hi:+d} deg; aiming at its middle "
                           f"({mid:+.1f} deg in the travel frame)")
         if abs(aim) >= 0.5:
@@ -237,8 +371,11 @@ def main() -> int:
         print(f"OUT: driving {out_leg:+.2f} m")
         _clear_foreign("out")
         ch.gate_clearance(out_leg)
+        # verbose, deliberately: _leg only reports "wheel_slipping went true during this
+        # leg" when verbose, and suppressing it cost the one explanation available when
+        # an exit leg issued its full 2.70 m of velocity and moved 1.564 m (2026-09-04).
         got, d_ori, reason = _leg(ch, out_leg, min(args.speed, MAX_SPEED), 4.0,
-                                  verbose=False)
+                                  verbose=True)
         print(f"  achieved {got:+.3f} m ({reason}), heading {d_ori:+.2f} deg")
         if abs(d_ori) > CONTAMINATED_DEG:
             _clear_foreign("out")
