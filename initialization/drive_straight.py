@@ -121,6 +121,25 @@ CREEP_YAW = 0.06               # rad/s
 # this one has no measurement behind it yet, so `turn` prints the ratio it achieved on
 # every run and the correction legs absorb the difference meanwhile.
 TURN_RATIO = 1.0
+# Small turns are NOT open-loop predictable on this chassis, and no constant fixes that.
+# Measured 2026-09-04 with the ramp deficit already removed, single legs, settled poses
+# both ends: 10 deg commanded gave 14.9 and 17.2, 20 deg gave 17.2 and 23.5 — a ratio
+# scattered over 0.86 to 1.72 within one minute. The cause is the operating point: a
+# small turn spends its whole duration inside the ramp, at 0.06-0.12 rad/s, which is at
+# the bottom of what the wheels control smoothly. So `turn` closes the loop instead of
+# trusting a model, and DAMPS each correction to CORR_GAIN of what is left, which
+# converges monotonically even when a single step is 70 % out. Below TURN_FLOOR_DEG the
+# plant does not respond usefully at all, so the loop stops rather than chasing noise.
+# And the floor is the chassis's own resolution, measured rather than chosen: with the
+# ramp capped so every turn gets a real push, single turns of 3-12 deg still came back
+# +2.2, +3.0, -2.1, -2.9 and -4.0 deg off, and commands below ~3 deg frequently moved the
+# base NOT AT ALL (0.0 deg, three times running) before breaking away to 2.9. This is the
+# plant, not the measurement: ori held its value for 20 s after a turn, so nothing was
+# still settling. So ~3 deg is the angular resolution of this base, the damped loop stops
+# there instead of chasing noise, and anything needing better than 3 deg of heading has to
+# get it some other way.
+CORR_GAIN = 0.6
+TURN_FLOOR_DEG = 3.0
 
 # STALL DETECTION DOES NOT USE THE POSE. /tracked_pose is 1 Hz AND repeats the same
 # value across consecutive messages while the base is moving (SLAM settles late), so
@@ -134,6 +153,21 @@ STALL_CURRENT_S = 0.8
 # so it is a poor stall signal — like the pose, it is unreliable while moving. It costs
 # nothing to report, and the distance loop reads before/after pose rather than odometry,
 # so a slip cannot corrupt the measurement anyway.
+
+# WHY BOTH LEGS INTEGRATE WHAT THEY COMMAND (_integral_note, 2026-09-04)
+# Both loops used to run for `target / speed` seconds and stop. But both ramp DOWN over
+# the last stretch, and the ramp was not in that sum, so every leg came up short by
+# roughly the ramp's own deficit — a FIXED loss, independent of how far the leg was.
+# Measured on three clean single turns: 10 deg commanded gave 6.9, 23 gave 20.1, 90 gave
+# 84.4, which fits `achieved = 0.969 * commanded - 2.8 deg`. That constant 2.8 deg is
+# 28 % of a 10 deg turn and 3 % of a 90 deg one, which is exactly why the "ratio" looked
+# like it wandered between 0.69 and 0.96 with no pattern. Correcting a small angle was
+# therefore untrustworthy, and correcting a small angle is precisely what aligning to a
+# doorway needs.
+# The fix is not another constant: the loop now accumulates the velocity it actually
+# sends and stops when that integral reaches the target, so the ramp pays for itself.
+# SPEED_RATIO / TURN_RATIO stay, but they now mean only what they say — the slip between
+# what the wheels were told and what the floor gave back.
 
 _stop_requested = False
 
@@ -431,11 +465,17 @@ def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
     docstring). The pose is still watched, but only for stalls and heading drift, and
     both are judged on FRESH samples.
     """
-    start = ch.wait_pose()
+    # The START must be settled too, not just the end. Reading a stale start pose
+    # makes the leg's own measurement wrong in whichever direction the previous motion
+    # was still catching up in — and back-to-back legs are exactly when that bites.
+    start = _settled_pose(ch) or ch.wait_pose()
     linear = math.copysign(speed, metres)
     target = abs(metres)
-    duration = target / (speed * SPEED_RATIO)
-    timeout = duration + 6.0
+    # Issue MORE than the target, by the calibrated loss, and count what is actually
+    # sent rather than how long the leg has been running. See _integral_note.
+    want = target / SPEED_RATIO
+    timeout = want / max(speed, 1e-6) + 8.0
+    ramp_m = min(RAMP_M, 0.4 * want)   # same reason as the turn's ramp — see _spin_leg
 
     if ch.estop:
         return 0.0, 0.0, "emergency stop is pressed"
@@ -449,15 +489,17 @@ def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
     last_log = t0
     reason = "leg complete"
 
+    issued = 0.0
+    last_tick = t0
     while True:
         elapsed = time.time() - t0
-        done = min(1.0, elapsed / duration) if duration > 0 else 1.0
-        remaining_m = target * (1.0 - done)
-        if remaining_m < RAMP_M:
-            scale = max(CREEP_MPS / speed, remaining_m / RAMP_M)
-            ch.send_twist(math.copysign(speed * scale, linear))
+        remaining_m = max(0.0, want - issued)
+        if remaining_m < ramp_m:
+            scale = max(CREEP_MPS / speed, remaining_m / ramp_m)
         else:
-            ch.send_twist(linear)
+            scale = 1.0
+        v = speed * scale
+        ch.send_twist(math.copysign(v, linear))
         ch.pump()
 
         next_tick += period
@@ -467,8 +509,10 @@ def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
         else:
             next_tick = time.time()
         now = time.time()
+        issued += v * (now - last_tick)
+        last_tick = now
 
-        if elapsed >= duration:
+        if issued >= want:
             break
         if _stop_requested:
             reason = "interrupted"
@@ -492,8 +536,8 @@ def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
             slip_seen = True          # reported at the end, never an abort
 
         if verbose and now - last_log >= 1.0:
-            print("    t+%4.1fs  commanded %.2f/%.2f m   current %s A"
-                  % (elapsed, target * done, target,
+            print("    t+%4.1fs  issued %.2f/%.2f m   current %s A"
+                  % (elapsed, issued, want,
                      "?" if ch.current is None else f"{ch.current:.1f}"))
             last_log = now
 
@@ -563,15 +607,20 @@ def _spin_leg(ch: Chassis, degrees_: float, yaw_rate: float,
     cannot be closed on it either. Position is watched as the SANITY check here —
     an in-place turn that translates is a turn the wheels are not executing.
     """
-    start = ch.wait_pose()
+    start = _settled_pose(ch) or ch.wait_pose()
     if ch.estop:
         return 0.0, 0.0, "emergency stop is pressed"
 
     target = abs(math.radians(degrees_))
     angular = math.copysign(yaw_rate, degrees_)
-    duration = target / (yaw_rate * TURN_RATIO)
-    timeout = duration + 6.0
-    ramp = math.radians(TURN_RAMP_DEG)
+    want = target / TURN_RATIO
+    timeout = want / max(yaw_rate, 1e-6) + 8.0
+    # The ramp limits the coast at the END of a turn. On a turn shorter than the ramp
+    # it swallowed the whole motion instead, leaving the wheels at 0.06-0.12 rad/s —
+    # below breakaway, so a commanded 1.5 deg measured 0.0 deg three times running and
+    # then jumped to 2.9. Cap it at a fraction of the turn so every turn gets a real
+    # push before it slows down.
+    ramp = min(math.radians(TURN_RAMP_DEG), 0.4 * want)
 
     if verbose:
         print(f"    (base reports control_mode={ch.mode})")
@@ -581,15 +630,17 @@ def _spin_leg(ch: Chassis, degrees_: float, yaw_rate: float,
     last_log = t0
     reason = "turn complete"
 
+    issued = 0.0
+    last_tick = t0
     while True:
         elapsed = time.time() - t0
-        done = min(1.0, elapsed / duration) if duration > 0 else 1.0
-        remaining = target * (1.0 - done)
+        remaining = max(0.0, want - issued)
         if remaining < ramp:
             scale = max(CREEP_YAW / yaw_rate, remaining / ramp)
-            ch.send_spin(math.copysign(yaw_rate * scale, angular))
         else:
-            ch.send_spin(angular)
+            scale = 1.0
+        w = yaw_rate * scale
+        ch.send_spin(math.copysign(w, angular))
         ch.pump()
 
         next_tick += period
@@ -599,8 +650,10 @@ def _spin_leg(ch: Chassis, degrees_: float, yaw_rate: float,
         else:
             next_tick = time.time()
         now = time.time()
+        issued += w * (now - last_tick)
+        last_tick = now
 
-        if elapsed >= duration:
+        if issued >= want:
             break
         if _stop_requested:
             reason = "interrupted"
@@ -619,8 +672,8 @@ def _spin_leg(ch: Chassis, degrees_: float, yaw_rate: float,
             stall_since = None
 
         if verbose and now - last_log >= 1.0:
-            print("    t+%4.1fs  commanded %.1f/%.1f deg   current %s A"
-                  % (elapsed, math.degrees(target * done), abs(degrees_),
+            print("    t+%4.1fs  issued %.1f/%.1f deg   current %s A"
+                  % (elapsed, math.degrees(issued), math.degrees(want),
                      "?" if ch.current is None else f"{ch.current:.1f}"))
             last_log = now
 
@@ -652,20 +705,23 @@ def spin(ch: Chassis, degrees_: float, yaw_rate: float, tol_deg: float,
     ch.pump(0.3)
 
     total = 0.0
-    want = degrees_
     for attempt in range(corrections + 1):
-        if abs(want) < 0.5:
+        remaining = degrees_ - total
+        if abs(remaining) <= max(tol_deg, TURN_FLOOR_DEG if attempt else 0.0):
             break
-        leg_rate = yaw_rate if attempt == 0 else min(yaw_rate, 0.12)
+        # First leg goes for the whole angle; every correction is DAMPED, because a
+        # single small turn can come out 70 % over (see the note by CORR_GAIN).
+        want = remaining if attempt == 0 else remaining * CORR_GAIN
+        if attempt and abs(want) < TURN_FLOOR_DEG:
+            want = math.copysign(TURN_FLOOR_DEG, want)
         ch.enter_remote()                     # re-assert; see the keepalive note
-        got, drift, reason = _spin_leg(ch, want, leg_rate)
+        got, drift, reason = _spin_leg(ch, want, yaw_rate)
         total += got
         print(f"  turn {attempt + 1}: commanded {want:+.1f} deg -> achieved "
-              f"{got:+.1f} deg ({reason}), position drift {drift * 1000:.0f} mm")
+              f"{got:+.1f} deg (remaining {degrees_ - total:+.1f}), "
+              f"drift {drift * 1000:.0f} mm")
         if reason != "turn complete":
-            break
-        want = degrees_ - total
-        if abs(want) <= tol_deg:
+            print(f"    stopped: {reason}")
             break
 
     end = ch.pose or start
@@ -818,10 +874,10 @@ def main() -> int:
                        help="signed degrees, in place (linear pinned to 0)")
     t.add_argument("degrees", type=float)
     t.add_argument("--rate", type=float, default=0.20, metavar="RADPS")
-    t.add_argument("--tol", type=float, default=1.0, metavar="DEG",
+    t.add_argument("--tol", type=float, default=3.0, metavar="DEG",
                    help="stop correcting once within this of the target")
-    t.add_argument("--corrections", type=int, default=1,
-                   help="extra short turns allowed to close the remaining angle")
+    t.add_argument("--corrections", type=int, default=4,
+                   help="damped closed-loop corrections allowed after the first turn")
     t.add_argument("--no-gate", action="store_true",
                    help="skip the lidar all-round check (not recommended)")
 

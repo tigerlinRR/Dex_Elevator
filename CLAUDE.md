@@ -492,6 +492,30 @@ square to the robot cannot be reached by translating.
 - A whole re-position — turn -90, translate 0.265 m, turn +90 — came back to within
   **0.57 deg** of the original heading, which is the pose feed's own quantisation.
 
+**Legs are driven on the INTEGRAL of what was commanded, and the ramp is capped**
+(2026-09-04). Both loops used to run for `target / speed` seconds; both also ramp down
+over the last stretch, and that was not in the sum, so every leg lost the ramp's own
+deficit — a FIXED loss, which is why the turn "ratio" looked like it wandered between
+0.69 and 0.96 (it fitted `achieved = 0.969 * commanded - 2.8 deg`). Worse, a leg shorter
+than the ramp spent its whole duration inside it, below the wheels' breakaway. Now each
+loop accumulates the velocity it sends and stops when that integral reaches the target,
+and the ramp is capped at 40 % of the leg. Straight legs measured after: 1.00 m -> 0.988,
+0.40 -> 0.390, 0.15 -> 0.152, heading 0.00 deg.
+
+**~3 degrees is this chassis's angular resolution — treat it as a constraint.** With the
+ramp deficit gone, single turns of 3-12 deg still came back 2-4 deg off, and commands
+below ~3 deg often moved the base NOT AT ALL (0.0 deg three times running, then a
+break-away to 2.9). It is the plant, not the measurement: `ori` held its value for 20 s
+after a turn and the feed quantises at 0.573 deg. So `turn` closes the loop and DAMPS each
+correction to 60 % of what remains, stopping at a 3 deg floor. Consequence worth stating
+before designing anything on top: 3 deg over the ~1.2 m it takes to clear a doorway is
+~6 cm of lateral drift, which is the entire margin of a 0.9 m door against a 0.8 m robot.
+
+**The chassis rotation centre is 0.281 m BEHIND the arm base origin** (arm-frame
+(-0.281, +0.030), solved from one measured turn). So a turn changes the panel's RANGE as
+well as its bearing — which is what makes "one straight leg plus one turn" able to satisfy
+both, and why a turn is not a pure re-aim.
+
 **Read the pose only after it has SETTLED** (`_settled_pose`, 2026-09-02). Waiting for
 "a couple of fresh samples" after braking was not enough: SLAM settles late, so the
 sample arriving right after the brake still describes a place the robot has left. A leg

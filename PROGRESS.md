@@ -2,6 +2,87 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ ONE TURN IS ENOUGH TO REACH THE PANEL; COMING BACK BY ODOMETRY IS NOT (2026-09-04)
+
+The flow the operator wants — park at a fixed point, reverse in, turn once, press, turn
+back, drive straight out — was run end to end. **The first half works and the second half
+does not**, and both halves produced a number worth keeping.
+
+| | |
+|---|---|
+| recipe from the fixed point | reverse **2.558 m**, turn **−25.2°** |
+| result | four buttons **24/24 rolls**, margins **60.7–69.5°** |
+| press | **4/4 in 62.8 s**, depth −3.01…−3.05 mm, lateral 0.11–0.39 mm |
+| round trip back to the fixed point | **0.373 m and 9.2° out** |
+
+One turn really is enough, and this pose was better than the one that pressed on 09-02
+(which had buttons at 1/24 and 2/24). Worth knowing why: the turn moves the arm base as
+well as aiming it, because **the chassis rotation centre sits 0.281 m behind the arm base
+origin** (solved from a measured turn: arm-frame (−0.281, +0.030)). So a turn changes the
+panel's range as well as its bearing, which is what makes distance and bearing solvable
+with one straight leg plus one turn.
+
+### The return is the part that fails, and it is not fixable by tuning
+
+Driving back out on dead reckoning missed by 37 cm and 9.2°. Against a 0.9 m car door and
+a 0.8 m robot — 5 cm of margin per side — that does not fit. **So the exit cannot be
+dead-reckoned; it has to be referenced to the door itself**, and the lidar is the only
+sensor that can see it (the chest camera faces the doors only from inside, and the exit
+is the one leg where being wrong is expensive). The measurement is cheap and can be taken
+during the ride, when the robot is otherwise idle: a lidar frame is 2.00 Hz with 74 ms of
+latency, i.e. ~1 s for two confirming reads, against a 62.8 s press. Only the straight leg
+itself has to happen inside the door window.
+
+### Legs now integrate what they command, and short legs stopped being wrong
+
+Both loops used to run for `target / speed` seconds. Both also ramp DOWN over the last
+stretch, and that was not in the sum — so every leg lost roughly the ramp's own deficit, a
+**fixed** loss independent of leg length. It fitted `achieved = 0.969 × commanded − 2.8°`
+across three clean turns, which is 28 % of a 10° turn and 3 % of a 90° one: exactly why the
+"ratio" looked like it wandered between 0.69 and 0.96 with no pattern. Worse, a leg shorter
+than the ramp spent its whole duration inside it.
+
+The loop now accumulates the velocity it actually sends and stops when that integral
+reaches the target, and the ramp is capped at 40 % of the leg. Straight legs, measured
+after:
+
+| commanded | achieved | error | before the fix |
+|---|---|---|---|
+| 1.00 m | 0.988 m | 12 mm | — |
+| 0.40 m | 0.390 m | 10 mm | 0.80 → 0.676 (124 mm) |
+| 0.15 m | 0.152 m | 2 mm | 0.075 → 0.083 |
+
+### The chassis cannot turn finer than about 3°, and that is the plant
+
+With the ramp deficit gone, single turns of 3–12° still came back +2.2, +3.0, −2.1, −2.9
+and −4.0° off, and **commands below ~3° frequently moved the base not at all** — 0.0°
+three times running, then a break-away to 2.9°. That is stiction, not measurement: `ori`
+held its value for **20 s** after a turn, so nothing was still converging, and the feed's
+own quantisation is 0.573°.
+
+So `turn` closes the loop instead of trusting a model, damping each correction to 60 % of
+what remains (a single step can be 70 % out, and damping converges monotonically anyway),
+and stops at a 3° floor rather than chasing noise. Measured: +15° requested → 16.0°, +5° →
+5.2°.
+
+**The consequence is a design constraint, not a tuning target.** ±3° of heading over the
+~1.2 m it takes to clear a doorway is ~6 cm of lateral drift, which is the whole margin of
+a 0.9 m door. Either the target elevator's doors are wider than that, or exiting needs
+something better than in-place turns. **Measure the real door width before designing the
+exit** — it decides whether this approach works at all.
+
+### Still open
+- Align the exit to the door with the lidar (the measurement fits in the ride's dead time).
+- Profile the press per phase before optimising it: 62.8 s for four buttons is ~15 s each,
+  and the suspects are the return to home between every button, the lift moving serially
+  with the arm, and the 0.35 s settle between moves — but this project has been burned by
+  step-by-step timings before, so measure the real call.
+- Identity verification at the reachable distance (anchors 0/4) — still the arm-camera
+  argument.
+- The fixed point outside the door should be an AutoXing waypoint, not a dead-reckoned
+  one: `elevator test` docks to 1.5–2.3 cm, which is what makes a recorded recipe
+  replayable at all.
+
 ## ▶ THE BASE TURNS IN PLACE, AND PRESSED 4/4 AT A NEW SITE IT DROVE ITSELF TO (2026-09-02)
 
 The robot went from the charging dock to a pressable pose under its own power — straight
