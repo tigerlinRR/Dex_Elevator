@@ -516,6 +516,29 @@ before designing anything on top: 3 deg over the ~1.2 m it takes to clear a door
 well as its bearing — which is what makes "one straight leg plus one turn" able to satisfy
 both, and why a turn is not a pure re-aim.
 
+**The chassis has a LOCAL navigation API, not just twist** (`/chassis/moves`, found
+2026-09-04). This corrects an assumption the straight-line driver was built under — that
+anything beyond a straight line had to go through AutoXing's cloud. It does not:
+
+    GET  /chassis/               -> Move Actions, Current Map, Pose, Status
+    GET  /chassis/moves          -> history; each has type, target pose, state
+    POST /chassis/moves          -> {"creator","type","target_x","target_y","target_ori"}
+    GET  /chassis/moves/current  -> 404 when nothing is running
+    GET  /services               -> the full service list (estop, wheels, lidar power, …)
+
+Types seen in this robot's own history: **`charge`, `standard`, `along_given_route`**.
+Verified by sending one: a `charge` move to the pose the control_unit itself last used
+(12.955, -17.617, ori -0.219) docked the robot and it drew -2.1 A within **24 s**.
+- **A local move runs in the chassis's planner, exactly like a cloud task** — so killing
+  the process that posted it does NOT stop the robot. Cancel it, or take the wheels away
+  with `set_control_mode remote` (which is what the straight-line driver does anyway).
+- **The charge target is an approach pose, not where the robot ends up.** Docked, the
+  tracked pose read (13.348, -18.25, ori -0.0) against that target — 0.74 m and 12 deg
+  away — because the chassis does its own contact-seeking at the end. Do not read a
+  completed charge move's target as the robot's position.
+- Worth revisiting what this unlocks: `elevator_runner` drives through the cloud today,
+  which is where the ~24 s of arrival lag and the read-only map both come from.
+
 **Aligning to a doorway is a HEADING SWEEP, not a gap measurement**
 (`drive_straight.py align`, 2026-09-04). The first version found the nearest return on
 each side and called the space between them the opening; facing a blank wall 1.66 m away

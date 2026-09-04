@@ -84,6 +84,22 @@ Taking the operator's 1.1 m door: 30 cm of total margin, 15 cm a side, against t
 of drift that 3 deg of unresolvable heading costs over the ~1.2 m of a doorway. It fits,
 with room — which is what makes this approach viable at all.
 
+### The chassis turns out to have a LOCAL navigation API
+
+Looking for a way to send the robot back to its charger surfaced `/chassis/moves` — a
+local move-action endpoint with types `charge`, `standard` and `along_given_route`. That
+contradicts the assumption the straight-line driver was built under, that anything beyond
+a straight line had to go through AutoXing's cloud. Verified by using it: a `charge` move
+docked the robot and it drew -2.1 A within 24 s.
+
+Two cautions, both learned elsewhere and both applying here: a local move runs in the
+chassis's own planner, so killing the process that posted it does not stop the robot; and
+a charge move's target is an approach pose, not where the robot ends up — docked, the
+pose read 0.74 m and 12 deg away from the target it was given.
+
+Worth revisiting properly, because `elevator_runner` drives through the cloud today, and
+that is where the ~24 s of arrival lag and the read-only map both come from.
+
 ### Still open
 - Profile the press per phase before optimising it: 62.8 s for four buttons is ~15 s each,
   and the suspects are the return to home between every button, the lift moving serially
