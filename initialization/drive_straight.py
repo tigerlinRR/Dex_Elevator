@@ -169,6 +169,33 @@ STALL_CURRENT_S = 0.8
 # SPEED_RATIO / TURN_RATIO stay, but they now mean only what they say — the slip between
 # what the wheels were told and what the floor gave back.
 
+# PER-DIRECTION leg model, measured 2026-09-04 by `calibrate_legs.py`. This chassis is
+# NOT symmetric: over 0.4/0.8/1.2 m legs the base's own front delivered 82.5/93.2/98.2 %
+# of what was asked while the arm-ward direction delivered 73.0/62.5/61.6 %. Fitting
+# `achieved = k * commanded - c` gives k 1.061 / c +97 mm one way and k 0.559 / c -63 mm
+# the other, with residuals of 4 and 7 mm — a clean model, not scatter. A single shared
+# SPEED_RATIO cannot describe both, and what it hid was paid for by the correction legs on
+# every single move: the visible "stop, then shuffle again" the operator asked about.
+LEG_K_FWD, LEG_C_FWD = 1.061, 0.097
+LEG_K_BACK, LEG_C_BACK = 0.559, -0.063
+# The fit is only valid where it was measured. Extrapolated to zero the arm-ward line
+# claims 63 mm of travel for a commanded 0, which is nonsense, and at 2.7 m it predicted
+# 2.768 against 2.826 measured. So it is applied only over the calibrated band; shorter
+# legs keep the old behaviour and lean on the measure-move-measure loop, which is what
+# absorbs the few-centimetre corrections anyway.
+LEG_MODEL_MIN_M = 0.30
+LEG_MODEL_MAX_M = 1.60
+
+
+def _model_target(metres: float) -> float:
+    """What to ask the timed loop for, so that the wheels deliver `metres`."""
+    d = abs(metres)
+    if not (LEG_MODEL_MIN_M <= d <= LEG_MODEL_MAX_M):
+        return d
+    k, c = (LEG_K_FWD, LEG_C_FWD) if metres >= 0 else (LEG_K_BACK, LEG_C_BACK)
+    return max(d, (d + c) / k)
+
+
 _stop_requested = False
 
 
@@ -490,7 +517,7 @@ def _leg(ch: Chassis, metres: float, speed: float, ori_tol: float,
     target = abs(metres)
     # Issue MORE than the target, by the calibrated loss, and count what is actually
     # sent rather than how long the leg has been running. See _integral_note.
-    want = target / SPEED_RATIO
+    want = _model_target(metres) / SPEED_RATIO
     timeout = want / max(speed, 1e-6) + 8.0
     ramp_m = min(RAMP_M, 0.4 * want)   # same reason as the turn's ramp — see _spin_leg
 

@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,8 +40,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import requests  # noqa: E402
 
 from drive_straight import (  # noqa: E402
-    HALF_WIDTH_M, HOST, HULL_M, MAX_SPEED, PORT, TURN_FLOOR_DEG, Chassis, _leg,
-    _settled_pose, _wrap_deg, clear_band, heading_sweep,
+    HALF_WIDTH_M, HOST, HULL_M, MAX_SPEED, PORT, TURN_FLOOR_DEG, Chassis, _settled_pose,
+    _wrap_deg, clear_band, drive, heading_sweep,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -128,8 +130,107 @@ def _measure_panel(cam, det, base_T_cam, frames: int = 3):
     return float(np.median(a[:, 0])), float(np.median(a[:, 1])), len(acc)
 
 
+_T0 = None
+_MARKS = []
+
+
+def _mark(label: str) -> None:
+    """Timestamp a phase boundary. Measure before optimising: this project has produced a
+    step-by-step profile whose parts summed to 10 ms for a call that took 26."""
+    global _T0
+    now = time.time()
+    if _T0 is None:
+        _T0 = now
+        _MARKS.append((label, now, 0.0))
+        print(f"  [t+  0.0s] {label}")
+        return
+    prev = _MARKS[-1][1]
+    _MARKS.append((label, now, now - prev))
+    print(f"  [t+{now - _T0:6.1f}s] {label}   (+{now - prev:.1f}s)")
+
+
+def _profile() -> None:
+    if len(_MARKS) < 2:
+        return
+    print("\n=== where the time went ===")
+    for label, _, dt in _MARKS[1:]:
+        print(f"  {dt:6.1f}s  {label}")
+    print(f"  {_MARKS[-1][1] - _T0:6.1f}s  TOTAL")
+
+
+class Halted(Exception):
+    """The emergency stop went on mid-run. Marching through the remaining phases with a
+    dead base — which this harness did once, all the way to launching the press — turns
+    one clear cause into a page of consequences."""
+
+
+def _drive(ch: Chassis, metres: float, args) -> None:
+    """Every straight leg goes through drive(), never a bare _leg.
+
+    A single uncorrected leg is NOT reliable in the arm-ward (-ori) direction: measured
+    2026-09-04, a 0.099 m nudge moved 0.045 and an exit leg issued its full 3.00 m of
+    velocity over 15.3 s and travelled 1.553. It is a start-up lag rather than a speed
+    cap — 1.553 m is exactly 7.8 s at the commanded 0.20 m/s, so the base spends the first
+    ~7.5 s of a leg not moving. Legs the other way OVER-deliver by ~5 %. drive()'s
+    correction legs absorb both, which is why every accurate figure recorded until now
+    came from that path and why calling _leg directly here quietly produced a press at
+    +10 cm, where the arm had no IK solution at all.
+    """
+    # tol 0.03, not 0.02: below ~3 cm this base does not respond — the same stiction
+    # floor the turns have. With the per-direction leg model in place the first leg lands
+    # within a couple of centimetres, and a 2 cm tolerance then spent two or three further
+    # legs commanding 21-24 mm and achieving 0.000, which is the visible "stop and shuffle
+    # again" with nothing to show for it.
+    drive(ch, metres, min(args.speed, MAX_SPEED), 4.0, 0.03, 3)
+    ch.pump(0.1)
+    if ch.estop:
+        raise Halted("emergency stop pressed during a leg")
+
+
+def _prewarm_press(floors: str, extra: str, token: Path, log: Path):
+    """Start the press NOW and let it block on a token, so its startup overlaps the drive.
+
+    Measured 2026-09-04: from the turn finishing to the arm moving was ~14 s, of which
+    ~7.3 s is startup that does not depend on where the robot is — 2.8 s loading the
+    TensorRT engine, 2.5 s opening the camera, ~1.5 s ramping the GPU off its 306 MHz idle
+    clock, 0.4 s connecting the arm. `elevator_runner` already pays that during its drive
+    (8.3 s -> 1.6 s); this harness was paying it after arriving, every run.
+
+    Nothing about WHEN to press moves into the child — it blocks on a file this process
+    writes after the turn. Letting the press decide arrival for itself is what drove the
+    arm into the panel once.
+    """
+    try:
+        token.unlink()
+    except FileNotFoundError:
+        pass
+    cmd = [sys.executable, str(REPO / "initialization" / "press_buttons.py")]
+    cmd += floors.split() + extra.split() + ["--go", "--wait-go", str(token)]
+    fh = open(log, "w")
+    proc = subprocess.Popen(cmd, cwd=str(REPO), stdout=fh, stderr=subprocess.STDOUT,
+                            text=True)
+    return proc, fh
+
+
+def _wait_prewarm(proc, log: Path, timeout: float = 40.0) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if proc.poll() is not None:
+            return False
+        try:
+            if "PREWARM_READY" in log.read_text():
+                return True
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
 def _report(tag: str, ch: Chassis, start) -> tuple:
-    p = _settled_pose(ch) or ch.wait_pose()
+    # `ch.pose` is already SETTLED here: every leg and every turn ends by waiting for two
+    # consecutive agreeing samples. Re-settling cost a measured 2.0 s per report at the
+    # 1 Hz pose feed, purely to print a line.
+    p = ch.pose or ch.wait_pose()
     print(f"  [{tag}] pose x={p[0]:.3f} y={p[1]:.3f} ori={p[2]:+.4f}"
           f"   from start: {math.hypot(p[0] - start[0], p[1] - start[1]) * 100:.1f} cm, "
           f"{_wrap_deg(p[2] - start[2]):+.1f} deg")
@@ -195,7 +296,12 @@ def main() -> int:
     ch = Chassis()
     ch.check_identity()
     ch.open_stream()
+    proc = fh = None
     try:
+        ch.pump(1.0)
+        if ch.estop:
+            return print("ABORT: the emergency stop is pressed — nothing here can move, "
+                         "and the arm controllers are unpowered too") or 4
         start = _settled_pose(ch) or ch.wait_pose()
         print(f"START pose x={start[0]:.3f} y={start[1]:.3f} ori={start[2]:+.4f}")
         half = HALF_WIDTH_M + args.margin
@@ -217,12 +323,94 @@ def main() -> int:
                   % (args.back, args.turn, args.press or "nothing", args.back))
             return 0
 
-        # Warm the perception up HERE, outside, where the seconds are free: loading the
-        # TensorRT engine and opening the camera is ~5 s, against ~200 ms for the
-        # measurement itself once warm. Inside the car that 5 s would come out of the
-        # ride, so it is paid before the robot has gone anywhere.
-        cam = det = base_T_cam = None
-        if not (args.no_approach or args.hold):
+        # PRE-WARM the press here, outside, where the seconds are free — it holds the
+        # camera and the engine from now until it presses, so the harness does NOT open a
+        # camera of its own. Two processes on one Orbbec is how the chest 335 gets into
+        # the state where it enumerates but delivers no colour.
+        # The measured approach moved to a FALLBACK for the same reason: it needs the
+        # camera. Since the per-direction leg model went in, four consecutive runs landed
+        # the panel 0.3-4.2 cm from target and the correction chose not to move every
+        # time, so paying 4.9 s of measurement on every run to catch a case that has not
+        # occurred is the wrong trade. If the press refuses, the camera is free by then
+        # and the harness measures, nudges and retries.
+        token = Path(f"/tmp/dex_mock_go_{os.getpid()}")
+        log = Path(f"/tmp/dex_mock_press_{os.getpid()}.log")
+        if args.press and not args.hold:
+            proc, fh = _prewarm_press(args.press, args.press_args, token, log)
+            ready = _wait_prewarm(proc, log)
+            print(f"press pre-warm {'ready' if ready else 'NOT ready (continuing)'} "
+                  f"— its ~7 s of startup now overlaps the drive")
+
+        # remote is taken ONCE, here, and given back only in the finally block
+        ch.enter_remote()
+        ch.pump(0.3)
+
+        # --- 2. in ---------------------------------------------------------------
+        _mark("entry leg starts")
+        print(f"IN: reversing {args.back:.2f} m")
+        _clear_foreign("in")
+        _drive(ch, args.back, args)
+        _mark("entry leg done")
+        after = _report("in", ch, start)
+        d_ori = _wrap_deg(after[2] - start[2])
+        if abs(d_ori) > CONTAMINATED_DEG:
+            _clear_foreign("in")
+            return print(f"ABORT: the entry leg turned {d_ori:+.1f} deg — a straight leg "
+                         f"sends angular 0, so something else had the wheels") or 3
+
+        # --- 3. face the panel ----------------------------------------------------
+        if abs(args.turn) >= 0.5:
+            _mark("turn starts")
+            print(f"TURN: {args.turn:+.1f} deg to face the panel")
+            _clear_foreign("turn")
+            _turn(ch, args.turn, args.rate, args.corrections)
+        _mark("turn done")
+        at_panel = _report("at panel", ch, start)
+        if args.hold:
+            print("HOLD: stopping here as asked. Measure the panel, adjust --back/--turn, "
+                  "and re-run; `elevator_runner/goto.py start` drives back to the point.")
+            return 0
+
+        # --- 4. press: release the pre-warmed child ------------------------------
+        _mark("press released")
+        press_rc = 0
+        if args.press and proc is not None:
+            print(f"PRESS: releasing the pre-warmed child ({args.press})")
+            token.touch()
+            proc.wait()
+            press_rc = proc.returncode
+            out = log.read_text()
+            for l in [x for x in out.splitlines() if x.strip()][-3:]:
+                print("  " + l)
+            if fh:
+                fh.close()
+            proc = None
+        elif args.press:
+            cmd = [sys.executable, str(REPO / "initialization" / "press_buttons.py")]
+            cmd += args.press.split() + args.press_args.split() + ["--go"]
+            print(f"PRESS (cold, no pre-warm): {' '.join(cmd[1:])}")
+            r = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True)
+            press_rc = r.returncode
+            for l in [x for x in r.stdout.splitlines() if x.strip()][-3:]:
+                print("  " + l)
+
+        if args.press:
+            # The press blocks for ~60 s with nothing pumping the topic stream, and the
+            # chassis closes an idle socket. Reconnect and re-assert remote before the
+            # exit, or the next wait_pose dies after the press has already succeeded.
+            ch.reconnect()
+            ch.enter_remote()
+            ch.pump(0.3)
+
+        # --- 4b. FALLBACK: only if the press could not reach ----------------------
+        # The camera is free now, so this costs nothing on a good run. It exists because
+        # a panel outside the reachable window produces "no IK at standoff" for every
+        # roll — measured at x 0.731 — and the cure is a few centimetres of base motion,
+        # which the press cannot do for itself.
+        if args.press and press_rc != 0 and not args.no_approach:
+            print(f"  press exited {press_rc} — measuring and retrying once")
+            _mark("fallback approach")
+            cam = det = base_T_cam = None
             try:
                 import numpy as np
                 sys.path.insert(0, str(REPO))
@@ -234,104 +422,49 @@ def main() -> int:
                 cam = OrbbecCamera(camera_id="cam_chest", match_name="335",
                                    exposure=156, gain=16)
                 cam.start()
-                print("perception warm (engine + camera up before entering)")
+                m = _measure_panel(cam, det, base_T_cam)
             except Exception as e:                                 # noqa: BLE001
-                print(f"perception unavailable ({type(e).__name__}: {e}) — "
-                      f"continuing without the measured approach")
-                cam = det = None
-
-        # remote is taken ONCE, here, and given back only in the finally block
-        ch.enter_remote()
-        ch.pump(0.3)
-
-        # --- 2. in ---------------------------------------------------------------
-        print(f"IN: reversing {args.back:.2f} m")
-        _clear_foreign("in")
-        ch.gate_clearance(args.back)
-        got, d_ori, reason = _leg(ch, args.back, min(args.speed, MAX_SPEED), 4.0,
-                                  verbose=True)
-        print(f"  achieved {got:+.3f} m ({reason}), heading {d_ori:+.2f} deg")
-        if abs(d_ori) > CONTAMINATED_DEG:
-            _clear_foreign("in")
-            return print(f"ABORT: the entry leg turned {d_ori:+.1f} deg — a straight leg "
-                         f"sends angular 0, so something else had the wheels") or 3
-        _report("in", ch, start)
-
-        # --- 3. face the panel ----------------------------------------------------
-        if abs(args.turn) >= 0.5:
-            print(f"TURN: {args.turn:+.1f} deg to face the panel")
-            _clear_foreign("turn")
-            _turn(ch, args.turn, args.rate, args.corrections)
-        at_panel = _report("at panel", ch, start)
-        if args.hold:
-            print("HOLD: stopping here as asked. Measure the panel, adjust --back/--turn, "
-                  "and re-run; `elevator_runner/goto.py start` drives back to the point.")
-            return 0
-
-        # --- 3b. close the last few centimetres by MEASURING, not by remembering -----
-        if cam is not None and det is not None:
-            m = _measure_panel(cam, det, base_T_cam)
-            if m is None:
-                print("APPROACH: panel not located — leaving the position as it is")
-            else:
+                print(f"  fallback perception unavailable ({type(e).__name__}: {e})")
+                m = None
+            if m is not None:
                 px, py, n = m
                 err = px - args.target_x
-                print(f"APPROACH: panel at x {px:+.3f} y {py:+.3f} ({n} obs); "
-                      f"target x {args.target_x:+.3f}, off by {err * 100:+.1f} cm")
-                if abs(err) <= args.approach_tol:
-                    print(f"  already inside {args.approach_tol * 100:.0f} cm — not moving")
-                else:
-                    # Moving along the arm's own axis is the most accurate primitive we
-                    # have: short legs land within 2 mm. Negative `move` closes on the
-                    # panel. y is left alone — a straight leg cannot fix it, and the
-                    # measured window in y is wide (-0.15 to -0.40 all pressed).
+                print(f"  panel at x {px:+.3f} y {py:+.3f} ({n} obs); off by "
+                      f"{err * 100:+.1f} cm")
+                if abs(err) > args.approach_tol:
                     print(f"  nudging {-err:+.3f} m along the arm axis")
                     _clear_foreign("approach")
-                    ch.enter_remote()
-                    got, d_ori, reason = _leg(ch, -err, min(args.speed, MAX_SPEED), 4.0,
-                                              verbose=False)
-                    print(f"  achieved {got:+.3f} m ({reason})")
-                    m2 = _measure_panel(cam, det, base_T_cam)
-                    if m2:
-                        print(f"  now at x {m2[0]:+.3f} y {m2[1]:+.3f}"
-                              f"   ({(m2[0] - args.target_x) * 100:+.1f} cm from target)")
-        if cam is not None:
-            # Release the device BEFORE the press starts: two processes on one Orbbec is
-            # how the chest camera gets into the state where it enumerates but never
-            # delivers colour. The method is stop(), not close() — and this must NOT be
-            # swallowed, because a silent failure here leaves the press contending for
-            # the device and the symptom appears one step later, as "no color frame".
-            try:
-                cam.stop()
-                print("camera released before the press")
-            except Exception as e:                                 # noqa: BLE001
-                print(f"  !! could NOT release the camera ({type(e).__name__}: {e}) — "
-                      f"the press may fail with 'no color frame'")
-            cam = None
-
-        # --- 4. press -------------------------------------------------------------
-        if args.press:
+                    _drive(ch, -err, args)
+            if cam is not None:
+                # stop(), not close() — and never swallowed: a camera left open makes the
+                # retry fail with "no color frame", one step away from the real cause.
+                try:
+                    cam.stop()
+                except Exception as e:                             # noqa: BLE001
+                    print(f"  !! could NOT release the camera ({type(e).__name__}: {e})")
             cmd = [sys.executable, str(REPO / "initialization" / "press_buttons.py")]
             cmd += args.press.split() + args.press_args.split() + ["--go"]
-            print(f"PRESS: {' '.join(cmd[1:])}")
             r = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True)
-            tail = [l for l in r.stdout.splitlines() if l.strip()][-3:]
-            for l in tail:
+            for l in [x for x in r.stdout.splitlines() if x.strip()][-3:]:
                 print("  " + l)
-            if r.returncode != 0:
-                print(f"  press exited {r.returncode} — continuing to the exit anyway")
-            # The press blocks for ~60 s with nothing pumping the topic stream, and the
-            # chassis closes an idle socket. Reconnect and re-assert remote before the
-            # exit, or the next wait_pose dies after the press has already succeeded.
             ch.reconnect()
             ch.enter_remote()
             ch.pump(0.3)
-            print("  chassis stream reconnected after the press")
 
         # --- 5. aim the way out, by MEASURING it ----------------------------------
+        _mark("press done")
         out_leg = -args.back
         sweep_out, _ = heading_sweep(ch, out_leg, args.window, args.margin, args.sweep)
-        aim = 0.0
+        # The target heading is the one we CAME IN ON, not the middle of whatever the
+        # lidar finds open. Aiming at the band's middle over-turned by 5.7 deg in the lab
+        # (2026-09-04) and cost 24 cm of closure: in a car the middle of the clear band IS
+        # the doorway, but in an open room it is merely the roomiest direction, which is a
+        # different thing. So the entry heading is the objective and the lidar band is a
+        # CONSTRAINT on it — which also stays correct in a car, where the entry heading is
+        # perpendicular to the door and therefore inside the band anyway.
+        at = ch.pose or start
+        want = _wrap_deg(start[2] - at[2])
+        aim = want
         if sweep_out is None:
             print("EXIT: no lidar returns near the exit path — undoing the turn instead")
             aim = -args.turn
@@ -342,25 +475,24 @@ def main() -> int:
             print(f"EXIT: {_fmt(straight_out)} straight out (need {half:.2f} m), "
                   f"unresolvable drift {resid * 100:.1f} cm over this leg")
             if band is None:
-                print("  nothing clears — undoing the turn and letting the gate refuse")
-                aim = -args.turn
+                print(f"  nothing clears — going back to the entry heading ({want:+.1f} "
+                      f"deg) and letting the gate refuse if it is wrong")
             else:
                 lo, hi, _best = band
-                mid = (lo + hi) / 2.0
-                if straight_out >= half and (straight_out - half) > resid:
-                    print(f"  clear band {lo:+d}..{hi:+d} deg; straight out already has "
-                          f"{(straight_out - half) * 100:.0f} cm of slack — no constriction "
-                          f"to aim at, so undoing the turn")
-                    aim = -args.turn
+                # A clear heading t is reached by turning +t whichever way the leg points:
+                # the travel frame negates BOTH axes for a backward leg, which is a 180 deg
+                # rotation and preserves handedness. Getting that sign wrong once turned
+                # the exit 27.5 deg the wrong way, and only the clearance gate saved it.
+                if lo <= want <= hi:
+                    print(f"  clear band {lo:+d}..{hi:+d} deg contains the entry heading "
+                          f"({want:+.1f} deg) — going back to it")
                 else:
-                    # +mid, not -mid: the travel frame negates both axes for a
-                    # backward leg, which preserves handedness, so a clear heading t is
-                    # reached by turning +t either way. The sign was wrong here first and
-                    # the exit turned 27.5 deg the wrong way; the clearance gate refused
-                    # the resulting path, which is the only reason nothing was hit.
-                    aim = mid
+                    aim = float(min(max(want, lo + 1), hi - 1))
+                    print(f"  entry heading {want:+.1f} deg is OUTSIDE the clear band "
+                          f"{lo:+d}..{hi:+d}; clamping to {aim:+.1f} deg")
                     print(f"  clear band {lo:+d}..{hi:+d} deg; aiming at its middle "
                           f"({mid:+.1f} deg in the travel frame)")
+        _mark("exit aim computed")
         if abs(aim) >= 0.5:
             print(f"AIM: {aim:+.1f} deg")
             _clear_foreign("aim")
@@ -368,27 +500,43 @@ def main() -> int:
         aimed = _report("aimed", ch, start)
 
         # --- 6. out ---------------------------------------------------------------
+        _mark("exit aim done")
         print(f"OUT: driving {out_leg:+.2f} m")
         _clear_foreign("out")
-        ch.gate_clearance(out_leg)
-        # verbose, deliberately: _leg only reports "wheel_slipping went true during this
-        # leg" when verbose, and suppressing it cost the one explanation available when
-        # an exit leg issued its full 2.70 m of velocity and moved 1.564 m (2026-09-04).
-        got, d_ori, reason = _leg(ch, out_leg, min(args.speed, MAX_SPEED), 4.0,
-                                  verbose=True)
-        print(f"  achieved {got:+.3f} m ({reason}), heading {d_ori:+.2f} deg")
-        if abs(d_ori) > CONTAMINATED_DEG:
-            _clear_foreign("out")
-            print(f"  WARNING: the exit leg turned {d_ori:+.1f} deg — something else had "
-                  f"the wheels, so the closure below is not a measurement of our driving")
+        before = ch.pose
+        _drive(ch, out_leg, args)
         end = _report("out", ch, start)
+        if before is not None and abs(_wrap_deg(end[2] - before[2])) > CONTAMINATED_DEG:
+            print(f"  WARNING: the exit leg turned "
+                  f"{_wrap_deg(end[2] - before[2]):+.1f} deg — something else had the "
+                  f"wheels, so the closure below is not a measurement of our driving")
 
         print(f"\nCLOSURE  {math.hypot(end[0] - start[0], end[1] - start[1]) * 100:.1f} cm"
               f"   heading {_wrap_deg(end[2] - start[2]):+.1f} deg")
         print("(closure is a measurement of dead-reckoning drift, not a pass/fail — the "
               "exit's requirement is clearing the doorway, see the module docstring)")
+        _mark("exit leg done")
+        _profile()
         return 0
+    except Halted as e:
+        print(f"ABORT: {e} — stopping here rather than running the rest on a dead base")
+        return 4
     finally:
+        # A pre-warmed child that is never released keeps the camera open, and the NEXT
+        # attempt then fails with "no color frame after 40 tries" — a symptom one step
+        # away from the cause. Every path that abandons the press has to kill it.
+        if proc is not None and proc.poll() is None:
+            print("  killing the un-released pre-warm child (it holds the camera)")
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:                                      # noqa: BLE001
+                proc.kill()
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:                                      # noqa: BLE001
+                pass
         ch.close()
 
 

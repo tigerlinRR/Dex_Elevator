@@ -264,5 +264,13 @@ elevator:
     # it along the approach axis, a commanded 3 mm was really pressing about 8 mm and the
     # button still lit with no damage. Watch the lamps, not the log — the press log's own
     # depth figure cannot see this, because both sides of it use the same assumed TCP.
-    push_depth: 0.0045
+    # 4.5 -> 6.0 mm on 2026-09-04 (second raise the same day): at 4.5 the operator still
+    # reports buttons the plunger reaches without lighting. Still inside what this tool
+    # has survived — a stale TCP once pressed ~8 mm with no damage.
+    # BUT NOTE THE NOTE ABOVE: past ~5 mm the suspicion should shift from stroke to the
+    # SPRING being too soft, i.e. compressing without transmitting force. If 6 mm still
+    # leaves buttons unlit, more depth is the wrong lever — fit a stiffer spring. Deeper
+    # travel past that point only compresses the spring further; the force at the button
+    # stops rising with it.
+    push_depth: 0.006
     up_hint: [0.0, 0.0, 1.0]

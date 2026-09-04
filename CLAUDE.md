@@ -502,6 +502,57 @@ loop accumulates the velocity it sends and stops when that integral reaches the 
 and the ramp is capped at 40 % of the leg. Straight legs measured after: 1.00 m -> 0.988,
 0.40 -> 0.390, 0.15 -> 0.152, heading 0.00 deg.
 
+**The straight-leg model is PER DIRECTION — this chassis is not symmetric**
+(`LEG_K_FWD/BACK`, measured by `initialization/calibrate_legs.py`, 2026-09-04). Over
+0.4/0.8/1.2 m legs the base's own front delivered 82.5/93.2/98.2 % of what was asked while
+the arm-ward direction delivered 73.0/62.5/61.6 %. Fitting `achieved = k * commanded - c`
+gives k **1.061** / c +97 mm one way and k **0.559** / c −63 mm the other, residuals 4 and
+7 mm — a clean model, not scatter. One shared `SPEED_RATIO` cannot describe both, and what
+it hid was paid for by the correction legs on every move (the visible "stop, then shuffle
+again"). With the model in place, single uncorrected arm-ward legs measure 100.1/101.2/
+100.7 %.
+- **Only applied over 0.30-1.60 m, where it was measured.** Extrapolated to zero the
+  arm-ward line claims 63 mm of travel for a commanded 0; at 2.7 m it predicted 2.768
+  against 2.826 measured. Shorter legs keep the old behaviour and lean on the
+  measure-move-measure loop, which is what absorbs centimetre corrections anyway.
+- Correction tolerance is 3 cm, not 2: the first leg now lands within a couple of
+  centimetres and a 2 cm tolerance spent two or three further legs commanding 21-24 mm
+  and achieving 0.000 — the same stiction floor the turns have.
+
+**PRE-WARM the press; never launch it cold from a harness** (`mock_elevator_run.py`,
+2026-09-04). ~7.3 s of its startup is position-independent — 2.8 s TensorRT engine, 2.5 s
+camera, ~1.5 s GPU ramp off the 306 MHz idle clock, 0.4 s arm — and measured, the gap from
+"turn finished" to "arm moves" was ~14 s of which that was the bulk. Start it with
+`--wait-go TOKEN` before the entry leg and release it with one `token.touch()`: the gap
+becomes **0.0 s**. `elevator_runner` has done this since 2026-08-27; the harness had not.
+- **It holds the camera from launch**, so nothing else may open one. That is why the
+  measured approach became a fallback rather than a per-run step: since the per-direction
+  leg model went in, five consecutive runs landed the panel 0.3-4.2 cm from target and the
+  correction chose not to move at all, so 4.9 s per run to catch a case that has not
+  occurred is the wrong trade. If the press refuses, the camera is free and the harness
+  measures, nudges and retries once.
+- **A child that is never released keeps the camera**, and the NEXT attempt fails with
+  "no color frame after 40 tries" — one step away from the cause. Kill it on every
+  abandoning path.
+- `_report`-style bookkeeping must not re-settle the pose: every leg and turn already ends
+  by waiting for two agreeing samples, and re-settling cost 2.0 s to print a line.
+
+**Aim the exit at the ENTRY heading, with the lidar band as a constraint — not at the
+band's middle** (2026-09-04). Aiming at the middle over-turned by 5.7° and cost 24 cm of
+closure: in a car the middle of the clear band IS the doorway, but in an open room it is
+merely the roomiest direction. Inside the band, go back to the entry heading; outside,
+clamp to the nearest edge. Correct in a car too, where the entry heading is perpendicular
+to the door and therefore inside the band. Heading residual afterwards: −0.6 to +1.1°.
+
+**The entry turn is hard-coded and the exit turn is computed — know which is which.**
+`--turn` is a fixed number; the exit aim is derived from the live pose. The entry one
+cannot be measured before turning, because the chest camera faces away from the panel
+until the robot is inside. It COULD be computed without a camera by registering the
+panel's MAP position once — the same argument `panels.yaml` makes for the layout — and
+taking the bearing from the robot's live pose, which would make the turn follow where the
+entry leg actually landed. Not built; today a drifted entry leaves the constant wrong and
+the fallback corrects distance only, never bearing.
+
 **~3 degrees is this chassis's angular resolution — treat it as a constraint.** With the
 ramp deficit gone, single turns of 3-12 deg still came back 2-4 deg off, and commands
 below ~3 deg often moved the base NOT AT ALL (0.0 deg three times running, then a
@@ -532,6 +583,11 @@ Verified by sending one: a `charge` move to the pose the control_unit itself las
 - **A local move runs in the chassis's planner, exactly like a cloud task** — so killing
   the process that posted it does NOT stop the robot. Cancel it, or take the wheels away
   with `set_control_mode remote` (which is what the straight-line driver does anyway).
+- **A `standard` move lands ~5 cm from the pose it is given, repeatably.** Three
+  consecutive returns to the same waypoint measured 5.1 cm from it, identical to the
+  millimetre — biased, not noisy, so it can be corrected by targeting the mirrored point.
+  It is the fastest way to reposition (12-15 s, no cloud, no planner freedom to worry
+  about in open space), but do not read its target as where the robot will be.
 - **The charge target is an approach pose, not where the robot ends up.** Docked, the
   tracked pose read (13.348, -18.25, ori -0.0) against that target — 0.74 m and 12 deg
   away — because the chassis does its own contact-seeking at the end. Do not read a

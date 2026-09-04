@@ -2,6 +2,118 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE LEG MODEL WAS DIRECTIONAL ALL ALONG, AND THE DEAD TIME IS GONE (2026-09-04, evening)
+
+Seven consecutive end-to-end runs from a registered start point, **4/4 buttons every
+time**. Closure came down from 37.3 cm / 9.2° in the morning to **2.8 cm / 1.1°**, and the
+two waits the operator could see between phases are now **0.0 s**.
+
+### The chassis is not symmetric, and one shared constant was hiding it
+
+`SPEED_RATIO` was a single number applied both ways. Measured with `calibrate_legs.py`
+(new: single uncorrected legs, restored between measurements, all in one process):
+
+| commanded | +ori, base front | −ori, arm-ward |
+|---|---|---|
+| 0.4 m | 82.5 % | 73.0 % |
+| 0.8 m | 93.2 % | 62.5 % |
+| 1.2 m | 98.2 % | 61.6 % |
+| fit `achieved = k·cmd − c` | k **1.061**, c +97 mm, rms 4 mm | k **0.559**, c −63 mm, rms 7 mm |
+
+Residuals of 4 and 7 mm — a clean model, not scatter. **A slope of 1.06 against 0.56
+cannot be described by one constant**, and what it hid was paid for by the correction
+legs on every single move: the "it stops and then shuffles again" the operator asked
+about. Corroborating it, the exit leg's FIRST attempt had come back 0.842 / 0.851 /
+0.836 m of a commanded 1.400 across three earlier runs — 59.7 / 60.1 / 60.8 %.
+
+With a per-direction model in `_leg`, single uncorrected arm-ward legs measure **100.1 /
+101.2 / 100.7 %** (k 1.011, rms 3 mm). Entry and exit now each take ONE leg: −1.400 m
+commanded, −1.404 and −1.405 achieved.
+
+**The model is only applied where it was measured** (0.30–1.60 m). Extrapolated to zero
+the arm-ward line claims 63 mm of travel for a commanded 0, which is nonsense, and at
+2.7 m it predicted 2.768 against 2.826 measured. Shorter legs keep the old behaviour and
+lean on the measure-move-measure loop, which is what absorbs centimetre corrections anyway.
+
+Correction tolerance also went 2 → 3 cm: with the model in place the first leg lands
+within a couple of centimetres, and a 2 cm tolerance then spent two or three further legs
+commanding 21–24 mm and achieving **0.000** — the same stiction floor the turns have.
+
+### The dead time between phases is gone
+
+Measured with the new `_mark`/`_profile` instrumentation rather than guessed — and the
+guess was half wrong: "entry leg done → turn starts" was **1.0 s**, not the 6 s of
+redundant settles predicted. The real cost was elsewhere:
+
+| gap | before | after |
+|---|---|---|
+| entry done → turn starts | 1.0 s | **0.0 s** |
+| turn done → arm moves | 2.0 + 4.9 + ~7.3 ≈ **14 s** | **0.0 s** |
+
+Three changes: `_report` stopped re-settling the pose (every leg and turn already ends by
+waiting for two agreeing samples — 2.0 s to print a line); the harness stopped opening a
+camera of its own; and **the press is PRE-WARMED**, started before the entry leg so its
+~7.3 s of engine load, camera open, GPU ramp and arm connect overlaps the drive. That
+mechanism already existed for `elevator_runner` (8.3 → 1.6 s); this harness had never
+used it. Releasing it after the turn is one `token.touch()`.
+
+The measured approach became a FALLBACK for the same reason — it needs the camera, which
+the pre-warm now holds. That is a trade, stated plainly: since the leg model went in,
+five consecutive runs landed the panel **0.3–4.2 cm** from target and the correction chose
+not to move every time, so paying 4.9 s per run to catch a case that has not occurred is
+the wrong side of it. If the press refuses, the camera is free by then and the harness
+measures, nudges and retries once.
+
+**A pre-warmed child that is never released keeps the camera open**, and the next attempt
+then fails with "no color frame after 40 tries" — one step away from the cause. Every
+abandoning path kills it.
+
+### Press depth raised again, 4.5 → 6.0 mm, and where that stops being the lever
+
+The operator still reported the plunger reaching buttons that did not light. Measured
+depth is now −5.94 to −6.06 mm against a commanded −6.00, 4/4 on every run since.
+
+**Note the limit this crosses.** The config's own comment says that past ~5 mm the
+suspicion should shift from stroke to the SPRING being too soft — compressing without
+transmitting force. If 6 mm still leaves buttons unlit, more depth is the wrong lever and
+a stiffer spring is the fix; deeper travel only compresses the spring further and the
+force at the button stops rising with it.
+
+### The exit aim targets the ENTRY heading, not the middle of the clear band
+
+Aiming at the middle of the lidar's clear band over-turned by **5.7°** and cost 24 cm of
+closure. In a car that middle IS the doorway; in an open room it is merely the roomiest
+direction, which is a different thing. The entry heading is now the objective and the
+lidar band is a CONSTRAINT on it — inside the band, go back to it; outside, clamp to the
+nearest edge. That stays correct in a car, where the entry heading is perpendicular to
+the door and therefore inside the band anyway. Measured after: heading residual **−0.6 /
++1.1 / +1.1 / −0.6°** against +5.7° before.
+
+### Still open
+- **The 3° dead zone costs 4–8 s per turn when the remainder lands in 3–4°.** Seen twice
+  in one run: `+3.0 → +0.0` then `+3.0 → +3.4`. The recommendation is a 3° tolerance —
+  stop at the plant's own resolution instead of chasing it. 3° over 1.4 m is 7 cm against
+  a 1.1 m door's 15 cm of margin, and in a car the seconds are the scarcer resource.
+  Operator has not decided; nothing changed yet.
+- **The entry turn is still HARD-CODED** (`--turn`), while the exit turn is computed. It
+  cannot be measured before turning — the chest camera faces away from the panel until
+  the robot is inside. It CAN be computed without a camera by registering the panel's
+  MAP position once (the same argument `panels.yaml` makes for the layout) and taking the
+  bearing from the robot's live pose. That would make the turn follow where the entry leg
+  actually landed; today a drifted entry leaves −25° wrong and the fallback corrects only
+  distance, never bearing.
+- **The local `standard` move lands ~5 cm from the pose it is given** — three consecutive
+  returns measured 5.1 cm, identical to the millimetre, so it is repeatable and biased
+  rather than noisy. Useful for repositioning (12–15 s, no cloud), but do not read its
+  target as where the robot will be.
+- Heading drift on the straight legs (+1.1 to +1.7° over 1.4 m, ~26–32 mm lateral) is now
+  the largest remaining error. Angular is pinned to zero, so heading is fully open loop.
+- Identity verification at the reachable distance (anchors still 0/4; every press today
+  used `--no-verify`).
+- The press itself is 60–62 s of the ~103 s run. Suspects unchanged — the return to home
+  between every button, the lift moving serially with the arm, the 0.35 s settle between
+  moves — but instrument it before touching it.
+
 ## ▶ THE WHOLE MANOEUVRE RUNS AS ONE PROCESS, AND VISION CLOSES THE LAST FEW CM (2026-09-04, later)
 
 `mock_elevator_run.py` drives the flow end to end from a registered start point: reverse

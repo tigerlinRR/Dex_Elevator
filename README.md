@@ -191,6 +191,8 @@ python3 initialization/drive_straight.py turn 30      # turn 30 deg in place (si
 python3 initialization/drive_straight.py turn --corrections 1 -- -90
 python3 initialization/drive_straight.py align 2.0   # read-only: which headings fit
 python3 initialization/drive_straight.py align -- -1.5
+python3 initialization/calibrate_legs.py             # per-direction leg ratio
+python3 initialization/mock_elevator_run.py --back 1.4 --turn -25 --press "1 4"
 python3 initialization/drive_straight.py calibrate    # achieved vs commanded distance
 ```
 
