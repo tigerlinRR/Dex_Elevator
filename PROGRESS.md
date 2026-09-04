@@ -100,6 +100,16 @@ pose read 0.74 m and 12 deg away from the target it was given.
 Worth revisiting properly, because `elevator_runner` drives through the cloud today, and
 that is where the ~24 s of arrival lag and the read-only map both come from.
 
+### A claim from this morning, retracted
+
+I recorded that an engaged emergency stop empties the lidar point cloud, from seeing
+`npoints = 0` while it was pressed and ~900 points after it was released. Measured again
+the same afternoon with the e-stop engaged, the scan published 878-938 points per frame.
+One co-occurrence is not a mechanism, and the note has been corrected rather than left
+standing. What actually causes the empty scan is still unknown — a chassis that has just
+booted and not yet localised is the leading candidate. The operational rule is unaffected:
+an empty scan looks exactly like "nothing in the way", so it must fail closed.
+
 ### Still open
 - Profile the press per phase before optimising it: 62.8 s for four buttons is ~15 s each,
   and the suspects are the return to home between every button, the lift moving serially

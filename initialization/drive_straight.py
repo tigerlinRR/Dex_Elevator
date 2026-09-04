@@ -786,6 +786,63 @@ def cmd_clearance(args) -> None:
         ch.close()
 
 
+def heading_sweep(ch: Chassis, metres: float, window: float, margin: float,
+                  sweep_deg: float):
+    """For each candidate heading, the smallest lateral clearance inside the swept path.
+
+    Returns (list of (heading_deg, clearance_m), body_points) or (None, None) if the scan
+    has nothing near the path. Headings are in the TRAVEL frame, so a positive value means
+    "turn this way" whichever direction `metres` points.
+    """
+    x0, y0, ori = ch.wait_pose()
+    pts = ch.wait_scan()
+    c, sn = math.cos(ori), math.sin(ori)
+    sign = 1.0 if metres >= 0 else -1.0
+    depth = abs(metres) + HULL_M
+
+    body = []
+    for p in pts:
+        dx, dy = p[0] - x0, p[1] - y0
+        bx = (dx * c + dy * sn) * sign
+        by = (-dx * sn + dy * c) * sign
+        if -0.5 < bx < depth + 1.0 and abs(by) < window + 1.0:
+            body.append((bx, by))
+    if not body:
+        return None, None
+
+    out = []
+    for t in range(-int(sweep_deg), int(sweep_deg) + 1):
+        rad = math.radians(t)
+        ct, st = math.cos(rad), math.sin(rad)
+        worst = float("inf")
+        for bx, by in body:
+            ax = bx * ct + by * st
+            ay = -bx * st + by * ct
+            if 0.05 <= ax <= depth:
+                worst = min(worst, abs(ay))
+        out.append((t, worst))
+    return out, body
+
+
+def clear_band(sweep, half):
+    """The widest run of consecutive clear headings. Returns (lo, hi, best) or None."""
+    clear = [(t, w) for t, w in sweep if w >= half]
+    if not clear:
+        return None
+    runs, run = [], [clear[0]]
+    for prev, cur in zip(clear, clear[1:]):
+        if cur[0] == prev[0] + 1:
+            run.append(cur)
+        else:
+            runs.append(run)
+            run = [cur]
+    runs.append(run)
+    widest = max(runs, key=len)
+    lo, hi = widest[0][0], widest[-1][0]
+    best = min(widest, key=lambda q: abs(q[0]))[0]
+    return lo, hi, best
+
+
 def cmd_align(args) -> None:
     """Sweep the heading and report which ones let the whole robot through.
 
@@ -801,7 +858,7 @@ def cmd_align(args) -> None:
     The test is not "how wide is the gap" but "which headings are clear", because that is
     the question with an answer the robot can act on. For each candidate heading the whole
     swept rectangle is checked against the scan, so a doorway is found by the robot fitting
-    through it rather than by trying to recognise a door.
+    through it rather than by recognising a door.
 
     Read-only; it reports and never turns. It also prints the drift left over from the
     ~3 deg the base cannot resolve (see TURN_FLOOR_DEG), rather than implying the heading
@@ -812,68 +869,28 @@ def cmd_align(args) -> None:
     ch.open_stream()
     try:
         metres = args.metres
-        x0, y0, ori = ch.wait_pose()
-        pts = ch.wait_scan()
-        c, sn = math.cos(ori), math.sin(ori)
         sign = 1.0 if metres >= 0 else -1.0
-        depth = abs(metres) + HULL_M
         half = HALF_WIDTH_M + args.margin
-
-        body = []
-        for p in pts:
-            dx, dy = p[0] - x0, p[1] - y0
-            bx = (dx * c + dy * sn) * sign
-            by = (-dx * sn + dy * c) * sign
-            if -0.5 < bx < depth + 1.0 and abs(by) < args.window + 1.0:
-                body.append((bx, by))
-        if not body:
+        sweep, _ = heading_sweep(ch, metres, args.window, args.margin, args.sweep)
+        if sweep is None:
             print("no lidar returns anywhere near the path — nothing to align to")
             return
 
-        def clearance_at(theta_deg):
-            """Smallest |lateral| of anything inside the swept path at this heading."""
-            t = math.radians(theta_deg)
-            ct, st = math.cos(t), math.sin(t)
-            worst = float("inf")
-            for bx, by in body:
-                # rotate the scan into the candidate heading's frame
-                ax = bx * ct + by * st
-                ay = -bx * st + by * ct
-                if 0.05 <= ax <= depth:
-                    worst = min(worst, abs(ay))
-            return worst
-
-        sweep = [(t, clearance_at(t)) for t in
-                 range(-int(args.sweep), int(args.sweep) + 1)]
-        clear = [(t, w) for t, w in sweep if w >= half]
-
+        straight = dict(sweep)[0]
+        resid = math.radians(TURN_FLOOR_DEG) * abs(metres)
         print(f"travel {metres:+.2f} m; robot half-width {HALF_WIDTH_M:.2f} m "
               f"+ {args.margin * 100:.0f} cm margin = {half:.2f} m needed each side")
-        straight = dict(sweep)[0]
         print(f"  straight ahead: {_fmt_m(straight)} of side clearance "
               f"{'(CLEAR)' if straight >= half else '(BLOCKED)'}")
 
-        if not clear:
+        band = clear_band(sweep, half)
+        if band is None:
             best_t, best_w = max(sweep, key=lambda q: q[1])
             print(f"  NO heading within +-{args.sweep:.0f} deg is clear; the roomiest is "
                   f"{best_t:+d} deg with {_fmt_m(best_w)}")
             return
-
-        # widest contiguous run of clear headings — the doorway, in heading terms
-        runs, run = [], [clear[0]]
-        for prev, cur in zip(clear, clear[1:]):
-            if cur[0] == prev[0] + 1:
-                run.append(cur)
-            else:
-                runs.append(run)
-                run = [cur]
-        runs.append(run)
-        widest = max(runs, key=len)
-        lo, hi = widest[0][0], widest[-1][0]
-        best_t, best_w = min(widest, key=lambda q: abs(q[0]))
+        lo, hi, best_t = band
         mid = (lo + hi) / 2.0
-        resid = math.radians(TURN_FLOOR_DEG) * abs(metres)
-
         print(f"  clear headings: {lo:+d} to {hi:+d} deg ({hi - lo + 1} of "
               f"{len(sweep)} tried), middle {mid:+.1f} deg")
         print(f"  turn {mid * sign:+.1f} deg to take the middle of the opening"
@@ -881,8 +898,6 @@ def cmd_align(args) -> None:
         print(f"  the {TURN_FLOOR_DEG:.0f} deg the base cannot resolve is "
               f"{resid * 100:.1f} cm of drift over this leg")
         room = (hi - lo) / 2.0
-        # Judge in metres, not degrees: what matters is whether the room left over going
-        # straight already swallows the drift the base cannot turn out.
         slack_straight = straight - half
         if straight >= half and slack_straight > resid:
             print(f"  VERDICT: go as you are — {slack_straight * 100:.0f} cm of slack "

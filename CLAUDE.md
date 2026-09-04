@@ -881,14 +881,19 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   unexpectedly!` and `9502 Debugging config file exists` survived, and `6007` came back
   later. Confirm a reboot actually happened by watching `planning_state.action_id` reset
   — the first time, it did not (`action_id` stayed 643) and nothing had changed.
-- **An engaged emergency stop silently EMPTIES the lidar point cloud.**
-  `/scan_matched_points2` keeps publishing at 1.33 Hz with `npoints = 0`, while
-  `/slam/state` still reports `lidar_reliable: true, lidar_matched: true` — so nothing
-  says the lidar is unavailable. Released, it returns to 2.00 Hz and 908-975 points.
-  An empty scan reads exactly like "nothing in the way", so any obstacle or door test
-  built on it must fail CLOSED; `drive_straight` aborts with "no lidar scan", which is
-  the correct behaviour and should not be relaxed. It also unpowers both arm
-  controllers, which come back a few seconds after the release.
+- **The lidar point cloud can come back EMPTY, and the cause is not the emergency stop.**
+  Seen 2026-09-04 morning: `/scan_matched_points2` publishing at 1.33 Hz with
+  `npoints = 0` while `/slam/state` still reported `lidar_reliable: true,
+  lidar_matched: true`, so nothing said the lidar was unavailable. It recovered to 2.00 Hz
+  and ~900 points after the e-stop was released, and I wrote that down as cause and
+  effect. **That was wrong** — measured again the same afternoon with the e-stop ENGAGED,
+  the scan was publishing 878-938 points per frame quite happily. One co-occurrence is not
+  a mechanism. The real trigger is still unknown; a chassis that has just booted and not
+  yet localised is the leading candidate. What matters operationally is unchanged: an
+  empty scan reads exactly like "nothing in the way", so anything built on it must fail
+  CLOSED, and `drive_straight` aborting with "no lidar scan" is correct behaviour that
+  should not be relaxed. (The e-stop DOES unpower both arm controllers, which come back a
+  few seconds after release — that part was independently verified.)
 - **`initialization/boundary_sweep.py` no longer runs against the current config.** It
   reads `arm.lift.usable_relative_z_m` and `target_relative_z_m`, both of which were
   removed when the lift height became SEARCHED rather than computed, so it dies with a
