@@ -189,6 +189,8 @@ python3 initialization/drive_straight.py move 2.0     # forward 2 m (signed metr
 python3 initialization/drive_straight.py move -- -2.0 # back 2 m
 python3 initialization/drive_straight.py turn 30      # turn 30 deg in place (signed)
 python3 initialization/drive_straight.py turn --corrections 1 -- -90
+python3 initialization/drive_straight.py align 2.0   # read-only: which headings fit
+python3 initialization/drive_straight.py align -- -1.5
 python3 initialization/drive_straight.py calibrate    # achieved vs commanded distance
 ```
 

@@ -71,8 +71,20 @@ a 0.9 m door. Either the target elevator's doors are wider than that, or exiting
 something better than in-place turns. **Measure the real door width before designing the
 exit** — it decides whether this approach works at all.
 
+### Aligning to the door is built (`align`), and it is a heading sweep
+`drive_straight.py align 2.0` reports which headings let the whole robot through, rather
+than measuring a gap — the first version, facing a blank wall, reported "an opening
+0.041 m wide", which is true and useless. Validated by tightening each dimension on its
+own: a 2.0 m leg cleared over a 51 deg band, a 3.5 m leg over only 11 deg, and demanding a
+1.9 m corridor made straight-ahead BLOCKED while still finding -16..-3 deg clear — the
+doorway case, "straight will not fit, 3 deg will". Read-only, ~1 s for two confirming
+reads.
+
+Taking the operator's 1.1 m door: 30 cm of total margin, 15 cm a side, against the ~6 cm
+of drift that 3 deg of unresolvable heading costs over the ~1.2 m of a doorway. It fits,
+with room — which is what makes this approach viable at all.
+
 ### Still open
-- Align the exit to the door with the lidar (the measurement fits in the ride's dead time).
 - Profile the press per phase before optimising it: 62.8 s for four buttons is ~15 s each,
   and the suspects are the return to home between every button, the lift moving serially
   with the arm, and the 0.35 s settle between moves — but this project has been burned by

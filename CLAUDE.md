@@ -516,6 +516,24 @@ before designing anything on top: 3 deg over the ~1.2 m it takes to clear a door
 well as its bearing — which is what makes "one straight leg plus one turn" able to satisfy
 both, and why a turn is not a pure re-aim.
 
+**Aligning to a doorway is a HEADING SWEEP, not a gap measurement**
+(`drive_straight.py align`, 2026-09-04). The first version found the nearest return on
+each side and called the space between them the opening; facing a blank wall 1.66 m away
+it duly reported "an opening 0.041 m wide", which is true and useless. What the robot can
+act on is which HEADINGS let its whole swept rectangle through, so that is what is
+computed: for each candidate heading the scan is rotated into it and the swept path
+checked, and the clear headings are reported as a band. A doorway is then found by the
+robot fitting through it rather than by recognising a door.
+- Validated by making the problem harder in each dimension separately: a 2.0 m leg had a
+  51 deg clear band, a 3.5 m leg only 11 deg (the far wall enters the path), and demanding
+  a 1.9 m corridor turned straight-ahead BLOCKED while still finding a clear band at
+  -16..-3 deg — i.e. the doorway case, "straight will not fit, 3 deg will".
+- It reports in metres, not degrees, where it matters: the verdict compares the slack
+  going straight against the drift left over from the ~3 deg the base cannot resolve.
+- Read-only, and cheap enough for dead time — the scan is 2.00 Hz with 74 ms of latency,
+  so two confirming reads cost about a second against a 60 s press. Take it while the car
+  is moving and leave only the straight leg for the door's open window.
+
 **Read the pose only after it has SETTLED** (`_settled_pose`, 2026-09-02). Waiting for
 "a couple of fresh samples" after braking was not enough: SLAM settles late, so the
 sample arriving right after the brake still describes a place the robot has left. A leg
