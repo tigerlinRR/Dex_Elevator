@@ -18,9 +18,16 @@ so calibrate intrinsics first.
 |---|---|---|---|
 | `cam_chest` | torso Gemini 335, faces the panel — **button camera** | `match_name: "335"` (or a serial) in `cameras.yaml` | the **RIGHT** arm base |
 | `cam_head`  | head Gemini 335L — navigation/scene | `match_name: "335L"` | (not calibrated for pressing yet) |
+| `cam_arm` | **planned** — rides the right arm | `mount: arm` in `cameras.yaml` (commented out until fitted) | the right arm's **TCP** (`gripper_T_camera`) |
 
 Because the chest camera and the arm base ride the torso lift **together**,
 `base_T_camera` is a fixed constant — calibrate once, share at runtime.
+
+An **arm-mounted** camera is the opposite: there is no constant `base_T_camera`
+at all, so step 2 is replaced by `run_calibration_arm_cam.py` (eye-IN-hand) and
+the runtime composes `base_T_gripper(t) @ gripper_T_camera` per frame. Which of
+the two a saved `.npy` holds is recorded in a `<cam>.frame` sidecar and checked
+at load — see §2b.
 
 ## Prerequisites
 
@@ -57,6 +64,31 @@ The solver feeds the *inverted* gripper poses into `cv2.calibrateHandEye`.
 python initialization/run_calibration.py --camera cam_chest              # drag-teach ON by default
 python initialization/run_calibration.py --camera cam_chest --no-manual  # keep servos locked
 ```
+
+## 2b. Extrinsics (eye-IN-hand) — `run_calibration_arm_cam.py`
+
+**Only for a camera mounted ON the arm** — the chest camera keeps using step 2,
+unchanged. The setup is the mirror image: the board is **fixed in the scene** and
+the arm carries the camera around it, solving `gripper_T_camera`.
+
+```bash
+python3 initialization/selftest_eye_in_hand.py                              # synthetic check, no hardware
+python3 initialization/run_calibration_arm_cam.py  --camera cam_arm --web   # capture + solve
+python3 initialization/eval_localization_arm_cam.py --camera cam_arm --web  # end-to-end accuracy
+```
+→ `data/calibration/cam_arm.npy` + `cam_arm.frame` (the tag that stops the runtime
+reading it as a fixed camera's `base_T_camera`).
+
+Watch the HUD's **`axis spread`** while capturing: `AX = XB` gets the camera's
+translation only from the ROTATION between poses, so a set of mostly-translation
+poses — the natural way to hand-guide an arm — is ill-conditioned, and one whose
+rotations share an axis leaves that direction unobservable. The solve still
+returns a tidy matrix; only the conditioning check sees it, and it **fails**
+rather than warns. Keep `axis spread` above 0.15 and rotate about different axes.
+
+Also specific to this mount: let the arm **settle** before each capture (the pose
+error now corrupts the camera pose itself), and never change the tool frame
+afterwards — `gripper_T_camera` is relative to whatever `get_tcp_pose()` reports.
 → `data/calibration/cam_chest.npy` (PARK solve, reliable for down-/angled cameras),
 plus a `cam_chest.calib.npz` sidecar (every method + residuals). Each accepted
 sample is saved under `data/calibration/cam_chest_samples/`, so a crashed run can

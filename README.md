@@ -51,7 +51,7 @@ the vision only needs to give a reliable button pixel and its floor label.
 | Compute | NVIDIA Jetson AGX Orin (`ssh dex5-wired`) | JetPack 6.2 / CUDA 12.6; runs the SDKs + inference |
 | Detection | Ultralytics YOLO11m | multi-class (per floor: `1`,`2`,`B1`,`G`…) — detects AND identifies; trained from CC BY data (`yolo/`, `DATASETS.md`) |
 | Inference | **TensorRT FP16** on the Orin's GPU | 43 ms/frame (23 FPS) via `yolo/trt_detector.py`; the machine's torch is CPU-only and is deliberately left alone |
-| Calibration | intrinsics + eye-to-hand (ChArUco) | once per camera, shared (`calibration/`) |
+| Calibration | intrinsics + eye-to-hand (ChArUco) | once per camera, shared (`calibration/`); an eye-**in**-hand path exists for a future arm-mounted camera, not yet used |
 | Press geometry | ray ∩ panel-plane | pure geometry, no learned model (`core/press.py`) |
 
 ## Repository layout
@@ -68,7 +68,8 @@ Dex_Elevator/
 │   └── robot/              # RobotArm interface + RealMan adapter + Sim (headless)
 │   └── hand/               # LinkerHand O6 over the arm's tool-side Modbus RS485
 ├── yolo/                   # TensorRT GPU detector, panel-layout matcher, dataset prep & training
-├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco)
+├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco);
+│                           #   eye-in-hand gripper_T_camera for an arm-mounted camera
 ├── initialization/         # bring-up check, calibration + eval scripts, and press_buttons.py (the presser)
 ├── configs/                # cameras.yaml, pipeline.yaml, panels.yaml
 ├── elevator_runner/        # drive-to-the-panel tool (AutoXing cloud API + press)
@@ -143,6 +144,14 @@ python3 initialization/run_calibration.py --camera cam_chest --web
 # 3. (optional) end-to-end localization accuracy at fresh poses
 python3 initialization/eval_localization.py --camera cam_chest --web
 ```
+
+**If the camera is ever moved ONTO the arm** (planned, not fitted — see `PROGRESS.md`),
+step 2 becomes a different problem: the board is then **fixed in the scene** and the arm
+carries the camera, solving `gripper_T_camera`, and the runtime composes
+`base_T_gripper(t) @ gripper_T_camera` for every frame. Use
+`run_calibration_arm_cam.py` / `eval_localization_arm_cam.py` and set `mount: arm` in
+`configs/cameras.yaml`; the fixed-camera path above is unchanged and stays the default.
+`selftest_eye_in_hand.py` checks that maths with no hardware at all.
 
 See `calibration/README.md` and `initialization/README.md` for details, and
 `CLAUDE.md` for the architecture and gotchas.

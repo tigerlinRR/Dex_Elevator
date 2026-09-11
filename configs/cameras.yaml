@@ -12,11 +12,25 @@
 #
 # Calibration is done ONCE per camera and shared from data/calibration/:
 #   intrinsics_file  -> Part 1: K + distortion   (initialization/calibrate_intrinsics.py)
-#   extrinsic_file   -> Part 2: base_T_camera    (initialization/run_calibration.py)
+#   extrinsic_file   -> Part 2: the extrinsic, whose MEANING depends on `mount:`
 # The chest camera's extrinsic is base_T_camera to the RIGHT arm (the pressing arm).
+#
+# mount: fixed | arm   (default: fixed)
+#   fixed -> the camera is bolted to the world/torso. The file holds base_T_camera,
+#            a CONSTANT (the chest camera and the arm base ride the torso lift
+#            together, so it survives lift motion). Calibrate with
+#            initialization/run_calibration.py (eye-to-hand).
+#   arm   -> the camera rides the arm. The file holds gripper_T_camera, and the
+#            live base_T_camera = base_T_gripper @ gripper_T_camera must be
+#            recomputed for EVERY frame, from the arm pose read at capture time.
+#            Calibrate with initialization/run_calibration_arm_cam.py (eye-in-hand).
+# Both files are a bare 4x4, so a sidecar data/calibration/<cam>.frame records
+# which one it is and CameraManager refuses a mismatch — mixing them up produces
+# plausible coordinates that are wrong by the length of the arm.
 cameras:
   - id: cam_chest
     role: chest             # torso-mounted Gemini 335, faces the panel — BUTTON CAMERA
+    mount: fixed            # bolted to the torso -> extrinsic is a constant base_T_camera
     serial: "CP0BB5300041"  # Gemini 335 (chest) — enumerated on dex5 (AGX Orin)
     match_name: "335"       # fallback if serial changes: name ends with "335", not "335L"
     width: 1280
@@ -42,3 +56,22 @@ cameras:
     fps: 30
     intrinsics_file: cam_head_intrinsics.npz
     extrinsic_file: cam_head.npy
+
+  # ARM-MOUNTED camera — NOT FITTED YET (planned; see CLAUDE.md "Camera moving to
+  # the ARM"). Uncomment and fill in the serial once the bracket is on, then:
+  #   1. python3 initialization/calibrate_intrinsics.py     --camera cam_arm --web
+  #   2. python3 initialization/run_calibration_arm_cam.py  --camera cam_arm --web
+  #   3. python3 initialization/eval_localization_arm_cam.py --camera cam_arm --web
+  # Left commented so CameraManager does not try to open a device that is not there.
+  # - id: cam_arm
+  #   role: arm             # rides the RIGHT arm, looks at the panel from wherever the arm puts it
+  #   mount: arm            # extrinsic file holds gripper_T_camera, NOT base_T_camera
+  #   serial: ""            # fill in from `python3 -m core.camera.orbbec`
+  #   match_name: ""        # fallback if the serial changes
+  #   width: 1280
+  #   height: 720
+  #   fps: 30
+  #   exposure: 156         # RE-TUNE on the arm: the working distance and the light on the
+  #   gain: 16              # faceplate both change when the camera moves
+  #   intrinsics_file: cam_arm_intrinsics.npz
+  #   extrinsic_file: cam_arm.npy

@@ -3,7 +3,11 @@
 Two parts:
   * Part 1 — intrinsics  (:mod:`calibration.intrinsic`): K + distortion.
   * Part 2 — extrinsics  (:mod:`calibration.extrinsic`): eye-to-hand base_T_camera,
-    which consumes Part 1's intrinsics.
+    which consumes Part 1's intrinsics. Use this for a camera fixed to the torso.
+  * Part 2b — extrinsics (:mod:`calibration.eye_in_hand`): eye-IN-hand
+    gripper_T_camera, for a camera that rides the arm. Same Part 1, same board,
+    different geometry; :mod:`calibration.frames` tags which of the two a saved
+    ``.npy`` holds so the runtime cannot confuse them.
 
 Both write to ``data/calibration/`` and are loaded once by
 :class:`~core.camera.manager.CameraManager` and reused everywhere.
@@ -28,6 +32,25 @@ from calibration.extrinsic import (
     select_best,
     solve_eye_to_hand,
     solve_eye_to_hand_all_methods,
+)
+
+# Part 2b — extrinsics (eye-IN-hand, arm-mounted camera)
+from calibration.eye_in_hand import (
+    EyeInHandSession,
+    EyeInHandThresholds,
+    base_T_camera,
+    rotation_diversity,
+    save_eye_in_hand,
+    solve_eye_in_hand,
+    solve_eye_in_hand_all_methods,
+    validate_eye_in_hand,
+)
+from calibration.frames import (
+    FRAME_BASE,
+    FRAME_GRIPPER,
+    check_frame,
+    load_frame_tag,
+    save_frame_tag,
 )
 
 # Shared persistence
@@ -76,6 +99,20 @@ __all__ = [
     "save_extrinsic",
     "load_extrinsic",
     "save_calibration",
+    # Part 2b — extrinsics (eye-in-hand)
+    "EyeInHandSession",
+    "EyeInHandThresholds",
+    "solve_eye_in_hand",
+    "solve_eye_in_hand_all_methods",
+    "validate_eye_in_hand",
+    "rotation_diversity",
+    "base_T_camera",
+    "save_eye_in_hand",
+    "FRAME_BASE",
+    "FRAME_GRIPPER",
+    "check_frame",
+    "load_frame_tag",
+    "save_frame_tag",
     # validation
     "validate_intrinsics",
     "validate_extrinsics",

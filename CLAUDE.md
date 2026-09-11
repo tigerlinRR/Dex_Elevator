@@ -858,12 +858,36 @@ are no-ops (the LinkerHand is separate).
 - Part 1 `intrinsic.py` → `data/calibration/<cam>_intrinsics.npz` (K + distortion).
 - Part 2 `extrinsic.py` → `data/calibration/<cam>.npy` (`base_T_camera`, eye-to-hand).
   Part 2 detects the board using Part 1's intrinsics, so **order matters**.
+- **Part 2b `eye_in_hand.py` → `gripper_T_camera` for an ARM-MOUNTED camera**
+  (built 2026-09-11, **never run on hardware** — the camera is not fitted). Part 1
+  is shared; only the extrinsic geometry differs, so the eye-to-hand path is
+  untouched rather than generalised. The board is FIXED IN THE SCENE and the arm
+  carries the camera, `cv2.calibrateHandEye` is fed the gripper poses **as-is**
+  (the eye-to-hand path inverts them), and what must be rigid is `base_T_board`
+  instead of `gripper_T_board`. Scripts: `run_calibration_arm_cam.py`,
+  `eval_localization_arm_cam.py`, `selftest_eye_in_hand.py` (synthetic, no hardware).
+  - **The pose set's ROTATION is what makes the camera's translation observable.**
+    `AX = XB` gets X's translation only from the rotation between poses, so a
+    mostly-translation set — the natural way to hand-guide an arm — is
+    ill-conditioned, and one whose rotations share an axis leaves the translation
+    along that axis unobservable while the solve still returns a tidy matrix.
+    `rotation_diversity()` scores it (0 = one axis), the capture HUD shows it live,
+    and `validate_eye_in_hand` FAILS a near-collinear set. Verified on synthetic
+    data: a yaw-only set solves to a plausible-looking X and is refused.
+  - Its consistency residual is NOT comparable to the eye-to-hand one — it also
+    absorbs the arm's FK and joint repeatability error, because the camera now
+    rides through them. Expect it larger; re-tune `EyeInHandThresholds` against
+    the first real calibration rather than reading a warning as a defect.
 - The solver takes `base_T_gripper` + `cam_T_target` pose lists (arm-agnostic). All
   OpenCV methods run; `select_best` picks by residual — **PARK is the reliable one**
   for angled/down-looking cameras. Uses the modern `cv2.aruco.CharucoDetector`.
   Default board: **14×9, 20 mm squares, 15 mm markers, `DICT_5X5_100`**.
 - `core/camera/manager.py` loads both files once per camera and shares them; nothing
-  recomputes calibration at runtime.
+  recomputes calibration at runtime. For `mount: arm` the loaded matrix is
+  `gripper_T_camera`, so ask `handle.base_T_camera(arm_pose)` — it refuses to
+  answer without a pose rather than returning a wrong matrix of the right shape.
+  `handle.extrinsic` keeps its old meaning for `mount: fixed` (the default), so
+  every existing caller is unchanged.
 
 **Orbbec driver (`core/camera/orbbec.py`)** selects a device by `serial` (exact,
 preferred) or `match_name` (name suffix, e.g. "335"/"335L") so two units don't
@@ -871,7 +895,7 @@ collide; picks the best decodable color profile at the requested resolution and
 decodes to RGB. `python -m core.camera.orbbec` lists connected devices.
 
 **Config**: `configs/cameras.yaml` (per-camera `serial`/`match_name`/resolution +
-`intrinsics_file`/`extrinsic_file`) and `configs/pipeline.yaml` (`arm` = RealMan
+`mount`/`intrinsics_file`/`extrinsic_file`) and `configs/pipeline.yaml` (`arm` = RealMan
 side/ip, `button_yolo` weights, `elevator` = panel plane + press params). Loaded via
 `core/config.py` (`REPO_ROOT`-relative). **The `elevator.panel` plane and press
 poses are PLACEHOLDERS — measure them on the real cell before running on hardware.**
@@ -894,6 +918,15 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 - **Calibration board mount**: bolt the ChArUco board to the bare **flange** (remove
   the LinkerHand — its fingertip TCP isn't defined in the controller). `base_T_camera`
   is end-effector-independent, so the hand is remounted afterward with no re-calibration.
+  **This is the EYE-TO-HAND setup (fixed camera).** For an arm-mounted camera the board
+  goes the other way round — FIXED IN THE SCENE, never on the flange — and the result is
+  `gripper_T_camera`. Doing it backwards is not caught by any residual: measured on
+  synthetic data, solving eye-in-hand samples with the eye-to-hand routine gives a
+  **1398 mm** consistency residual against 0.000 mm for the right one, which is loud, but
+  the arrangement that produces it looks entirely normal while you are standing at the
+  robot. The two saved files are both a bare 4x4, so `data/calibration/<cam>.frame`
+  records which is which and `CameraManager` refuses a file whose tag disagrees with
+  `mount:`. A missing tag reads as `base`, so every existing calibration still loads.
 - **`rm_movej`/`rm_movel` need arrival confirmation — fire-and-forget misreports the
   cause.** Two failure modes stack: they return `false` while still finishing the
   move in the background, AND they reject a new command while the previous one is
@@ -1179,19 +1212,40 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
 
 ## Stubs / not-yet-wired (marked in-code with `# TODO`)
 
-- **Camera moving to the ARM** (decided 2026-09-01, not built). The chest camera is
+- **Camera moving to the ARM** (decided 2026-09-01; **the calibration half is now
+  built, the runtime half is not, and no hardware exists yet**). The chest camera is
   fixed, so the positions where it can SEE the panel and where the arm can REACH it must
   overlap — and at the new site they do not: the panel sits at `y = -0.55, z = +0.69` in
   the arm base frame, where **336 combinations (14 lift heights x 24 approach rolls)
   have no IK solution**, while detection was perfectly healthy (lattice residual
   0.7-0.9 px). Mounting the camera on the arm decouples viewing from standing position.
-  What it costs, to be planned together: a different calibration problem
-  (`gripper_T_camera`; the existing `cam_chest.npy` and its 41 samples are void), a
-  geometry chain that can no longer treat `base_T_camera` as constant, cabling along the
-  arm, measurements only while stationary, and — most importantly — **the obstacle check
-  breaks**: it currently works because the home pose puts the arm entirely outside the
-  chest camera's view, so the depth image shows the world and not the robot's own limb.
-  With the camera on the arm that property is gone.
+
+  **Built 2026-09-11** (synthetic checks only — the camera is not fitted): eye-in-hand
+  calibration (`calibration/eye_in_hand.py`, `run_calibration_arm_cam.py`), its accuracy
+  eval (`eval_localization_arm_cam.py`), the frame tagging that keeps the two extrinsic
+  kinds apart (`calibration/frames.py`), and `CameraHandle.base_T_camera(arm_pose)`.
+  The eye-to-hand path is untouched: `mount: fixed` is the default and behaves exactly
+  as before, so which mount wins is still an open decision, not a fork in the road.
+
+  **NOT built, and each is a real decision rather than a port:**
+  - **Wiring it into the press.** `core/press.py` is pure geometry and takes the 4x4 as
+    an argument, so it needs NO change; `press_buttons.py:180` (`base_T_cam =
+    handle.extrinsic`) becomes `handle.base_T_camera(arm.get_tcp_pose())` and the pose
+    must be read at the instant of the frame, with the arm stationary. What that implies
+    is the actual work: where the arm STANDS to look, and whether it re-looks per button.
+  - **The obstacle check breaks.** It works today only because the home pose puts the arm
+    entirely outside the chest camera's view, so the depth image shows the world and not
+    the robot's own limb. With the camera on the arm that property is gone. **Keeping the
+    chest camera fitted for this job is the cheap answer** — the two mounts coexist in
+    `cameras.yaml` by design.
+  - **Accuracy is no longer a rigid constant.** Every measurement now passes through the
+    arm's FK and joint repeatability, which the 0.9 mm median end-to-end figure never
+    included. Mitigation to try first: look from ONE or TWO FIXED viewing poses, where a
+    systematic FK error is constant and is absorbed by the calibration —
+    `eval_localization_arm_cam.py` separates that (repeatability at one pose) from
+    accuracy across poses, precisely so the choice is made on numbers.
+  - Cabling along the arm, measurements only while stationary, and the existing
+    `cam_chest.npy` + its 41 samples being void for the new mount.
 - **Which floor the car is on** — unsolved, and the next perception problem after the
   above. Three candidate signals, to be COMBINED and chosen per site rather than picked
   blindly, because they fail in different ways:

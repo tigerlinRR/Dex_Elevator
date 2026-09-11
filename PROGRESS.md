@@ -2,6 +2,69 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE ARM-MOUNTED CAMERA HAS A CALIBRATION PATH; THE FIXED ONE IS UNTOUCHED (2026-09-11)
+
+Groundwork for moving the button camera onto the arm, which is still an **undecided**
+option — so it is built as a second path that coexists with the chest camera rather than
+a migration. `mount: fixed` is the default, the eye-to-hand code is byte-for-byte
+unchanged, and the existing `cam_chest.npy` loads exactly as before.
+
+**No hardware was involved. Nothing here has run on the robot.** The camera is not
+fitted; what exists is the maths, the capture tooling and a synthetic proof.
+
+### It is a different problem, not a variant of the same one
+
+| | eye-to-hand (chest, unchanged) | eye-IN-hand (arm, new) |
+|---|---|---|
+| board | bolted to the flange | **fixed in the scene** |
+| solved | `base_T_camera`, a constant | `gripper_T_camera`, a constant |
+| runtime | use it directly | `base_T_gripper(t) @ gripper_T_camera`, **per frame** |
+| OpenCV call | gripper poses **inverted** | gripper poses **as-is** |
+| must stay rigid | `gripper_T_board` | `base_T_board` |
+
+`cv2.calibrateHandEye` solves eye-in-hand natively, so the new path is the one that
+*drops* a step. Everything else — board detection, pose-diversity gating, per-sample
+persistence, offline re-solve — is reused by subclassing the existing session.
+
+**`core/press.py` needs no change at all**: it is pure geometry and takes the 4x4 as an
+argument, so it does not care where the matrix came from. The integration is one line in
+`press_buttons.py` plus the real question behind it — where the arm stands to look.
+
+### What the synthetic check proved (and one thing it killed)
+
+| check | result |
+|---|---|
+| noiseless recovery of a known `gripper_T_camera` | exact |
+| the same data through the eye-to-hand routine | **1398 mm** residual vs 0.000 mm |
+| yaw-only pose set | solver returns a tidy matrix; validator **fails** it |
+| `base_T_camera(X, pose) @ cam_T_target == base_T_board`, every pose | holds |
+
+The 1398 mm is the important one. Both extrinsics are a bare 4×4 on disk and **nothing
+in the file says which it is**, so a mix-up gives confident coordinates wrong by the
+length of the arm. Hence `data/calibration/<cam>.frame`, checked against `mount:` at
+load, failing closed. Files with no tag read as `base`, so there is nothing to migrate.
+
+The second important one is the yaw-only set. `AX = XB` recovers the camera's
+*translation* only from the ROTATION between poses — so a mostly-translation pose set
+(the natural way to hand-guide an arm) is ill-conditioned, and one whose rotations share
+an axis leaves that direction **unobservable while the solve still looks fine**. The
+capture HUD shows the axis spread live, because that is a defect only fixable while the
+operator is still standing at the robot with drag-teach on.
+
+### Still open — and these are decisions, not ports
+- **Where the arm stands to look.** The measurement now passes through the arm's FK and
+  joint repeatability, which the chest camera's 0.9 mm end-to-end median never included.
+  Looking from ONE OR TWO FIXED poses should absorb most of it as a systematic error;
+  `eval_localization_arm_cam.py` reports repeatability-at-one-pose separately from
+  accuracy-across-poses so that is settled with numbers.
+- **The obstacle check breaks.** It works only because the home pose puts the arm outside
+  the chest camera's view, so the depth image shows the world and not the robot's own
+  limb. Keeping the chest camera fitted for that job is the cheap answer, and the two
+  mounts already coexist in `cameras.yaml`.
+- Exposure and working distance have to be re-tuned: both change when the camera moves.
+- `EyeInHandThresholds` are engineering judgement, not measurement. Re-tune them against
+  the first real calibration instead of reading a warning as a defect.
+
 ## ▶ THE LEG MODEL WAS DIRECTIONAL ALL ALONG, AND THE DEAD TIME IS GONE (2026-09-04, evening)
 
 Seven consecutive end-to-end runs from a registered start point, **4/4 buttons every
