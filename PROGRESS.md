@@ -2,6 +2,54 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE ARM CAMERA IS ON THE ROBOT AND SEEN; CALIBRATION IS NEXT (2026-09-14)
+
+The camera is fitted and wired. Enumerated, captured from, and registered in the config;
+the solver self-test now passes on the robot's own cv2 rather than only on the Mac's
+synthetic run. **Not calibrated yet** — that needs a person with the board.
+
+| | |
+|---|---|
+| arm camera | Gemini 335, serial **`CP0T263000FK`** |
+| first capture | 1280x720 MJPG, depth **73-84 %** valid, median range 0.315 m |
+| SDK intrinsics | fx 691.5 / cx 643.5 / cy 363.0 (chest unit: 692.76 calibrated — same model) |
+| `bringup_check.py --camera cam_arm` | **passes** |
+| solver self-test on the robot | exact recovery; **0.58 mm** X error at 0.5 mm / 0.1 deg detection noise; degenerate set refused |
+
+**`match_name` stopped being enough the moment this camera went on.** It is the SAME
+MODEL as the chest one, so `"335"` now matches both and the SDK would open whichever it
+enumerated first — silently, and not necessarily the same one twice. `cam_arm` is pinned
+by serial, and so is `cam_chest` already.
+
+**The first frame settles a design question before calibration starts**: the plunger and
+the hand occupy the lower third of the image. So the tool is inside this camera's field
+of view — a plane-fit ROI must exclude it (the hand in frame dragged a chest-camera fit
+by 23 mm), and the board must not be occluded by it while capturing samples.
+
+### The self-test found a real defect, and it is the project's classic shape
+
+A degenerate pose set makes OpenCV's `calibrateHandEye` return an **all-NaN** transform
+instead of raising. That is worse than an error: every validation test is a threshold
+comparison, and `nan > limit` is **False**, so all of them fall through to their "pass"
+branch and the calibration reports clean. Only the rotation-axis conditioning check
+caught it. Non-finite results are now refused at the solve, in `select_best` (whose
+`min()` would otherwise rank a NaN first), and in the validator independently, since an
+extrinsic can arrive from a saved file.
+
+The same pattern exists in the eye-to-hand path and was **left alone deliberately** —
+that is the calibration currently flying — but it is the same hazard if that solve ever
+degenerates. Worth a decision rather than a silent fix.
+
+### Next, and the first two need a person
+1. Intrinsics for `cam_arm` (hold the board, cover the frame).
+2. `run_calibration_arm_cam.py` — board FIXED in the scene this time, arm carries the
+   camera. Watch the HUD's axis spread; keep it above 0.15.
+3. `eval_localization_arm_cam.py` — measure repeatability at one pose separately from
+   accuracy across poses. That number decides whether the press looks from a fixed
+   viewing pose or from wherever the arm is.
+4. Exposure is on **auto** for now (mean 107.9, 0.00 % saturated). Re-tune and lock it
+   against the real panel before trusting button detection.
+
 ## ▶ THE ARM-MOUNTED CAMERA HAS A CALIBRATION PATH; THE FIXED ONE IS UNTOUCHED (2026-09-11)
 
 Groundwork for moving the button camera onto the arm, which is still an **undecided**

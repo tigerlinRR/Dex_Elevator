@@ -90,7 +90,20 @@ def _solve(base_T_gripper, cam_T_target, method: int) -> np.ndarray:
     R_t2c = [np.asarray(T, dtype=np.float64)[:3, :3] for T in cam_T_target]
     t_t2c = [np.asarray(T, dtype=np.float64)[:3, 3] for T in cam_T_target]
     R_cam, t_cam = cv2.calibrateHandEye(R_g2b, t_g2b, R_t2c, t_t2c, method=method)
-    return make_transform(R_cam, t_cam.reshape(3))
+    X = make_transform(R_cam, t_cam.reshape(3))
+    # A degenerate pose set (all rotations about one axis, or near-zero rotation)
+    # makes the OpenCV solve return NaN rather than raising. Measured on a
+    # synthetic yaw-only set: PARK returns an all-NaN matrix. Left to propagate it
+    # is WORSE than an exception, because every downstream threshold test is a
+    # comparison and `nan > limit` is False — the residual checks then fall
+    # through to their "pass" branch and the calibration reports clean. Turn it
+    # into a failure here, where it is still attributable to the solve.
+    if not np.isfinite(X).all():
+        raise RuntimeError(
+            "hand-eye solve returned a non-finite transform — the pose set is degenerate "
+            "(check rotation_diversity: rotations about a single axis, or too little rotation)"
+        )
+    return X
 
 
 def solve_eye_in_hand(
@@ -125,7 +138,7 @@ def solve_eye_in_hand_all_methods(
     for name, method in _methods().items():
         try:
             results[name] = _solve(base_T_gripper, cam_T_target, method)
-        except cv2.error:  # pragma: no cover - depends on pose conditioning
+        except (cv2.error, RuntimeError):  # pragma: no cover - depends on pose conditioning
             continue
     if not results:
         raise RuntimeError("All hand-eye methods failed; check the pose set.")
@@ -179,6 +192,12 @@ def select_best(
         name: consistency_residual(X, base_T_gripper, cam_T_target)["trans_m"]["mean"]
         for name, X in candidates.items()
     }
+    # Drop non-finite scores before ranking: min() would happily return a NaN
+    # entry (every comparison against NaN is False), i.e. silently pick the one
+    # candidate that is not a solution at all.
+    scored = {k: v for k, v in scored.items() if np.isfinite(v)}
+    if not scored:
+        raise RuntimeError("no hand-eye candidate produced a finite residual; pose set is degenerate")
     best = min(scored, key=scored.get)
     if prefer in scored and scored[prefer] - scored[best] < 1e-4:
         best = prefer
@@ -277,8 +296,19 @@ def validate_eye_in_hand(
     if n < 3:
         rep.check("fail", f"only {n} samples (need >= 3)")
         return rep
+    # Independent of the solve, because X can arrive from a saved file. Every
+    # check below is a threshold comparison, and `nan > limit` is False, so a
+    # non-finite X would sail through all of them and report PASS.
+    if not np.isfinite(np.asarray(gripper_T_camera, dtype=np.float64)).all():
+        rep.check("fail", "extrinsic contains NaN/inf — the solve did not converge "
+                          "(degenerate pose set); every residual below is meaningless")
+        return rep
 
     res = consistency_residual(gripper_T_camera, base_T_gripper, cam_T_target)
+    if not np.isfinite([res["trans_m"]["mean"], res["rot_deg"]["mean"]]).all():
+        rep.check("fail", "consistency residual is NaN/inf — a sample pose or board pose "
+                          "is not a valid transform")
+        return rep
     tmean, tmax = res["trans_m"]["mean"], res["trans_m"]["max"]
     rmean, rmax = res["rot_deg"]["mean"], res["rot_deg"]["max"]
     rep.metrics.update({

@@ -57,21 +57,31 @@ cameras:
     intrinsics_file: cam_head_intrinsics.npz
     extrinsic_file: cam_head.npy
 
-  # ARM-MOUNTED camera — NOT FITTED YET (planned; see CLAUDE.md "Camera moving to
-  # the ARM"). Uncomment and fill in the serial once the bracket is on, then:
+  # ARM-MOUNTED camera — FITTED 2026-09-14, NOT CALIBRATED YET. Order:
   #   1. python3 initialization/calibrate_intrinsics.py     --camera cam_arm --web
   #   2. python3 initialization/run_calibration_arm_cam.py  --camera cam_arm --web
   #   3. python3 initialization/eval_localization_arm_cam.py --camera cam_arm --web
-  # Left commented so CameraManager does not try to open a device that is not there.
-  # - id: cam_arm
-  #   role: arm             # rides the RIGHT arm, looks at the panel from wherever the arm puts it
-  #   mount: arm            # extrinsic file holds gripper_T_camera, NOT base_T_camera
-  #   serial: ""            # fill in from `python3 -m core.camera.orbbec`
-  #   match_name: ""        # fallback if the serial changes
-  #   width: 1280
-  #   height: 720
-  #   fps: 30
-  #   exposure: 156         # RE-TUNE on the arm: the working distance and the light on the
-  #   gain: 16              # faceplate both change when the camera moves
-  #   intrinsics_file: cam_arm_intrinsics.npz
-  #   extrinsic_file: cam_arm.npy
+  # Until step 2 has run there is no cam_arm.npy, which is not an error: the handle
+  # simply carries no extrinsic. Every script opens only the camera it asks for, so
+  # listing this one costs the others nothing.
+  - id: cam_arm
+    role: arm               # rides the RIGHT arm — sees the panel from wherever the arm puts it
+    mount: arm              # extrinsic file holds gripper_T_camera, NOT base_T_camera
+    # SERIAL IS MANDATORY HERE. This unit is a Gemini 335, the SAME MODEL as the chest
+    # camera, so `match_name: "335"` now matches BOTH and the SDK would open whichever
+    # it enumerates first — silently, and differently from run to run.
+    serial: "CP0T263000FK"  # Gemini 335 (arm) — enumerated on dex5 2026-09-14
+    width: 1280
+    height: 720
+    fps: 30
+    # Left on AUTO for now, deliberately. The chest camera's locked 156 was tuned for a
+    # 0.7 m view of a mostly-dark wall; this camera sits much closer and the panel fills
+    # far more of its frame, so that constant does not transfer. Measured on the first
+    # frames here: mean 107.9, 0.00% saturated on auto. Re-tune against the real panel
+    # (and lock it) before trusting button detection — AE drifting between the "look"
+    # and the "press" is exactly the kind of thing that moves a measurement.
+    # NOTE: auto-exposure needs ~30 frames to settle; a single capture() right after
+    # start() is far too dark.
+    exposure: auto
+    intrinsics_file: cam_arm_intrinsics.npz
+    extrinsic_file: cam_arm.npy

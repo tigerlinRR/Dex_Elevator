@@ -80,8 +80,23 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
   chest camera and arm bases ride it together, so `base_T_camera` stays constant.
 - **LinkerHand** dexterous hand as end-effector (driven by its own bridge, not the
   RealMan gripper) — pressing uses a fixed "pointing" hand pose set out-of-band.
-- **Two Orbbec** cameras: **Gemini 335** (chest, button camera) + **335L** (head,
-  scene). Distinguish them by device name suffix ("335" vs "335L") or serial.
+- **THREE Orbbec** cameras since 2026-09-14: **Gemini 335** (chest, `CP0BB5300041`),
+  **Gemini 335** (ARM-MOUNTED, `CP0T263000FK`, fitted but NOT calibrated) and **335L**
+  (head, `CP2G8530000W`).
+  - **`match_name` is no longer sufficient.** The arm camera is the SAME MODEL as the
+    chest one, so "335" now matches both and the SDK opens whichever it enumerates
+    first — silently, and not necessarily the same one twice. **Select by serial.**
+  - The arm unit works: 1280x720 MJPG, depth 73-84 % valid, SDK intrinsics
+    fx 691.5 / cx 643.5 / cy 363.0 (close to the chest unit's calibrated 692.76, as
+    expected for the same model). Its first frame shows the plunger and the hand in the
+    lower third of the image — so the tool is IN its field of view, which matters twice
+    over: a plane-fit ROI must exclude it (the hand in frame dragged a fit by 23 mm on
+    the chest camera), and the board must not be occluded by it during calibration.
+  - Its exposure is deliberately left on **auto** for now. The chest camera's locked 156
+    was tuned for a 0.7 m view of a mostly-dark wall and does not transfer to a camera
+    that sits much closer with the panel filling the frame. Measured on auto here: mean
+    107.9, 0.00 % saturated. Re-tune and LOCK it against the real panel before trusting
+    button detection.
   - **The head 335L is aimed steeply DOWN** (verified 2026-08-21 by looking at a frame): it
     sees the robot's own two arms, the base deck, and the near floor — NOT the elevator door
     or people at standing height. It catches only the bottom 4 of the 10 buttons, very
@@ -1147,6 +1162,19 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   button, 3 mm lit it repeatably). A finger pushes the switch directly, whereas the
   plunger must ALSO compress its own spring, and the spring eats most of the stroke.
   Expect the same bias with any compliant press tool.
+- **A degenerate hand-eye pose set returns NaN, and NaN PASSES every threshold check.**
+  OpenCV's `calibrateHandEye` does not raise on a rank-deficient pose set (all rotations
+  about one axis, or too little rotation) — it returns an all-NaN transform. That is
+  worse than an exception, because every validation test is a comparison and
+  `nan > limit` is **False**, so the residual checks fall through to their "pass" branch
+  and the calibration reports clean. Found 2026-09-14 by the eye-in-hand self-test, where
+  only the rotation-axis conditioning check caught it. `calibration/eye_in_hand.py` now
+  refuses a non-finite solve in three places: at the solve, in `select_best` (whose
+  `min()` would otherwise happily rank a NaN first), and in the validator (because X can
+  arrive from a saved file). **The same pattern exists unfixed in the eye-to-hand path**
+  (`validate_extrinsics`, `select_best` in `extrinsic.py`) — left alone on purpose while
+  the chest calibration is the working one, but it is the same hazard if that solve ever
+  degenerates.
 - **ALWAYS outlier-reject after calibrating — a single bad view/pose costs 3x accuracy.**
   Measured on the 2026-08 run: intrinsics RMS 0.698 → **0.383 px** by dropping 25 of 88 views;
   extrinsic consistency 1.85 → **0.67 mm** and leave-one-out worst 33.6 → **1.81 mm** by dropping
@@ -1220,7 +1248,13 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   have no IK solution**, while detection was perfectly healthy (lattice residual
   0.7-0.9 px). Mounting the camera on the arm decouples viewing from standing position.
 
-  **Built 2026-09-11** (synthetic checks only — the camera is not fitted): eye-in-hand
+  **Camera FITTED 2026-09-14** (`CP0T263000FK`), enabled in `cameras.yaml` as `cam_arm`,
+  `bringup_check.py --camera cam_arm` passes. **Not calibrated yet** — intrinsics first,
+  then `run_calibration_arm_cam.py`. The solver self-test passes on the robot's own cv2
+  4.8.0: exact recovery of a known `gripper_T_camera`, 0.58 mm error under 0.5 mm/0.1 deg
+  detection noise, and a degenerate pose set refused.
+
+  **Built 2026-09-11**: eye-in-hand
   calibration (`calibration/eye_in_hand.py`, `run_calibration_arm_cam.py`), its accuracy
   eval (`eval_localization_arm_cam.py`), the frame tagging that keeps the two extrinsic
   kinds apart (`calibration/frames.py`), and `CameraHandle.base_T_camera(arm_pose)`.

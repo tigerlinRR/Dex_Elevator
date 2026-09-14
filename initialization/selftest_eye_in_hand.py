@@ -116,17 +116,37 @@ def main() -> None:
     # --- 3. degenerate pose set must be refused ----------------------------
     dgrips = _pose_set(14, single_axis=True)
     dcams = _observations(dgrips, pos_noise_m=0.0005, rot_noise_deg=0.1)
-    Xd = solve_eye_in_hand(dgrips, dcams)
-    t_mm, _ = _err(Xd)
     div = rotation_diversity(dgrips)
-    drep = validate_eye_in_hand(Xd, dgrips, dcams)
-    print(f"3. single-axis pose set: X off by {t_mm:.1f} mm, axis ratio {div['axis_ratio']:.4f}, "
-          f"validator says {drep.status.upper()}")
-    if drep.status != "fail":
-        print("   ✗ FAIL — a degenerate pose set must be refused, not warned about")
+    try:
+        Xd = solve_eye_in_hand(dgrips, dcams)
+    except RuntimeError as e:
+        # Best case: the solve itself refuses. OpenCV returns NaN rather than
+        # raising on a degenerate set, so this is our own non-finite guard —
+        # without it every threshold check downstream silently passes, because
+        # `nan > limit` is False.
+        print(f"3. single-axis pose set (axis ratio {div['axis_ratio']:.4f}): "
+              f"solve REFUSED — {e}")
+        print("   ✓ caught at the solve, before any residual could be reported")
+    else:
+        t_mm, _ = _err(Xd)
+        drep = validate_eye_in_hand(Xd, dgrips, dcams)
+        print(f"3. single-axis pose set: X off by {t_mm:.1f} mm, axis ratio "
+              f"{div['axis_ratio']:.4f}, validator says {drep.status.upper()}")
+        if drep.status != "fail":
+            print("   ✗ FAIL — a degenerate pose set must be refused, not warned about")
+            ok = False
+        else:
+            print("   ✓ refused (the solve looks tidy; only the conditioning check sees it)")
+
+    # And the validator must refuse a non-finite extrinsic on its own, because X
+    # can arrive from a saved file rather than from solve().
+    nan_rep = validate_eye_in_hand(np.full((4, 4), np.nan), grips, cams)
+    print(f"3b. validator fed a NaN extrinsic: {nan_rep.status.upper()}")
+    if nan_rep.status != "fail":
+        print("   ✗ FAIL — NaN must not pass threshold checks")
         ok = False
     else:
-        print("   ✓ refused (the solve looks tidy; only the conditioning check sees it)")
+        print("   ✓ refused independently of the solve")
 
     # --- 4. the geometries are not interchangeable -------------------------
     X_wrong = solve_eye_to_hand(grips, cams)         # wrong routine, same data

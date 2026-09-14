@@ -47,6 +47,7 @@ the vision only needs to give a reliable button pixel and its floor label.
 | End-effector (pressing) | **spring plunger** bolted to the flange | rigid, no joints to damage; the spring gives compliance without force control |
 | End-effector (other) | LinkerHand O6 dexterous hand | still fitted and controllable (`core/hand/linkerhand.py`), but not what presses |
 | Camera (buttons) | **Orbbec Gemini 335** (chest) | `core/camera/orbbec.py` (pyorbbecsdk v2) |
+| Camera (arm) | **Orbbec Gemini 335** (on the right arm, `CP0T263000FK`) | fitted 2026-09-14, **not calibrated yet**; same model as the chest unit, so select it by **serial** — `match_name: "335"` now matches both |
 | Camera (scene) | Orbbec Gemini 335L (head) | aimed steeply DOWN — sees the robot's own arms and the near floor, not the door or standing people; uncalibrated and currently unused |
 | Compute | NVIDIA Jetson AGX Orin (`ssh dex5-wired`) | JetPack 6.2 / CUDA 12.6; runs the SDKs + inference |
 | Detection | Ultralytics YOLO11m | multi-class (per floor: `1`,`2`,`B1`,`G`…) — detects AND identifies; trained from CC BY data (`yolo/`, `DATASETS.md`) |
