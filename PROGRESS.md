@@ -87,10 +87,34 @@ and is left alone deliberately — that is the calibration currently flying — 
 - The arm camera is the SAME MODEL as the chest one, so `match_name: "335"` now matches
   both — **both are pinned by serial**.
 
+### End-to-end accuracy MEASURED on held-out poses (2026-09-15)
+
+`eval_arm_cam_accuracy.py`: the board stays put, the arm drives to poses the
+calibration never used (including J4, which no sweep touched), and we ask how far the
+computed board position lands from the reference.
+
+| | chest camera (in service) | **arm camera** |
+|---|---|---|
+| median | 0.9 mm | **1.70 mm** |
+| mean | 1.9 mm | **1.93 mm** |
+| worst | 8.3 mm | **4.16 mm** |
+
+Mean is level, median a little worse, **worst case twice as good** — and the arm
+camera's number additionally contains the arm's FK and joint repeatability error,
+which the chest figure does not carry at all. Good enough to proceed: the chest
+camera's 0.9 mm supports presses landing 0.1-0.4 mm off, because localisation error
+does not transfer 1:1 to a press (the panel plane is fitted live on approach).
+
+**A metric-definition trap worth recording.** Four returns to one pose read 3.50 /
+2.94 / 3.30 / 3.09 mm from the global reference, and calling that "repeatability"
+makes the camera look ten times worse than it is. Those four differ from EACH OTHER by
+**0.56 mm** — that is the repeatability; the 3.2 mm is a BIAS belonging to that
+particular pose. The two answer different questions: bias is constant at a fixed
+viewing pose and could be calibrated out, spread cannot. The script reported the wrong
+one at first and now reports both separately.
+
 ### Still open
-- **End-to-end localisation accuracy has not been measured** (`eval_localization_arm_cam.py`,
-  ~10 min). It separates repeatability at one viewing pose from accuracy across poses,
-  which decides whether the press looks from a fixed pose or from wherever the arm is.
+- ~~End-to-end accuracy~~ — done, see above.
 - **Not wired into the press.** One line in `press_buttons.py`; `core/press.py` needs no
   change. The real question behind it is where the arm STANDS to look.
 - **The arm obstacle check breaks** with the camera on the arm — it works today only
