@@ -314,6 +314,18 @@ between two clear endpoints. This matters because the controller's *runtime*
 self-collision check is **off**. It covers the arm's own links and end-effector only:
 the other arm, the chassis and the door frame still need virtual walls.
 
+**An ARM-MOUNTED button camera is supported but unproven** (`--camera cam_arm`,
+2026-09-15). Two things change and neither is optional:
+- `base_T_camera` is recomputed per frame from the arm pose, read **immediately after**
+  the frame with the arm stationary — for this mount the image and the pose are one
+  measurement.
+- **The obstacle check is forced onto a FIXED camera** (`--obstacle-camera`, default
+  `cam_chest`). It works by asking what sits in front of the panel plane, which is only
+  meaningful while the robot's own limbs are outside the view — a guarantee the home
+  pose gives the chest camera and cannot give a camera bolted to the arm. With no
+  suitable fixed camera the press REFUSES to move unless `--no-obstacle-check` is
+  passed explicitly. The `cam_chest` path is unchanged, byte for byte.
+
 **Autonomous pressing** (`initialization/press_buttons.py`) — the executable that
 ties everything together: `python3 initialization/press_buttons.py 1 4 2 5 --go`.
 Per button: home -> `movej` to standoff -> `movel` through contact into the button
@@ -581,6 +593,26 @@ before designing anything on top: 3 deg over the ~1.2 m it takes to clear a door
 (-0.281, +0.030), solved from one measured turn). So a turn changes the panel's RANGE as
 well as its bearing — which is what makes "one straight leg plus one turn" able to satisfy
 both, and why a turn is not a pure re-aim.
+
+**The chassis also serves a REST API on port 8000** (found 2026-09-15), separate from
+the 8090 twist/topic interface: `/live` is AutoXing's own web UI (map, pose, lidar
+cloud, trajectory, costmap, alerts — all of it accumulated, so it still shows something
+while the robot is stationary), plus `/videos/`, `/robot-params/`, `/services/` (48 of
+them), `/battery-state`. Two traps: `/battery-state` serves an HTML page, not JSON —
+read the battery from the `/battery_state` websocket topic instead; and 8000 is on the
+chassis subnet, so reaching it from a laptop needs a TCP forward on the Jetson.
+- **The chassis has a front RGB camera** — `/rgb_cameras/front/compressed` (JPEG,
+  ~0.85 Hz, what `initialization/base_camera_preview.py` serves) and
+  `/rgb_cameras/front/video` (H.264, ~4 Hz, not directly viewable). It faces the base's
+  direction of travel, i.e. **180 degrees away from the arm and chest camera**, so it
+  watches where the robot drives and never the arm's workspace. Monitoring/HRI only.
+- **The only point cloud is the lidar's.** The official UI subscribes to exactly
+  `/alerts /constraint_list /map /map/costmap /map/info /maps/{1cm,5cm}/1hz /path
+  /planning_state /scan_matched_points2 /score_histogram /slam/state /tracked_pose
+  /trajectory /trajectory_node_list /wheel_state` — no camera cloud. BUT `/services/`
+  lists **"Enable Depth Cameras"** and **"Calibrate Depth Cameras"**, so the hardware
+  has depth cameras that are not switched on. Worth revisiting: they would see the
+  heights the lidar's 7 cm plane cannot.
 
 **The chassis has a LOCAL navigation API, not just twist** (`/chassis/moves`, found
 2026-09-04). This corrects an assumption the straight-line driver was built under — that
@@ -1023,6 +1055,16 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   `KeyError` before doing anything. Fixing it means teaching it to search the lift the
   way `plan()` does — it is not a missing-key patch, because the fixed-height model it
   encodes is the superseded one.
+- **The chassis drives itself to the dock, and `remote` does not stop it — use
+  `initialization/chassis_hold.py`.** Its `control_unit` posts its own `charge` moves
+  whenever it feels like it and takes the control mode back to run one. Measured
+  2026-09-14: driven 30 cm off the dock, it posted one 30 s later and drove back to
+  within 1 cm, silently undoing the positioning. The watchdog cancels moves whose
+  creator is `control_unit`, never ours (`dex_elevator*`), and **allows them below
+  `--min-battery` (default 25 %)** — a blanket block is how the robot ran itself flat
+  on 2026-09-11 (parked 0.66 m short of the dock, never charged, shut down at 4 %, cost
+  three days). Installed at boot via the USER crontab (`--install-cron`, no sudo); note
+  that entry MUST be an absolute path, since cron does not run from the repo directory.
 - **Killing the local process does NOT stop the robot.** An AutoXing task is executed
   by the cloud, not by our process: after `kill -9` on the runner the base carried on
   and drove the rest of its route by itself. Stopping means cancelling the task

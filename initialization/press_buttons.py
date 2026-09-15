@@ -64,7 +64,19 @@ def main() -> int:
     ap.add_argument("buttons", nargs="+", help="button labels, e.g. 1 4 2 5")
     ap.add_argument("--go", action="store_true", help="execute (default: plan only)")
     ap.add_argument("--push", type=float, default=None, help="override push depth (mm)")
-    ap.add_argument("--camera", default="cam_chest")
+    ap.add_argument("--camera", default="cam_chest",
+                    help="camera that LOCATES the buttons. cam_chest (fixed) is the "
+                         "default; cam_arm rides the arm and recomputes base_T_camera "
+                         "per frame")
+    ap.add_argument("--obstacle-camera", default="cam_chest",
+                    help="camera that checks the path is clear. Must be a FIXED mount — "
+                         "a camera on the arm moves with the limb it would be watching, "
+                         "so it cannot do this job. Only consulted when --camera is "
+                         "arm-mounted; otherwise the button camera does both")
+    ap.add_argument("--no-obstacle-check", action="store_true",
+                    help="proceed even when no fixed camera can watch the path. This "
+                         "removes the only sensor that sees the arm's workspace — the "
+                         "base's own obstacle sensors face 180 degrees the other way")
     ap.add_argument("--panel", default="mock_cabinet",
                     help="registered layout id from configs/panels.yaml")
     ap.add_argument("--circles", action="store_true",
@@ -176,9 +188,47 @@ def main() -> int:
                   "to move. Pass --no-fist only if no hand is fitted.")
             arm.disconnect()
             return 1
-    handle = CameraManager().build().get(args.camera)
-    base_T_cam = handle.extrinsic
+    manager = CameraManager().build()
+    handle = manager.get(args.camera)
     cam = handle.camera
+
+    # base_T_camera is a CONSTANT only for a torso-mounted camera. With the camera on
+    # the arm it is a function of the arm pose, so it must be read at the instant of
+    # the frame, with the arm stationary — every caller below takes it from cam_pose()
+    # rather than closing over a value.
+    if handle.mount == "arm":
+        def cam_pose():
+            return handle.base_T_camera(arm.get_tcp_pose())
+        print(f"camera {args.camera}: mount=arm — base_T_camera recomputed per frame")
+    else:
+        _fixed_T_cam = handle.extrinsic
+        def cam_pose():
+            return _fixed_T_cam
+
+    # THE OBSTACLE CHECK NEEDS A CAMERA THAT DOES NOT MOVE WITH THE ARM. It works by
+    # asking what sits in front of the panel plane, and that is only meaningful while
+    # the robot's own limbs are outside the view — which the home pose guarantees for
+    # the chest camera and cannot guarantee for a camera bolted to the arm (the arm IS
+    # the mount). So an arm-mounted button camera keeps using the chest camera here.
+    obs_handle, obs_cam_pose = handle, cam_pose
+    if handle.mount == "arm":
+        try:
+            obs_handle = manager.get(args.obstacle_camera)
+        except KeyError:
+            obs_handle = None
+        if obs_handle is None or obs_handle.extrinsic is None or obs_handle.mount != "fixed":
+            print(f"!! {args.camera} rides the arm, so the path check needs a FIXED camera; "
+                  f"'{args.obstacle_camera}' is missing or uncalibrated. Refusing to move — "
+                  f"pass --no-obstacle-check to accept that nothing watches the path.")
+            if not args.no_obstacle_check:
+                arm.disconnect()
+                return 1
+        else:
+            _obs_T = obs_handle.extrinsic
+            def obs_cam_pose():
+                return _obs_T
+            print(f"path check uses {args.obstacle_camera} (fixed) — the arm camera cannot "
+                  f"do this job, it moves with the limb it is meant to watch")
 
     # ---- torso lift: SEARCHED, not computed --------------------------------
     # The lift is a degree of freedom, so it is searched exactly like the approach
@@ -342,6 +392,10 @@ def main() -> int:
         Returns ``(buttons3d, (origin, normal))`` in the arm base frame.
         """
         frame = cam.capture()
+        # Read the arm pose immediately after the frame, with the arm stationary: for
+        # an arm-mounted camera these two are one measurement, and any motion between
+        # them corrupts the camera pose itself, not just the target's.
+        base_T_cam = cam_pose()
         bgr = cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR)
 
         if args.circles:
@@ -417,7 +471,7 @@ def main() -> int:
         min_mm = float(gd.get("min_mm", 40.0))
         min_frac = float(gd.get("min_frac", 0.002))
         try:
-            fr = cam.capture()
+            fr = obs_handle.camera.capture()
         except Exception as e:  # noqa: BLE001
             return f"could not capture to check the path ({e})"
         d = fr.depth[::4, ::4]
@@ -429,7 +483,8 @@ def main() -> int:
         z = d[m].astype(np.float64)
         x = (xs[m] - K.cx) / K.fx * z
         y = (ys[m] - K.cy) / K.fy * z
-        pts = np.stack([x, y, z], 1) @ base_T_cam[:3, :3].T + base_T_cam[:3, 3]
+        T_obs = obs_cam_pose()
+        pts = np.stack([x, y, z], 1) @ T_obs[:3, :3].T + T_obs[:3, 3]
         front = (pts - org_now) @ nrm_now * 1000.0
         frac = float((front > min_mm).mean())
         if frac > min_frac:
