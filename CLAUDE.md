@@ -889,6 +889,25 @@ are no-ops (the LinkerHand is separate).
     `rotation_diversity()` scores it (0 = one axis), the capture HUD shows it live,
     and `validate_eye_in_hand` FAILS a near-collinear set. Verified on synthetic
     data: a yaw-only set solves to a plausible-looking X and is refused.
+  - **CAPTURE IT WITH A PROGRAM, NOT BY HAND** (`initialization/sweep_eye_in_hand_poses.py`,
+    2026-09-14). Three hand-guided rounds on this robot (56 samples) all produced a
+    DEGENERATE pose set — 82-92 % of the rotation energy on base-frame Z every time —
+    and the cause is mechanical, not operator skill: a person holds the arm and moves it
+    to a new PLACE, and the orientation change that comes with that is dominated by J1,
+    the base rotation, which IS Z. Spinning the last joint while holding everything else
+    still is not a motion a hand makes. Merging such rounds makes the ratio WORSE, since
+    single-axis samples dilute the one round that had a second axis (0.243 alone -> 0.135
+    merged). A program sweeping J6/J5 fixed it in one pass, and the samples are an order
+    of magnitude cleaner (median residual 2.4 mm / max 5.4 against the hand rounds'
+    3.7-5.8 / 33-53) because it waits for the arm to settle.
+  - **A sweep about ONE joint cannot see the translation along that joint's axis.** In
+    `(R_A - I) t_X = ...` the matrix is singular along the rotation axis. The camera's
+    optical axis is 2 deg off the TCP z here, so J6 spins it about its own line of sight
+    and `t_z` never enters the equations: two J6 sweeps agreed to **0.1 mm in x and y**
+    and disagreed by **12 mm in z**, both reporting excellent residuals. J5 (wrist pitch)
+    turns perpendicular to that and pins it down (axis spread 0.554 on its own). Its
+    usable range is asymmetric because the wrist sits near a limit, so the sweep computes
+    it from the joint limit instead of assuming symmetry.
   - Its consistency residual is NOT comparable to the eye-to-hand one — it also
     absorbs the arm's FK and joint repeatability error, because the camera now
     rides through them. Expect it larger; re-tune `EyeInHandThresholds` against
@@ -1181,7 +1200,14 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   ONE pose out of 41 (`sample002`, captured before the arm had settled). The danger is that the
   headline numbers still look acceptable, because the mean hides the tail — always look at the
   *max* and the per-item distribution, not just RMS/consistency.
-  - Intrinsics: `cv2.calibrateCameraExtended` returns `perViewErrors`; drop views above
+  - Intrinsics: `initialization/reject_intrinsic_outliers.py` (2026-09-14) does this as a
+    re-runnable step over the saved images. It CACHES the corner detection — the slow
+    part, ~10 min for 80 views — so trying another threshold is seconds, which is what
+    makes the threshold choosable from the data. Measured on `cam_arm`: RMS falls
+    monotonically 0.487 -> 0.166 px as views go 80 -> 50, but the **held-out**
+    cross-validation bottoms out at **58 views** and degrades after, so RMS alone
+    over-rejects by 8 views. Judge rejection on held-out data, never on RMS.
+  - Manually: `cv2.calibrateCameraExtended` returns `perViewErrors`; drop views above
     ~2x the median, then re-run. Cache the detected corners first — detection is the slow part
     (~8 min for 88 views), after which trying different rejection thresholds is instant.
   - Extrinsics: reconstruct `flange_T_board = inv(base_T_gripper) @ X @ cam_T_target` for every
@@ -1248,9 +1274,13 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   have no IK solution**, while detection was perfectly healthy (lattice residual
   0.7-0.9 px). Mounting the camera on the arm decouples viewing from standing position.
 
-  **Camera FITTED 2026-09-14** (`CP0T263000FK`), enabled in `cameras.yaml` as `cam_arm`,
-  `bringup_check.py --camera cam_arm` passes. **Not calibrated yet** — intrinsics first,
-  then `run_calibration_arm_cam.py`. The solver self-test passes on the robot's own cv2
+  **Camera FITTED AND CALIBRATED 2026-09-14** (`CP0T263000FK`, `cam_arm` in
+  `cameras.yaml`). Intrinsics: 58 of 80 views, RMS **0.177 px**, mean reprojection
+  **0.152 px** — better than the in-service chest camera on every metric (0.253 px,
+  cross-val 3.29 vs 1.63). Extrinsic: 42 samples from three PROGRAM sweeps,
+  **1.60 mm / 0.382 deg**, axis spread 0.256, four methods agreeing to 0.07 mm, PASS.
+  `gripper_T_camera = [15.7, -48.9, -89.1] mm`. **End-to-end accuracy not yet measured**
+  and it is **not wired into the press**. The solver self-test passes on the robot's own cv2
   4.8.0: exact recovery of a known `gripper_T_camera`, 0.58 mm error under 0.5 mm/0.1 deg
   detection noise, and a degenerate pose set refused.
 

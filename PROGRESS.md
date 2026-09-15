@@ -2,6 +2,102 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE ARM CAMERA IS CALIBRATED, AND HAND-GUIDED CAPTURE IS THE WRONG METHOD (2026-09-14)
+
+Both parts done on the arm-mounted Gemini 335. Intrinsics beat the in-service chest
+camera on every metric; the eye-in-hand extrinsic passes validation. The result that
+generalises beyond this robot is **how** the extrinsic had to be captured.
+
+| | intrinsics | extrinsic |
+|---|---|---|
+| kept | **58** of 80 views | **42** samples (3 program sweeps) |
+| residual | RMS **0.177 px**, mean reproj **0.152 px** | **1.60 mm** / **0.382 deg** |
+| conditioning | coverage 0.979 | axis spread **0.256** (need 0.15) |
+| cross-check | 4 methods agree to **0.07 mm** | z from two independent subsets: **-90.6 / -89.1 mm** |
+| result | `gripper_T_camera = [15.7, -48.9, -89.1] mm` | ✓ PASS |
+
+Against the chest camera that is flying today (0.9 mm end-to-end, 0.3 mm presses):
+mean reprojection **0.152 vs 0.253 px**, cross-val **1.63 vs 3.29 px**, i.e. better on
+every comparable number.
+
+### Hand-guiding an arm produces a DEGENERATE pose set, structurally
+
+Three hand-guided rounds — 56 samples over ~40 minutes — all failed, and not because
+the operator did it badly:
+
+| round | samples | axis spread | dominant axis (base frame) |
+|---|---|---|---|
+| 1 | 30 | 0.089 | [-0.08, -0.01, 1.00] — 86.7 % of the energy |
+| 2a | 5 | 0.062 | [ 0.17, -0.06, 0.98] — 91.8 % |
+| 3 | 21 | 0.124 | [-0.13, 0.26, -0.96] — 82.7 % |
+
+All three are the SAME axis, base-frame Z. The cause is mechanical: **a person holds
+the arm and moves it to a new place, and the orientation change that comes with that
+is dominated by J1, the base rotation — which is Z.** Deliberately spinning the last
+joint while holding everything else still is not a motion a hand makes. Merging the
+rounds made it worse, not better: 56 single-axis samples DILUTE the one round that
+had a second axis (merged ratio 0.135 < the good round's 0.243 on its own).
+
+Program-driven joint sweeps fixed it in one pass, and the data is an order of
+magnitude cleaner — per-round residual **median 2.4 mm / max 5.4** against the hand
+rounds' **median 3.7-5.8 / max 33-53**. Etc. the arm settles properly when a program
+waits for it.
+
+### A pure J6 sweep cannot see along the optical axis — and the residual hides it
+
+The camera's optical axis sits 2 deg off the TCP's z, so J6 spins the camera about its
+own line of sight. That is exactly what the translation term needs, EXCEPT along that
+axis: in `(R_A - I) t_X = ...` the matrix is singular along the rotation axis, so `t_z`
+never enters the equations. Measured:
+
+```
+j6scan  alone  z = -81.1 mm   consistency 1.10 mm, PASS   <- both "pass"
+j6scan2 alone  z = -93.1 mm   consistency 1.35 mm, PASS   <- and differ by 12 mm
+j5scan  alone  z = -90.6 mm   axis spread 0.554           <- J5 turns PERPENDICULAR to it
+merged         z = -89.1 mm
+```
+
+Two sweeps agreed to **0.1 mm in x and y** and disagreed by **12 mm in z**, while both
+reported excellent residuals — the residual is blind to the unobservable direction.
+J5 (wrist pitch) turns about an axis perpendicular to the line of sight and pins `t_z`
+down; its usable range is asymmetric (the wrist sits near a limit), so the sweep
+computes it from the joint limit rather than assuming symmetry — 66 deg of real travel
+where a symmetric +/-15 would have been used.
+
+### NaN passes every threshold check
+
+A degenerate pose set makes `cv2.calibrateHandEye` return an **all-NaN** transform
+rather than raising. Every validation test is a comparison and `nan > limit` is False,
+so all of them fall through to "pass" and the calibration reports clean. Found by the
+solver self-test; only the rotation-axis conditioning check caught it. Now refused at
+the solve, in `select_best` (whose `min()` would rank a NaN first), and in the
+validator independently. **The same pattern exists unfixed in the eye-to-hand path**
+and is left alone deliberately — that is the calibration currently flying — but noted.
+
+### Also
+- **Outlier rejection must be judged on held-out data, not RMS.** Sweeping the
+  threshold: RMS falls monotonically 0.487 -> 0.166 px as views are dropped 80 -> 50,
+  but cross-validation bottoms out at **58 views (1.63 px)** and degrades after. RMS
+  alone would have over-rejected by 8 views. `reject_intrinsic_outliers.py` caches the
+  corner detection (the slow part) so thresholds can be tried in seconds.
+- **Three cables to get a working link.** Two had dead SuperSpeed pairs (480 Mbps, half
+  the bandwidth, colour dropping to 15 fps) and one failed outright mid-session. Proved
+  it was the cable and not the robot: the same hub port runs 5000 Mbps with the third.
+  150 s soak, 0 failures.
+- The arm camera is the SAME MODEL as the chest one, so `match_name: "335"` now matches
+  both — **both are pinned by serial**.
+
+### Still open
+- **End-to-end localisation accuracy has not been measured** (`eval_localization_arm_cam.py`,
+  ~10 min). It separates repeatability at one viewing pose from accuracy across poses,
+  which decides whether the press looks from a fixed pose or from wherever the arm is.
+- **Not wired into the press.** One line in `press_buttons.py`; `core/press.py` needs no
+  change. The real question behind it is where the arm STANDS to look.
+- **The arm obstacle check breaks** with the camera on the arm — it works today only
+  because the home pose puts the arm outside the chest camera's view. Keeping the chest
+  camera for that job is the cheap answer; both mounts coexist in `cameras.yaml`.
+- `gripper_T_camera`'s z has not been cross-checked against a tape measure.
+
 ## ▶ THE ARM CAMERA IS ON THE ROBOT AND SEEN; CALIBRATION IS NEXT (2026-09-14)
 
 The camera is fitted and wired. Enumerated, captured from, and registered in the config;
