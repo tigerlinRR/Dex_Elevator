@@ -402,6 +402,21 @@ misalignment is caught rather than pressed. Measured, and each number changed th
   gaps AND catches a shift, because rows/cols come from the registered layout: a
   missing row cannot be fitted without the residual blowing up. Measured residual on a
   good frame is ~1.5 px.
+- **`min_anchors` in `panels.yaml` is NOT ENFORCED** — `grep` finds only its definition
+  and its parse. The guard that runs is the relative test below, which deliberately
+  replaced the old absolute threshold. The key is kept as documented intent; do not read
+  it as an active check.
+- **Which cells can anchor is a MEASUREMENT, not a choice.** On this faceplate, from the
+  arm camera at locked exposure, 8 frames: `A` -> `alarm` 8/8; `open` -> `open` 5/8
+  (`close` the rest — the two arrow glyphs confuse); `dot` -> `1` 7/8; `6`, `4`, `5`, `3`
+  all read `1` or worse; `2` and `close` never detected at all (behind the plunger). `1`
+  is this model's fallback for any brushed-steel disc it cannot read, which is why three
+  cells return it. `dot` and `close` were anchors and are not any more: they could never
+  agree, so they contributed nothing at any shift while making every report carry a
+  permanent `mismatch` — which teaches the operator that mismatches are normal, the exact
+  habit a safety check must not create. ONE dependable anchor still catches a row shift
+  here, because `A` is the only cell that reads `alarm`: shift the grid and its position
+  is taken by something that does not.
 - **Anchors are a RELATIVE test, not an absolute one.** They used to require "2 of 4
   read correctly", and that refused a perfectly correct grid once the classifier
   degraded at the greater distance — a false refusal whose consequence is the robot
