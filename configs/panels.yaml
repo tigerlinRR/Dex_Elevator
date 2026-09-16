@@ -28,15 +28,44 @@ panels:
       dark disc (the model correctly calls it `empty` — there is nothing to read).
     # Rows top -> bottom, each row left -> right, as seen by the chest camera.
     grid:
-      - [{label: A,     expect: alarm}, {label: dot, expect: empty}]
+      - [{label: A,     expect: alarm}, {label: dot}]
       - [{label: "5"},                  {label: "6"}]
       - [{label: "3"},                  {label: "4"}]
       - [{label: "1"},                  {label: "2"}]
-      - [{label: open,  expect: open},  {label: close, expect: close}]
+      - [{label: open,  expect: open},  {label: close}]
     verify:
-      # How many anchors must agree before a press is allowed. 2 of the 4 defined
-      # anchors: enough that a one-row shift cannot pass (a shift breaks every
-      # anchor at once), while tolerating a single bad read.
+      # WHICH CELLS CAN ACTUALLY ANCHOR, measured 2026-09-16 from the arm camera at
+      # the locked exposure, 8 located frames, `classify_solo` on each cell's own crop:
+      #
+      #     A    8/8 detected -> alarm x8          <- the only dependable one
+      #     open 8/8          -> open x5, close x3     62 %; the two arrow glyphs
+      #                                                 are confusable
+      #     dot  7/8          -> `1` x7            <- reliably WRONG
+      #     6    8/8 -> 1 x8     5  8/8 -> 1 x5, 2 x3
+      #     4    8/8 -> 1 x7     3  8/8 -> G x4, 2 x3
+      #     2    0/8 never detected    close 0/8 never detected
+      #
+      # `1` is this model's fallback guess for any brushed-steel disc whose marking it
+      # cannot read, which is why three separate cells come back as `1`.
+      #
+      # `dot` and `close` were anchors and are NOT any more. They could never agree —
+      # `dot` reads `1` at every exposure swept, `close` is behind the plunger and is
+      # never detected — so they contributed nothing at any shift, while making every
+      # report carry a permanent `mismatch`. That is worse than useless: it teaches
+      # the operator that mismatches are normal, which is the exact habit a safety
+      # check must not create.
+      #
+      # ONE dependable anchor still catches a row shift here, because `A` is the only
+      # cell on this faceplate that reads `alarm`: shift the grid and its position is
+      # taken by `5` or `open`, neither of which reads `alarm`, so every shifted
+      # alignment scores 0 and the press is refused.
+      #
+      # NOTE min_anchors is NOT ENFORCED anywhere in the code — `grep min_anchors`
+      # finds only its definition and its parse. The check that does run is the
+      # RELATIVE one in `assign` (the unshifted alignment must beat every shifted
+      # one), which was a deliberate replacement for the old absolute threshold
+      # because that one refused correct grids. The key is kept as the documented
+      # intent; do not read it as an active guard.
       min_anchors: 2
       # An anchor read below this confidence does not count as agreement. Measured
       # anchor confidences on this panel: open 0.92, close 0.92, alarm 0.97,
@@ -66,5 +95,22 @@ panels:
       # bad read. Worth knowing which ones actually read: `alarm` and `empty` came
       # back at 0.74 / 0.80 here, while the top-right `close` was read as `up` — the
       # two arrow glyphs are easy to confuse, so do not count on that one.
+      min_anchors: 2
+
+  # DELIBERATELY WRONG — a test fixture, never a real panel. Its rows are the real
+  # `mock_cabinet` rotated by one, so the physical `A` button sits where this layout
+  # claims `5` is. Running a press against it MUST be refused; if it is ever accepted,
+  # the anchor check has stopped protecting anything and the failure it guards is
+  # silent (plausible coordinates for the wrong floor).
+  - id: shift_test_DO_NOT_USE
+    description: >
+      Test fixture for the anchor check: mock_cabinet with the rows shifted by one.
+    grid:
+      - [{label: "5",   expect: alarm}, {label: "6"}]
+      - [{label: "3"},                  {label: "4"}]
+      - [{label: "1"},                  {label: "2"}]
+      - [{label: open,  expect: open},  {label: close}]
+      - [{label: A},                    {label: dot}]
+    verify:
       min_anchors: 2
 

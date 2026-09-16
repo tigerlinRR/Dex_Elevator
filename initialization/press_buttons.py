@@ -428,6 +428,10 @@ def main() -> int:
         go.unlink()
         print(f"go signal received after {time.time() - _t0:.1f} s of waiting")
 
+    # Set by locate() when a refusal was about the LAYOUT rather than the frame; read
+    # by the retry loop, which must not retry past it.
+    _last_reason: dict[str, bool] = {}
+
     def locate(verbose=True, tag=""):
         """One attempt at locating the panel and every button. None if it failed.
 
@@ -467,6 +471,12 @@ def main() -> int:
                 for line in rep.lines():
                     print(f"{tag}{line}")
             if not rep.ok:
+                # Classify the refusal: an alignment doubt is about WHICH BUTTON IS
+                # WHICH and must not be retried away; everything else is about this
+                # frame and may be.
+                r = (rep.reason or "").lower()
+                if "shift" in r or "anchor" in r:
+                    _last_reason["alignment"] = True
                 return None
             roi = tight_roi(rep.found, bgr.shape[:2])
             fit = fit_panel_plane_from_depth(frame, base_T_cam, roi=roi)
@@ -642,9 +652,25 @@ def main() -> int:
         # 70 % of them), and three consecutive runs used attempts 4, 1 and 5 of 6 — one
         # bad frame away from failing outright. Each attempt costs ~200 ms, so the whole
         # budget is 3 s against a 60 s sequence.
+        # A refusal about the FRAME may be retried; a refusal about the LAYOUT may not.
+        # "only 6 of 10 buttons detected" is about this image and the next one may be
+        # better. "a shifted alignment explains the anchors at least as well" is about
+        # which button is which, and retrying it is rolling dice until one comes up.
+        # Measured 2026-09-16 against a deliberately shifted layout: it was refused on
+        # 4 frames and accepted on the 5th, so 15 retries turned a working safety check
+        # into "refuse only if fifteen frames in a row refuse". An alignment contradicted
+        # once in a run stays contradicted: later frames cannot un-see it.
+        contradicted = False
         for attempt in range(15):
             got = locate(tag=f"  [{attempt + 1}/15] ")
+            if _last_reason.get("alignment"):
+                contradicted = True
             if got is not None:
+                if contradicted:
+                    print("!! an earlier frame in this run found the layout ambiguous, so "
+                          "this acceptance is not trusted — refusing. Re-run once the view "
+                          "is better, or fix the layout; do not retry past this.")
+                    return 1
                 buttons3d, plane = got
                 break
         if buttons3d is None:

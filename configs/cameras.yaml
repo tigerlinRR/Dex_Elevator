@@ -74,14 +74,21 @@ cameras:
     width: 1280
     height: 720
     fps: 30
-    # Left on AUTO for now, deliberately. The chest camera's locked 156 was tuned for a
-    # 0.7 m view of a mostly-dark wall; this camera sits much closer and the panel fills
-    # far more of its frame, so that constant does not transfer. Measured on the first
-    # frames here: mean 107.9, 0.00% saturated on auto. Re-tune against the real panel
-    # (and lock it) before trusting button detection — AE drifting between the "look"
-    # and the "press" is exactly the kind of thing that moves a measurement.
-    # NOTE: auto-exposure needs ~30 frames to settle; a single capture() right after
-    # start() is far too dark.
-    exposure: auto
+    # LOCKED at 35 (2026-09-16), measured against the real panel — NOT inherited from
+    # the chest camera, whose 156 was tuned for a 0.7 m view of a mostly-dark wall. This
+    # camera sits at ~0.4 m with the panel filling the frame, so 156 over-exposes it:
+    # swept 25..260 and counted how often each anchor classifies correctly,
+    #
+    #     exposure   25   35   45   60   75  120  156  200  260
+    #     `A`       5/5  5/5  5/5  5/5  5/5  1/3  1/5  1/1   panel not locatable
+    #     `open`    5/5  5/5  3/5  5/5  4/5  3/3  5/5  1/1
+    #     panel mean 137  146  165  186  197  205  218  212
+    #
+    # `A` collapses to 1/5 at the chest camera's value — the gold alarm marking washes
+    # out. 25-75 is a plateau, so 35 sits mid-plateau with headroom both ways against
+    # this lab's documented light drift. AUTO is what it ran on until now, and it is the
+    # reason the same anchor read `alarm` 8/8 in one burst and `1` in the next from an
+    # unchanged pose: classification must not depend on which frame you caught.
+    exposure: 35
     intrinsics_file: cam_arm_intrinsics.npz
     extrinsic_file: cam_arm.npy

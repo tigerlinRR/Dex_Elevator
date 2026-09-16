@@ -508,23 +508,45 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
 
     # Anchors: does the unshifted alignment explain the classes better than a shift?
     # Only REAL detections may vote — scoring inferred cells would be circular.
+    #
+    # An alignment must be dismissed by DISAGREEMENT, never by absent evidence. An
+    # earlier version scored each alignment over whichever of its cells happened to be
+    # detected in that frame, and a shifted alignment could therefore score 0 simply
+    # because its cells were missed — which read as "the shift is ruled out" and let the
+    # press proceed. Measured 2026-09-16 against a deliberately shifted layout: it was
+    # correctly refused on 4 frames and ACCEPTED on the 5th, and the accepting frame was
+    # the one with LESS evidence (2 inferred cells instead of 3). Fewer observations must
+    # never turn a refusal into an acceptance. So every alignment is now scored over the
+    # SAME anchors — those observed at both the unshifted and the shifted position — and
+    # if that common set is empty there is nothing to tell the alignments apart, which is
+    # a refusal rather than a pass.
     anchors = layout.anchors
     rep.anchors_total = len(anchors)
     if verify and anchors:
         solo: dict[tuple[int, int], tuple[str, float]] = {}
 
-        def score(shift: int) -> int:
+        def _read(k: tuple[int, int]) -> tuple[str, float]:
+            f = detected_cell.get(k)
+            if f is None:
+                return ("", 0.0)
+            if k not in solo:
+                solo[k] = classify_solo(bgr, f, detector)
+            return solo[k]
+
+        def comparable(shift: int) -> list[tuple[int, int, "Cell"]]:
+            """Anchors observed at BOTH alignments — the only fair basis to compare."""
+            return [(i, j, c) for i, j, c in anchors
+                    if (i, j) in detected_cell and ((i + shift) % rows, j) in detected_cell]
+
+        def score_over(shift: int, over) -> int:
             hits = 0
-            for i, j, c in anchors:
-                k = ((i + shift) % rows, j)
-                f = detected_cell.get(k)
-                if f is None:
-                    continue
-                if k not in solo:
-                    solo[k] = classify_solo(bgr, f, detector)
-                got, conf = solo[k]
+            for i, j, c in over:
+                got, conf = _read(((i + shift) % rows, j))
                 hits += got == c.expect and conf >= layout.min_conf
             return hits
+
+        def score(shift: int) -> int:
+            return score_over(shift, anchors if shift == 0 else comparable(shift))
 
         base = score(0)
         rep.anchors_ok = base
@@ -537,12 +559,25 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
             rep.anchor_detail.append(
                 f"{c.label:<6} expect {c.expect:<6} got {(got or '-'):<8} "
                 f"{conf:.2f}  {state}")
-        others = [score(sh) for sh in range(1, rows)]
-        if others and base <= max(others):
-            rep.reason = (f"a shifted alignment explains the anchors at least as well "
-                          f"({base} vs {max(others)}); refusing rather than risk "
-                          "pressing the wrong floor")
-            return {}, rep
+        worst = None
+        for sh in range(1, rows):
+            common = comparable(sh)
+            if not common:
+                # Nothing was observed at both alignments, so this shift cannot be
+                # ruled out by evidence. Absence is not acquittal.
+                rep.reason = (f"shift {sh} cannot be ruled out: no anchor was observed "
+                              f"at both the unshifted and the shifted position, so there "
+                              f"is no evidence distinguishing them")
+                return {}, rep
+            b, o = score_over(0, common), score_over(sh, common)
+            if worst is None or o - b > worst[1] - worst[2]:
+                worst = (sh, o, b)
+            if b <= o:
+                rep.reason = (f"a shifted alignment explains the anchors at least as well "
+                              f"(unshifted {b} vs shift {sh} {o}, compared over the "
+                              f"{len(common)} anchor(s) observed at both); refusing "
+                              "rather than risk pressing the wrong floor")
+                return {}, rep
         if base == 0 and not any(others):
             rep.anchor_detail.append(
                 "no anchor read confidently either way — accepted on the lattice fit "
