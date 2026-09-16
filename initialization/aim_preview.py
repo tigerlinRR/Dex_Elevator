@@ -136,7 +136,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--camera", default="cam_chest")
-    ap.add_argument("--match", default="335", help="device name suffix (335 / 335L)")
+    ap.add_argument("--match", default="", help="device name suffix (335 / 335L). Left "
+                    "empty by default: two Gemini 335s are fitted now (chest and arm) "
+                    "and they report the SAME name, so a suffix cannot tell them apart")
+    ap.add_argument("--serial", default="", help="exact device serial. Takes precedence; "
+                    "when neither this nor --match is given, the serial comes from "
+                    "configs/cameras.yaml for --camera")
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--expect", type=int, default=10,
                     help="buttons the registered layout has (mock_cabinet = 10)")
@@ -152,12 +157,31 @@ def main() -> int:
     base_T_cam = np.load(ext_path) if ext_path.exists() else None
     if base_T_cam is None:
         print(f"[warn] no extrinsic at {ext_path} — base-frame readout disabled")
+    else:
+        frame_tag = ext_path.with_suffix(".frame")
+        if frame_tag.exists() and frame_tag.read_text().strip() == "gripper":
+            print(f"[warn] {args.camera} is ARM-MOUNTED: its .npy holds gripper_T_camera, "
+                  f"not base_T_camera, so the base-frame readout would be wrong by the "
+                  f"length of the arm. Disabling it; detections and framing still work.")
+            base_T_cam = None
 
     from yolo.trt_detector import TrtButtonDetector
     det = TrtButtonDetector(conf=args.conf)
     print("[aim] detector ready")
 
-    cam = OrbbecCamera(camera_id=args.camera, match_name=args.match,
+    # Resolve the device the same way the rest of the runtime does — by serial from
+    # cameras.yaml — rather than by a name suffix that is no longer unique.
+    serial = args.serial
+    if not serial and not args.match:
+        from core.config import load_cameras
+        for c in load_cameras().get("cameras", []):
+            if c.get("id") == args.camera:
+                serial = c.get("serial", "")
+                break
+        if serial:
+            print(f"[aim] using serial {serial} from cameras.yaml for {args.camera}")
+    cam = OrbbecCamera(camera_id=args.camera, serial=serial or None,
+                       match_name=args.match or None,
                        exposure=exposure, gain=args.gain)
     cam.start()
     print("[aim] camera ready")

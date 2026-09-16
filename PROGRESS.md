@@ -2,6 +2,90 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+## ▶ THE ARM CAMERA PRESSES REAL BUTTONS (2026-09-15)
+
+`1`, `open` and `4` pressed and lit from the arm-mounted camera, four consecutive runs
+with the same parameters producing the same plan every time — joint margins within
+0.5°, identical approach rolls, 39.6–39.7 s. The chain is closed: viewing pose →
+detect → lattice verify → plan → press.
+
+| button | rolls passing | joint margin | depth |
+|---|---|---|---|
+| `1` | 24/24 | 30.1 / 31.6° | −5.90 / −5.98 mm |
+| `open` | 24/24 | 21.5 / 22.9° | −5.81 / −6.07 mm |
+| `4` | 24/24 | 38.8 / 40.1° | −5.71 / −5.87 mm |
+
+### Two biases, and a geometric test that tells them apart
+
+Getting there took finding two independent aiming errors, and the way to separate them
+is worth more than either fix:
+
+> **A `tcp_offset` error ROTATES with the approach roll. A localisation error does
+> NOT.** So a bias that stays in the same world direction across presses at different
+> rolls cannot come from the tool — it comes from where the buttons are computed to be.
+
+- **First failure: every press landed between the two columns, nothing lit.** Rolls
+  were 225 / 240 / 75°, and the offset was the same magnitude each time → tool. The
+  chest camera re-measured the plunger tip at **[11.64, −22.67, 36.66] mm** against a
+  configured **[24.15, −2.99, 29.88]** — **24.3 mm out, and the column pitch is 55.1 mm,
+  so the error was almost exactly half a pitch.** Configured value updated.
+- **Second: all three lit but landed low**, at rolls 240 / 240 / 255° — same direction
+  at different rolls → localisation. `+8 mm` along base `+z` put them on the buttons.
+  Recorded in `elevator.press.aim_offset_mm` and **labelled a patch**: it corrects a
+  symptom at one station, not the calibration causing it, and must be zeroed and
+  re-measured after any re-calibration.
+
+### The press log cannot see either of these, structurally
+
+While `tcp_offset` was 24 mm wrong, the log reported `lateral 0.15–0.81 mm`. It compares
+the command against `get_tcp_pose() @ tcp_offset` — **the same number on both sides,
+cancelling**. This was already written down from the 5.57 mm case in August; it stayed
+true at 24 mm. Only the lamps and outside measurement see it.
+
+**And yesterday's 1.70 mm end-to-end figure could not have caught it either.** That
+evaluation took its reference from the mean of the same calibration samples, so a bias
+shifts reference and measurement together and hides completely. It validates
+repeatability and consistency; **absolute accuracy needs an independent truth.**
+
+### The chest camera is an instrument for measuring the end effector
+
+It is calibrated to the same base frame the arm reports its pose in, so its depth can
+measure where the tool actually is, in the TCP frame. Used twice today:
+
+- **Envelope check before the first press** — plunger tip `+29.9 mm`, camera front face
+  `−74.1`, so the plunger leads by **103.9 mm** and at full 6 mm push the camera is
+  still **97.9 mm** clear. Asked because the operator asked; a torso-mounted camera
+  never had to answer it.
+- **Re-measuring the tip** (12 frames, spread 6.0 / 3.5 / 6.4 mm) — the fix above.
+
+Still unmodelled: the camera bracket and cabling, and anything BESIDE the button.
+
+### Also
+- **`find_viewing_pose.py`** — scores candidate poses on what the press depends on
+  (buttons found, pixel size against the 44–50 px band, centring, obliquity from the
+  live plane fit), using the same detector the press uses.
+- **The station matters more than the arm pose.** Moving the base **8.6 cm** forward
+  took `4` from **2/24** approach rolls to **24/24**, and cut the lattice residual from
+  4.8 px to the 0.5–2.8 px range. The arm cannot compensate: retreating along the
+  optical axis had **no IK solution past 15 cm** from the poses that see the panel.
+- **`--hold`** stops at the contact pose so the landing point can be photographed; the
+  press is otherwise too quick to see, and the log cannot report it.
+- `mock_cabinet_rotated` registered (the same faceplate turned 90°), then found not to
+  apply — the panel at this station is upright, and the 5×2 layout matched.
+
+### Still open
+- **The 8 mm patch should become a fix.** Root cause is in `gripper_T_camera` or the
+  button-centre pixel; distinguishing them needs an independent truth, not more of the
+  same self-referential evaluation.
+- **Anchors read 1/4 at this station**, below the required 2, so every press today used
+  `--no-verify` with the operator checking the labels by eye. Same classifier-degradation
+  story as 2026-09-02.
+- **The obstacle check was skipped** (`--no-obstacle-check`): it is forced onto the chest
+  camera, which cannot see this panel at all, so it would answer meaninglessly. Nothing
+  watched the space between arm and panel.
+- The arm camera **dropped off USB once** after a 147° joint move and re-enumerated by
+  itself. Third cable; the first two failed outright. Suspect strain at the connector.
+
 ## ▶ THE ARM CAMERA IS CALIBRATED, AND HAND-GUIDED CAPTURE IS THE WRONG METHOD (2026-09-14)
 
 Both parts done on the arm-mounted Gemini 335. Intrinsics beat the in-service chest

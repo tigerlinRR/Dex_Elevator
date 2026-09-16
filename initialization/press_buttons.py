@@ -73,6 +73,39 @@ def main() -> int:
                          "a camera on the arm moves with the limb it would be watching, "
                          "so it cannot do this job. Only consulted when --camera is "
                          "arm-mounted; otherwise the button camera does both")
+    ap.add_argument("--aim-offset", default=None, metavar="X,Y,Z",
+                    help="shift every button target by this much in the BASE frame, in "
+                         "millimetres. For a bias in WHERE THE BUTTONS ARE, as opposed to "
+                         "where the tip is: a tcp_offset error rotates with the approach "
+                         "roll, so it cannot produce a bias that stays in the same "
+                         "world direction across different rolls — that one comes from "
+                         "the hand-eye calibration or the button-centre pixel, and has "
+                         "to be corrected here instead")
+    ap.add_argument("--hold", type=float, default=0.0, metavar="SEC",
+                    help="stay at the contact pose for SEC seconds before retracting. "
+                         "For diagnosing WHERE the tip lands: the press itself is too "
+                         "quick to photograph, and the press log cannot see an aiming "
+                         "error at all (it compares the command against the same assumed "
+                         "TCP the command was built from)")
+    ap.add_argument("--tcp-offset", default=None, metavar="X,Y,Z",
+                    help="override end_effector.tcp_offset, in MILLIMETRES, for this run "
+                         "only. The configured value was measured once by hand-holding "
+                         "the tip against a button and has no independent cross-check; "
+                         "the press log cannot detect an error in it, because the "
+                         "commanded and measured sides of its own comparison both use "
+                         "this same number. Only the lamps and an outside measurement can")
+    ap.add_argument("--home-joints", default=None, metavar="J1,..,J6",
+                    help="override the pose the arm departs from and returns to. The "
+                         "configured home was chosen to keep the arm OUT of the chest "
+                         "camera's view; for an arm-mounted camera the natural home is "
+                         "the VIEWING pose, and travelling between the two is a large "
+                         "sweep past the panel that nothing in this program models")
+    ap.add_argument("--view-joints", default=None, metavar="J1,..,J6",
+                    help="joint angles to LOOK from, before locating the panel. Only "
+                         "meaningful for an arm-mounted camera, where the arm carries "
+                         "the lens: the home pose was chosen to keep the arm OUT of the "
+                         "chest camera's view, which is the opposite of what an arm "
+                         "camera needs. Defaults to arm.view_joints_deg in pipeline.yaml")
     ap.add_argument("--no-obstacle-check", action="store_true",
                     help="proceed even when no fixed camera can watch the path. This "
                          "removes the only sensor that sees the arm's workspace — the "
@@ -134,10 +167,19 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_pipeline()
+    if args.tcp_offset:
+        mm = [float(v) for v in args.tcp_offset.split(",")]
+        cfg["end_effector"]["tcp_offset"] = [v / 1000.0 for v in mm]
+        print(f"tcp_offset overridden to {mm} mm (config had "
+              f"{[round(v*1000, 2) for v in load_pipeline()['end_effector']['tcp_offset']]})")
+
     tcp = np.array(cfg["end_effector"]["tcp_offset"], dtype=np.float64)
     protrusion = cfg["elevator"]["press"]["button_protrusion"]
     push = args.push / 1000.0 if args.push is not None else cfg["elevator"]["press"]["push_depth"]
     home = cfg["arm"]["home_joints_deg"]
+    if args.home_joints:
+        home = [float(v) for v in args.home_joints.split(",")]
+        print(f"home overridden to {['%.1f' % v for v in home]}")
     LIM = cfg["arm"]["limits"]
 
     arm = RealmanArm(side=cfg["arm"]["side"])
@@ -575,6 +617,25 @@ def main() -> int:
                 print(f"    pressing in {k}…  (Ctrl+C to cancel)")
                 time.sleep(1.0)
     else:
+        # An arm-mounted camera has to be AIMED before it can locate anything. The
+        # panel and the dock are both fixed, so this pose is a registered constant
+        # (see initialization/find_viewing_pose.py), not something to search for at
+        # run time. A fixed camera ignores all of this and keeps localising from home.
+        view = args.view_joints or cfg["arm"].get("view_joints_deg")
+        if view is not None and handle.mount == "arm":
+            view = [float(v) for v in (view.split(",") if isinstance(view, str) else view)]
+            cur = list(arm.get_joint_angles())
+            if max(abs(a - b) for a, b in zip(cur, view)) > 1.0:
+                print(f"moving to the viewing pose {['%.1f' % v for v in view]}")
+                if not arm.move_joints_sync(view):
+                    print("!! could not reach the viewing pose")
+                    return 1
+                time.sleep(0.6)
+        elif handle.mount == "arm":
+            print("!! camera rides the arm but no viewing pose is registered "
+                  "(arm.view_joints_deg or --view-joints). Locating from wherever the "
+                  "arm happens to be, which is unlikely to see the panel.")
+
         buttons3d = plane = None
         # 15 attempts, not 6. Localisation succeeds on roughly a quarter of frames at a
         # re-docked distance (the detector drops a button or two and the lattice needs
@@ -590,6 +651,16 @@ def main() -> int:
             print("!! could not locate the panel/buttons — is the arm blocking the "
                   "view, or is this a different panel than the registered layout?")
             return 1
+    aim_mm = cfg["elevator"]["press"].get("aim_offset_mm")
+    if args.aim_offset:
+        aim_mm = [float(v) for v in args.aim_offset.split(",")]
+    if aim_mm and any(abs(float(v)) > 1e-9 for v in aim_mm):
+        off = np.array(aim_mm, dtype=float) / 1000.0
+        buttons3d = {k: np.asarray(v, dtype=float) + off for k, v in buttons3d.items()}
+        src = "--aim-offset" if args.aim_offset else "elevator.press.aim_offset_mm"
+        print(f"aim offset applied: {[round(float(v), 1) for v in aim_mm]} mm in the base "
+              f"frame (from {src}) — this is a recorded bias patch, not a calibration")
+
     origin, normal = plane
     inward = -normal
 
@@ -795,7 +866,14 @@ def main() -> int:
 
         # Last thing before the arm moves. The arm is at home here, i.e. outside the
         # camera's view, so what this sees is the world and not the robot.
-        blocked = path_obstructed(origin_now, normal)
+        # --no-obstacle-check does not merely tolerate a missing camera; it SKIPS the
+        # check. Running it with a camera that cannot see the panel is worse than not
+        # running it: the answer is meaningless either way, but a "clear" verdict
+        # reads like protection that is not there.
+        blocked = None if args.no_obstacle_check else path_obstructed(origin_now, normal)
+        if args.no_obstacle_check:
+            print("    path check SKIPPED (--no-obstacle-check): nothing is watching the "
+                  "space between the arm and the panel")
         if blocked is not None:
             print(f"    REFUSING to move: {blocked}")
             results.append((name, False))
@@ -812,6 +890,10 @@ def main() -> int:
         delta = button - tip
         along = float(delta @ inward) * 1000
         lateral = float(np.linalg.norm(delta - (along / 1000) * inward)) * 1000
+        if args.hold > 0:
+            print(f"    holding at contact for {args.hold:.0f} s — photograph the tip now",
+                  flush=True)
+            time.sleep(args.hold)
         arm.move_line_sync(make_transform(R, button + normal * STANDOFF)
                            @ make_transform(np.eye(3), -tcp))
         went_home = arm.move_joints_sync(home)

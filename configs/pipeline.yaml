@@ -201,7 +201,19 @@ end_effector:
   # surface over 8 frames (spread 0.27 / 0.55 / 0.65 mm). offset = inv(base_T_tool) @ tip.
   # The uncertain part is the hand placement, not the camera — worth a second opinion
   # (tape, or a repeat touch) before treating this as final.
-  tcp_offset: [0.02415, -0.00299, 0.02988]
+  # RE-MEASURED 2026-09-15 with the CHEST camera's depth (which is calibrated to the
+  # same base frame the arm reports its pose in), averaged over 12 frames; frame-to-
+  # frame spread was 6.0 / 3.5 / 6.4 mm, so treat it as good to a few mm, not better.
+  # The previous value [24.15, -2.99, 29.88] was 24.3 mm away and put every press half
+  # a column pitch off — landing between the two columns of buttons. It had been
+  # measured once by hand-holding the tip against a button, with no cross-check, and
+  # the plunger has been knocked since (it nearly struck the wall on 2026-09-15).
+  #
+  # THE PRESS LOG CANNOT DETECT AN ERROR HERE. Its depth/lateral figures compare the
+  # command against `get_tcp_pose() @ tcp_offset` — the same number appears on both
+  # sides and cancels. While this offset was 24 mm wrong, the log reported lateral
+  # errors of 0.15-0.81 mm. Only the lamps, or an outside measurement, can see it.
+  tcp_offset: [0.01164, -0.02267, 0.03666]
 
 button_yolo:
   weights: data/weights/buttons.pt   # TODO: train on the robot's ~/dataset; single class `button`
@@ -230,6 +242,24 @@ elevator:
   # already overpress by 2.3 mm; the target is
   #     plane_point + (button_protrusion - push_depth) * outward_normal
   press:
+    # AIM BIAS CORRECTION — a patch, not a fix, and it is recorded as one.
+    # Measured 2026-09-15 with the arm-mounted camera: every press landed low on the
+    # button by roughly half a button radius, CONSISTENTLY, while the approach roll
+    # varied (240 / 240 / 255 deg) between them. That distinction is the diagnosis: a
+    # tcp_offset error rotates with the roll, so a bias that stays in the same WORLD
+    # direction across different rolls cannot come from the tip — it comes from where
+    # the buttons are computed to be, i.e. the hand-eye calibration or the button-centre
+    # pixel. +8 mm along base +z brought the presses onto the buttons.
+    #
+    # It is a patch because it corrects the symptom at one station rather than the
+    # calibration that causes it, and it will not necessarily hold at a different
+    # viewing pose. The root fix is a hand-eye solve validated against an INDEPENDENT
+    # truth: the 2026-09-14 evaluation could not have caught this, because its
+    # reference was the mean of the same calibration samples — a bias shifts the
+    # reference along with the measurements and hides itself completely.
+    # Set to [0, 0, 0] and re-measure after any re-calibration.
+    aim_offset_mm: [0.0, 0.0, 8.0]
+
     # Refuse to move the arm if anything is between the robot and the panel. The
     # chest camera is the ONLY sensor that looks there: the base's own obstacle
     # sensors face its direction of travel, which is 180 degrees away from the panel,

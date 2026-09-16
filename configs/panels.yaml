@@ -42,3 +42,29 @@ panels:
       # anchor confidences on this panel: open 0.92, close 0.92, alarm 0.97,
       # empty 0.98 — so 0.40 leaves a wide margin without accepting noise.
       min_conf: 0.40
+
+  - id: mock_cabinet_rotated
+    description: >
+      The SAME physical faceplate as `mock_cabinet`, remounted on the office wall
+      turned 90 degrees anticlockwise — so it is 2 rows x 5 columns instead of
+      5 x 2. Confirmed by the operator 2026-09-15. It is a separate entry rather
+      than a flag on the original because the layout is what gets verified against
+      the detections, and a rotated panel is a different arrangement even when it is
+      the same piece of metal.
+
+      Recognisable landmarks, in the order they gave the rotation away: the gold
+      alarm bell sits BOTTOM-LEFT (it is top-left when the panel is upright), the
+      unmarked dark disc is TOP-LEFT, and the button carrying a green star over its
+      digit is `1` — bottom row, fourth from the left.
+    # Rows top -> bottom, each row left -> right, as the camera sees it.
+    grid:
+      - [{label: dot, expect: empty}, {label: "6"}, {label: "4"}, {label: "2"}, {label: close, expect: close}]
+      - [{label: A,   expect: alarm}, {label: "5"}, {label: "3"}, {label: "1"}, {label: open,  expect: open}]
+    verify:
+      # Same reasoning as the upright panel: two anchors is enough that a one-cell
+      # shift cannot pass (a shift breaks every anchor at once) while tolerating one
+      # bad read. Worth knowing which ones actually read: `alarm` and `empty` came
+      # back at 0.74 / 0.80 here, while the top-right `close` was read as `up` — the
+      # two arrow glyphs are easy to confuse, so do not count on that one.
+      min_anchors: 2
+

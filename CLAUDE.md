@@ -314,8 +314,18 @@ between two clear endpoints. This matters because the controller's *runtime*
 self-collision check is **off**. It covers the arm's own links and end-effector only:
 the other arm, the chassis and the door frame still need virtual walls.
 
-**An ARM-MOUNTED button camera is supported but unproven** (`--camera cam_arm`,
-2026-09-15). Two things change and neither is optional:
+**An ARM-MOUNTED button camera WORKS** (`--camera cam_arm`, 2026-09-15): `1`, `open`
+and `4` pressed and lit, four runs reproducing the same plan to within 0.5 deg of joint
+margin. Three things change and none is optional:
+- **A VIEWING POSE has to be registered** (`--view-joints`, `arm.view_joints_deg`). With
+  the camera on the arm, "where the robot looks from" becomes a parameter, and the
+  configured `home` is the WORST choice for it — that pose was picked to keep the arm OUT
+  of the chest camera's view. `--home-joints` overrides where the press departs from and
+  returns to, because travelling between the old home and a viewing pose is a 147 deg
+  sweep past the panel that nothing in this program models.
+  `initialization/find_viewing_pose.py` searches a neighbourhood and scores candidates on
+  what the press actually depends on (buttons found, pixel size against the measured
+  44-50 px band, centring, obliquity from the live plane fit), using the same detector.
 - `base_T_camera` is recomputed per frame from the arm pose, read **immediately after**
   the frame with the arm stationary — for this mount the image and the pose are one
   measurement.
@@ -1090,6 +1100,26 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   5.57 mm out and the reported lateral error stayed under 1 mm. The only signals that
   see it are the button lighting up and an independent re-measurement (touch the tip to
   a button, then `offset = inv(base_T_tool) @ camera_measured_button_point`).
+- **A TOOL bias rotates with the approach roll; a LOCALISATION bias does not.** That is
+  how to tell them apart without extra hardware, and both were hit on 2026-09-15 within
+  an hour. Presses at rolls 225/240/75 deg all landed the same distance off in the same
+  direction relative to the panel -> the tool: `tcp_offset` was **24.3 mm** wrong (the
+  column pitch is 55.1 mm, so every press landed almost exactly half a pitch off, between
+  the two columns, and nothing lit). Fixed, the next set at rolls 240/240/255 deg lit but
+  all landed low **in the same WORLD direction** -> not the tool, because that would have
+  turned with the roll; it is where the buttons are computed to be. Corrected with
+  `elevator.press.aim_offset_mm` (`+8 mm` on base z), which is recorded as a PATCH: it
+  fixes a symptom at one station, not the hand-eye calibration underneath, and must be
+  zeroed and re-measured after any re-calibration.
+- **The chest camera can MEASURE the end effector, and it is the only thing that can.**
+  It is calibrated to the same base frame the arm reports its pose in, so deprojecting its
+  depth into the TCP frame gives where the tool really is — no config value, no tape, no
+  eyeballing. Two uses, both on 2026-09-15: re-measuring the plunger tip (12 frames,
+  frame-to-frame spread 6.0/3.5/6.4 mm — good to a few mm, not better), and answering
+  "does the arm-mounted camera hit the panel before the plunger does?" — plunger tip
+  `+29.9 mm` against the camera's front face at `-74.1 mm` in the TCP frame, so the
+  plunger leads by **103.9 mm** and at full 6 mm push the camera is **97.9 mm** clear.
+  Unmodelled either way: the camera bracket, the cabling, and anything BESIDE the button.
 - **Close the hand into a fist BEFORE moving the arm.** The LinkerHand's fingertips sit
   172.87 mm from the flange while the plunger tip is at ~154 mm, so with the fingers
   extended the HAND is the front-most part and reaches the panel first. A fist folds
@@ -1321,8 +1351,9 @@ poses are PLACEHOLDERS — measure them on the real cell before running on hardw
   **0.152 px** — better than the in-service chest camera on every metric (0.253 px,
   cross-val 3.29 vs 1.63). Extrinsic: 42 samples from three PROGRAM sweeps,
   **1.60 mm / 0.382 deg**, axis spread 0.256, four methods agreeing to 0.07 mm, PASS.
-  `gripper_T_camera = [15.7, -48.9, -89.1] mm`. **End-to-end accuracy not yet measured**
-  and it is **not wired into the press**. The solver self-test passes on the robot's own cv2
+  `gripper_T_camera = [15.7, -48.9, -89.1] mm`. **Wired into the press and pressing real
+  buttons since 2026-09-15** — see the arm-mounted camera section above, and note the
+  `aim_offset_mm` patch it still needs. The solver self-test passes on the robot's own cv2
   4.8.0: exact recovery of a known `gripper_T_camera`, 0.58 mm error under 0.5 mm/0.1 deg
   detection noise, and a degenerate pose set refused.
 
