@@ -2,6 +2,838 @@
 
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
+
+## ▶ TWO RUNS LOST TO "0 BUTTONS", AND THE LOG COULD NOT SAY WHY (2026-09-18)
+
+Two attempts on the same evening died with the detector finding **0 buttons on all 15
+frames** of all three localisation attempts. The second one is the informative case: the
+base landed **13 mm from the station** — the best of the whole session — and the arm was
+on the registered viewing vector, so position and pose are ruled out.
+
+| | |
+|---|---|
+| first failure | the 8.0 mm push test, ~16:00 |
+| second failure | the timed cycle, landing 13 mm, arm on the viewing vector |
+| both | 0 buttons on every frame; the 9 mm press minutes earlier found 5 |
+
+**The log could not distinguish the two causes that matter**, which is the real defect
+here. "0 buttons" is produced both by the classifier failing and by THE ROOM LIGHT going
+out, and those want opposite responses — measured 2026-09-16, lights off took the frame
+mean 162 → 36 and every anchor to 0/N, with neither exposure nor gain recovering it.
+An hour can be spent on the classifier while the answer is a light switch.
+
+So `Report` now carries `frame_mean` and any 0-button line prints it with a verdict
+("LOW: suspect the room light" below 80, "brightness is normal, so this is not the
+light" above). It costs one `np.mean` per frame and it is populated on the voted refusal
+path too, where the caller previously saw only "0 of 5 frames".
+
+**Not re-run** on the spot. Retrying until it passes is what the fixed-frame vote exists
+to prevent, and the diagnostic was built first so the next run would state the cause
+rather than leave it to be guessed.
+
+**It was the light, and the operator switching it back on settled it.** The very next
+cycle detected **8 buttons at 0.8 px residual** — the best of the session, where the
+usual figure at this pose is 5 — with `open` voting 5/5 and `dot` at 0.24. Same station,
+same exposure lock of 35, same viewing pose to 0.002 deg. So the failure was entirely
+the room and not the classifier, the positioning or any of today's changes.
+
+## ▶ A ONE-BUTTON PRESS IS 10.9 s, DOWN FROM 22.8 (2026-09-18)
+
+Three changes, each measured on hardware, none costing accuracy:
+
+| | cold, 20 % | **now** |
+|---|---|---|
+| reaction (import, arm, hand, engine, camera) | 9.6 s | **0 s** — runs under the drive |
+| localise + verify | (in the 9.6) | **2.7 s**, unavoidable at the station |
+| motion | 13.0 s | **7.4-7.7 s** |
+| **press phase, arrival → done** | **~22.8 s** | **10.9-11.7 s** |
+
+Reproduced on three separate cycles. The stopwatch is restarted when the go signal
+arrives, so a pre-warmed run reports the reaction the CALLER still pays (2.7 s) rather
+than however long the child sat blocked (31 s on the first attempt, which is true of the
+process and useless as a budget).
+
+Depth −9.02 mm against a commanded −9.00, lateral **0.14 mm** — the best of the session,
+so none of this was bought with precision.
+
+1. **Free-air joint speed 20 % → 50 %** (−4.2 s), validated by A/B at one station visit.
+2. **Pre-warm under the drive** (−7.4 s), which matches the 7.5 s predicted from the
+   startup budget and the 7.3 s measured independently in August. `round_trip.py` now
+   launches `press_buttons.py --wait-go` before the drive-in and releases it only after
+   the landing gate AND the arm extension have passed — nothing about arrival moved into
+   the press, which is the mistake that once drove the arm into the panel. Verified in
+   both directions: the release path pressed, and the ABANDON path was exercised for
+   real when a later cycle failed the landing gate at 69 mm — the child was killed and
+   no camera was left held.
+3. **The retract got its own speed** (−1.0 s, 2.00 → 0.97 s). The two straight-line
+   segments had been sharing one: the inbound one ENDS ON THE BUTTON, where speed is
+   impact force, but the retract is 60 mm of free air moving AWAY from the panel with
+   nothing to hit. Splitting them is free.
+
+4. **The staged extend/retract legs, 20 % → 50 %** (−6 s), on the operator's explicit
+   call after watching the press at 50 %. **Not yet run** — the next cycle is its first.
+   It was held back because these legs are a ~264 deg sweep ACROSS THE ROOM while
+   `move_arm_staged` checks self-collision, the panel and the torso column but has no
+   model of the room; that reasoning has not stopped being true, it was weighed and
+   overruled with eyes on the robot. Lower it again for an unattended run or a
+   rearranged cell.
+
+**Left deliberately slow**: the contact `movel`, at 15 %. It is the one segment that
+ends ON the button, where speed becomes impact force.
+
+### The `standard` move has a 7 cm DEAD ZONE, and the "bias" reading was wrong
+
+Returning to the approach pose accurately turned out to be the blocker, and fixing it
+refuted a note this project has carried since 2026-09-04.
+
+That note said a `standard` move lands ~5 cm from its target, "biased, not noisy, so it
+can be corrected by targeting the mirrored point". Measured properly:
+
+| from | result |
+|---|---|
+| 133 mm away | landed 22 mm |
+| 66 mm away | landed 43 mm |
+| **35 mm away, x3 to the same target** | **did not move at all** — identical pose to the millimetre |
+| **35 mm away, x3 to MIRRORED targets** | **did not move at all** |
+
+So it is not a bias, it is an **arrival dead zone of roughly 7 cm**: inside it the
+planner declares success and issues nothing. Neither repeating nor aiming past the
+target can converge, and both were tried before this was written. The mirror logic was
+implemented, refuted by its own first run, and removed rather than left in looking
+plausible. `goto_pose.py` now detects "the robot did not move" and says so instead of
+retrying.
+
+**But outside the dead zone it is far better than the old figure**, and that gives the
+recipe. Two consecutive moves from ~0.6 m landed **12 mm** and **14 mm** — an order of
+magnitude better than the 5 cm the docs claimed. So when the robot is stuck a few
+centimetres from a registered pose, the fix is to **leave the dead zone and come back**:
+one `standard` move 0.6 m out along the approach line, then one back in. Measured on a
+run that was about to be refused, this took a predicted landing of **+108 mm to +35 mm**.
+
+Attempting to fix it in place does the opposite: a move posted from 83 mm away moved the
+robot from **-6 mm to +78 mm** of lateral error while only half-correcting the heading.
+
+**What this means for the flow**: the chassis closes metres well and centimetres not at
+all, and the gap is bridged by deliberately backing out of the dead zone. The underlying
+cause of needing this at all is still the open-loop heading on the straight legs.
+
+## ▶ THE PRESS RUNS AT 20 %, AND THE FIRST SPEED TEST MEASURED NOTHING (2026-09-18)
+
+`push_depth: 10 mm` is confirmed — **3/3 lit**, operator's eye, which is the only
+instrument that sees it. With that closed, the question became how fast a single-floor
+press can go. The answer needed two defects removing first, and the first one produced a
+result that looked like an answer and was not.
+
+### The speed actually in use, which nothing printed until now
+
+| | value |
+|---|---|
+| free-air joint moves (`move_joints_sync`) | **20 %** |
+| straight-line contact + retract (`move_line_sync`) | **15 %** |
+| `arm.max_speed_pct` | **20**, a bring-up cap never raised |
+
+**`max_speed_pct` is a CAP, not a setpoint** — `v = clip(round(speed * 100), 1,
+max_speed_pct)` — so raising it alone changes nothing while the callers keep passing
+0.20 and 0.15. That was caught before running. What was NOT caught is that
+`press_buttons.py` built its arm as `RealmanArm(side=...)` with **no `max_speed_pct` at
+all**, falling back to the class default of 20, while every other script in the repo
+passes it from config. So lifting the config ceiling to 50 left the press at 20.
+
+The first A/B therefore measured nothing, and said so in the cleanest possible way:
+
+| free-air | home→standoff | press | retract | →home | total |
+|---|---|---|---|---|---|
+| "20 %" | 4.82 s | 2.08 s | 2.08 s | 4.81 s | **13.79 s** |
+| "50 %" | 4.82 s | 2.08 s | 2.07 s | 4.83 s | **13.80 s** |
+
+**13.79 against 13.80 s reads exactly like "speed does not help".** The only thing that
+distinguished it from that conclusion was printing the cap next to the request — both
+runs logged `(cap 20%)`. A speed experiment must print the speed it actually got.
+
+### With the cap genuinely lifted, 50 % is worth a third of the press
+
+Same station visit, same localisation, minutes apart, 174 deg of joint travel each way:
+
+| free-air | home→standoff | press | retract | →home | sequence |
+|---|---|---|---|---|---|
+| 20 % | 4.44 s | 2.08 s | 2.09 s | 4.43 s | **13.2 s** |
+| **50 %** | **2.33 s** | 2.08 s | 2.03 s | **2.34 s** | **9.0 s** |
+
+**A single floor button goes 13.2 s → 9.0 s, and nothing else moved:** depth −9.93 vs
+−9.92 mm against a commanded −10.00, lateral 0.19 vs 0.27 mm, joint margin 33.5 deg,
+24/24 rolls, verification 4 of 5 frames both times.
+
+The scaling is close to linear once the fixed cost is taken out, which is the number to
+quote rather than the raw ratio: each move carries a **0.35 s settle**, so the MOVING
+part went 4.09 → 1.98 s, a factor of **2.07** against the 2.5 commanded. The missing
+0.43 is the acceleration ramp, and it is why "2.5x the percentage" is not 2.5x the time.
+
+### What is left, and where the next second is
+
+At 50 % the two contact-speed segments are now **47 % of the motion** (4.11 s of 8.79),
+because they never changed. The useful split is not fast/slow but **which one ends in
+contact**:
+
+- the INBOUND `movel` (standoff → 10 mm past the face) ends on the button, and speed
+  there becomes impact force. Leave it until there is a reason.
+- the RETRACT `movel` is 60 mm of pure free air away from the panel. There is no contact
+  risk on it at all, and it costs **2.03 s**. Raising just that one is free.
+
+Fixed costs no percentage can touch: 4 x 0.35 s settle = **1.4 s per button**, plus
+arrival polling quantised at 0.15 s.
+
+**And the reaction half is still unclaimed.** The pre-warm (`--wait-go`) measured
+**8.3 s → 1.6 s** and `elevator_runner` has used it since 2026-08-27; `round_trip.py`
+still launches the press cold. On a one-button cycle that is ~5.7 s, larger than the
+4.2 s the speed rise just bought, and it carries no motion risk whatsoever.
+
+### The REACTION half is bigger than the motion half, and most of it is already solved
+
+Instrumented the startup the same way the motion was. Two consecutive press
+invocations agreed to 0.02 s on every milestone, so this is a budget, not a sample:
+
+| phase | elapsed | position-independent? |
+|---|---|---|
+| python import + config + arm connect | **2.58 s** | yes |
+| close the hand into a fist + verify | **1.84 s** | yes |
+| TensorRT engine + camera open | **3.07 s** | yes |
+| localise + verify (5 vote frames) | **2.13 s** | **no** — must happen at the station |
+| **reaction total** | **9.62 s** | 7.5 s of it is not |
+| motion at 50 % free-air | 8.48 s | — |
+
+So a one-button press is **~18.3 s, of which 9.6 s is reaction** — larger than the
+motion the speed work just cut. **7.5 s of that is position-independent**, which
+matches the 7.3 s measured for the pre-warm in August from a completely different
+direction, and `press_buttons.py --wait-go` already implements it. `round_trip.py`
+still launches the press cold. Only the 2.13 s of localisation genuinely has to wait
+for the robot to be standing at the station.
+
+### Where the rest of the cycle goes, and what each lever costs
+
+| lever | worth | what it costs |
+|---|---|---|
+| **pre-warm during the drive-in** | **−7.5 s** | nothing — the mechanism exists and is used by `elevator_runner` |
+| **chassis speed 0.18 → ~0.30 m/s** | **−12 to −14 s** | `calibrate_legs.py` must be re-run; the clearance margin must grow |
+| **staged arm moves 20 % → 50 %** | **−6 s** | the same change already validated on the press |
+| retract `movel` faster | −1 s | none: it is 60 mm of pure free air AWAY from the panel |
+| contact `movel` faster | −1 s | **speed becomes impact force.** Not recommended |
+| fewer vote frames | −1 s | **weakens the only protection against a wrong-floor press.** No |
+
+**The chassis is not symmetric and it matters for the door window.** `_model_target`
+turns a requested 1.5 m into the integral the wheels actually need, and the two
+directions are nothing alike: forward (`k` 1.061) asks for 1.68 m and takes **10.2 s**,
+arm-ward (`k` 0.559) asks for **2.86 m** and takes **16.4 s** — same distance, 1.6x the
+time. The elevator flow REVERSES into the car, i.e. the leg that has to fit inside the
+door's open window is the slow one. Worth stating before anyone budgets that window
+from the forward number.
+
+### Push depth walked back to 9 mm, and the second half of that test was refused
+
+At 10 mm every button lit but the operator judged the press slightly hard once the arm
+moved at 50 %, and asked for 1-2 mm less. 9.0 mm delivered **−9.05 mm and lit**. The
+8.0 mm run in the same visit never happened: the detector reported **0 buttons on every
+frame of all three attempts** and the run was refused.
+
+That is not the geometry or anchor refusal seen elsewhere — it is the detector finding
+nothing at all, which on this panel is the **room light** signature (measured
+2026-09-16: lights off took the frame mean 162 → 36 and every anchor to 0/N, and
+neither exposure nor gain recovers it). It was ~16:00 local and the 9 mm run two
+minutes earlier had found 5 buttons from the identical pose. **Not re-run** — retrying
+until it passes is exactly what the fixed-frame vote exists to prevent, and the cause
+should be checked (frame mean) rather than out-waited. So 8 mm remains untested and
+6 mm is known not to light: the window is narrow and should be walked one millimetre at
+a time.
+
+### The heading drift is now biting, as predicted
+
+Three more cycles of open-loop heading: back at the approach pose **103 mm / −5.73 deg**,
+then **133 mm / −8.59 deg**. The second drive-in landed **−59 mm lateral against the
+harness's own 60 mm gate** — one millimetre inside a refusal. This is the item flagged
+after cycle 2 and it has now arrived: the approach pose has to be re-registered each
+cycle, or the heading loop closed, before another run.
+
+## ▶ THE ROUND TRIP RUNS: DRIVE AWAY, COME BACK, VERIFY, PRESS (2026-09-18)
+
+The arm-camera flow the operator asked for was run end to end for the first time —
+retract, drive out, straight-line reverse back in with **no turn**, re-extend, verify
+identity, press — and it pressed **3/3**.
+
+| step | result |
+|---|---|
+| retract to the travel pose | two checked legs; tip stayed 442 / 281 mm clear of the panel |
+| operator parked it outside | 1.503 m back, registered as `approach_pose` |
+| straight reverse leg, no turn | commanded +1.502 m, **achieved +1.497 m**, landed **23 mm** from the station |
+| arm re-extended | back on the registered viewing vector to **0.003 deg** |
+| identity verification | **5 of 5 frames**, lattice residual 0.2-0.3 px, `dot` 0.26, `open` ok |
+| press `1 open 4` | **3/3**, depth −6.03 / −6.05 / −5.97 mm, lateral 0.16 / 0.11 / 0.20 mm, 37.5 s |
+
+**The arm returning to 0.003 deg is what makes the fixed-viewing-pose design work.** The
+aim offset is bound to that joint vector and refuses to apply more than a degree away;
+after a full retract-drive-extend cycle the check passed with room to spare.
+
+### The approach pose was never aimed at the station, and two "successes" were luck
+
+Found on the third attempt, when the drive-in would have landed **16 cm** lateral and the
+harness refused. The cause was not that run: **the registered approach pose was never on
+the line to the station.** Even stopping exactly on it left the station **+6.4 cm
+LATERAL**, which a straight leg cannot fix and which the 2.22 deg aim angle could not
+turn out either. Cycle 1 passed because the leg drifted 41 mm in the cancelling
+direction; cycle 2 passed because the accumulated heading drift happened to point the
+right way. Both were coincidences, and the note written after cycle 1 said so.
+
+It is now recomputed as **the station translated 1.50 m back along its OWN heading**, so
+a straight drive-in lands on it by construction (checked: +1.500 m along, 0.0000 m
+lateral). `configs/stations.yaml`.
+
+**Turning cannot fix a few centimetres of lateral on this chassis** — measured trying.
+A 6.1 deg aim turn achieved **10.3 deg, ratio 1.69, overshooting**, where 10 deg had
+previously undershot at 0.688; the correction legs then landed under the 3 deg floor
+(commanded −3.0 twice, achieved +0.0 and −0.6) and could not recover. The attempt took a
++15.4 cm lateral error to **−11.2 cm**. Below ~10 deg this chassis is not lossy, it is
+uncontrolled.
+
+**What does work, in clear space, is the chassis's own `standard` move**: asked for the
+corrected approach pose it landed **18 mm and −0.57 deg in 11.6 s**. The same move in the
+cluttered room earlier that day managed 814 mm in 269 s — so the number is a property of
+the space, not of the move type.
+
+### The cycle from a correctly aimed approach pose
+
+| | cycle 1 | cycle 2 | **cycle 3** |
+|---|---|---|---|
+| lateral offset at the approach pose | +5.8 cm | −1.4 cm | **+3.1 cm** |
+| landed, along / lateral | −12 / −19 mm | +8 / −37 mm | **+12 / +22 mm** |
+| heading at the station | −1.15 deg | −4.58 deg | **−0.57 deg** |
+| arm back on the viewing vector | 0.003 deg | 0.004 deg | **0.002 deg** |
+| verification | 5/5, 0.2–0.3 px | 5/5, 0.2 px | **5/5, 0.4 px**, `dot` 0.27 |
+| pressed | 3/3, 37.5 s | 3/3, 38.2 s | **3/3, 38.3 s** |
+| press depth (commanded) | −6.0 mm | −6.0 mm | **−10.0 mm** |
+| measured depth | −5.98…−6.07 | −5.94…−6.08 | **−9.96…−10.05** |
+| lateral residual | 0.11–0.20 mm | 0.16–0.30 mm | **0.09–0.19 mm** |
+
+`push_depth` went 6 → 10 mm because the operator saw a press land on a button and NOT
+light — the one instrument that can see it. That was a predicted consequence of fixing
+the aim offset: the camera had been placing the panel ~6.8 mm too far away, so a
+commanded 6 mm was delivering about 12.8 mm past the real face, and 12.8 mm lit 9 of 9.
+Correcting the offset made the delivered stroke equal the commanded one and the actuation
+marginal. **This contradicts the note that used to sit in the config** — that past ~5 mm
+the suspicion should move to a spring too soft to transmit force. On this tool it does
+not: same plunger, same panel, 12.8 mm reliable and 6.0 mm not, which is stroke behaving
+like a lever. Whether 10 mm is enough is the operator's observation to make.
+
+### A SECOND cycle, and the drift is linear
+
+Run again from the approach pose with `initialization/round_trip.py`, which measures
+every stage. The press half repeated exactly; the driving half did not.
+
+| | cycle 1 | cycle 2 |
+|---|---|---|
+| station's lateral offset at the approach pose | +5.8 cm | **−1.4 cm** |
+| landed, along / lateral | −12 / **−19** mm | +8 / **−37** mm |
+| arm back on the viewing vector | 0.003 deg | **0.004 deg** |
+| identity verification | 5/5 frames, 0.2–0.3 px | **5/5 frames, 0.2 px**, `dot` 0.25 |
+| pressed | **3/3**, 37.5 s | **3/3**, 38.2 s |
+| back at the approach pose | 43 mm, **−4.01 deg** | 87 mm, **−8.02 deg** |
+
+**The press half is repeatable and the drive half is not.** The arm returns to the
+registered viewing vector to 0.003–0.004 deg, verification passes on the FIRST attempt
+both times with all five frames, and the presses land within 0.1–0.3 mm of the command.
+
+**The heading accumulates ~4 deg per cycle, linearly** (−4.01 then −8.02), and the two
+position errors roughly DOUBLED with it: landing lateral 19 → 37 mm, return error
+43 → 87 mm. Nothing corrects heading — `move` pins angular velocity to zero by design
+and every leg is computed from the live pose, which fixes position but cannot fix
+orientation. At this rate the harness's own 60 mm land-tolerance gate stops the flow
+within about one more cycle, which is the right failure (it refuses to extend the arm
+rather than extending it from somewhere the panel-clearance constant no longer describes)
+but it is a stop, not a solution.
+
+### The approach line runs through space the lab actually uses
+
+Blocked mid-session on 2026-09-18 and worth recording as a constraint rather than an
+incident. A colleague moved things; afterwards the lidar measured **48 returns between
+1.1 and 1.8 m ahead, spanning +0.19 to +0.90 m laterally** — entirely on the left, and
+intruding about **21 cm into the robot's own 0.40 m half-width corridor**. Both legs were
+refused: the 0.81 m straight leg needed 1.46 m of clearance (travel + 0.40 hull + 0.25
+margin) against 1.35 m available, and the in-place turn needs its 0.476 m swept radius
+and was refused by a separate object touching the rear-left corner.
+
+**That object is not merely tripping a conservative gate.** From the approach pose the
+drive-in leg is 1.53 m and the obstacle would then be 0.53 m ahead — the robot's left
+front would reach it. The gates refused correctly and there was no autonomous way out;
+clearing the space or hand-positioning was the only option.
+
+A reasoning error worth keeping with it: the rear return sat 0.154 m from the pose
+origin, INSIDE the chassis's own 0.80 x 0.76 m footprint, and I argued from that it had
+to be a self-return, since no external object can be inside the footprint without
+contact. It was a real object — clearing it took the rear reading from 0.15 m to
+**0.892 m**. The inference was wrong; declining to weaken the gate on the strength of it
+was right.
+
+### The return leg, and the thing that will break a repeated cycle
+
+| | |
+|---|---|
+| leg back to the approach pose | commanded −1.490 m, achieved **−1.519 m** (error 29 mm) |
+| landed | **43 mm** from the registered approach pose |
+| heading | **−4.01 deg** from it |
+
+**Heading is fully open loop and it accumulated 4 deg in ONE cycle** (+2.29 deg going in,
++1.72 deg coming back). `move` pins angular velocity to zero by design, so nothing
+corrects it; the position error is small and self-correcting because every leg is
+computed from the LIVE pose to the target, but the heading is not.
+
+That is the item to fix before running many cycles, and the first cycle happens to hide
+it: the same 4 deg of drift rotated the robot so that the station is now only **−1.4 cm**
+lateral to its heading, against **+5.8 cm** on the first run. The geometry got BETTER by
+accident. Over several cycles it will wander instead, and the approach pose stops being a
+fixed point. Options, none yet chosen: close the heading loop on the straight legs, or
+return to the approach pose with the chassis's own local `standard` move (lands ~5 cm,
+repeatably and biased rather than noisy), or re-register the approach pose each cycle and
+accept that it is not fixed.
+
+### The station tolerated the return, but do not read that as a property yet
+
+The station sits **58 mm LATERAL** to the robot's heading at the approach pose, and the
+aim angle that would correct it is **2.22 deg — below the ~3 deg the chassis can
+resolve**, so it cannot be steered out. The leg then drifted 41 mm laterally in the
+direction that cancelled most of it, landing 19 mm off. **That is a coincidence until it
+repeats.** If a later run lands badly, move the approach pose ~6 cm rather than trying to
+aim; both are recorded in `configs/stations.yaml`.
+
+### What actually caused a day of "detection is flaky"
+
+Localisation refused three attempts in a row from the returned station — 0 of 5 frames
+usable — while `assign` called directly on the same scene minutes apart accepted **5 of
+6** and **6 of 6** live frames. Two hypotheses were tested and killed before the real one
+was found:
+
+- **the arm had not settled** after a 169 deg sweep — refuted: the failure repeated
+  minutes later with the arm long stationary;
+- **the fist closing into the camera's lower third** — refuted by A/B: 5/6 without the
+  fist, **6/6 with it**.
+
+The cause was a **duplicated default**. `assign_voted` carried its own
+`min_detected_frac=0.7` and passed it down, shadowing the **0.5** that `assign` had been
+lowered to on the evidence of the hold-out measurement — so every frame in the voting
+path was still being asked for 7 of 10 detections while the scene was giving 5 or 6. With
+the duplicate removed the very next attempt localised **5 of 5 frames at 0.2 px**. Much
+of this session's "retry two or three times" story was this constant, not the panel.
+
+The fix is structural: `assign_voted` now takes `None` for the per-frame thresholds and
+forwards only what a caller sets, so `assign` holds the single source of truth.
+
+### Also
+- `initialization/move_arm_staged.py` — the checked two-leg mover, promoted out of `/tmp`
+  into the repo, because the return trip needs it every time and `/tmp` does not survive.
+- `initialization/park_hand.py` — closes the right hand into a fist at boot (USER
+  crontab, no sudo). The hand loses power across an e-stop and its fingers relax OPEN, so
+  "it was a fist last time" does not survive a restart; the fingertips sit 172.87 mm from
+  the flange against the plunger's ~154 mm, so an open hand is the front-most part.
+  **Deliberately does NOT move the arm**: the arm does not move on its own across a
+  restart, and an unattended sweep is the one motion whose checks do not cover the room.
+
+## ▶ AN ANCHOR THAT IS MEASURED, NOT READ (2026-09-18)
+
+Identity verification rested on one cell (`open`), and that cell reads correctly only
+most of the time. It now has a second anchor that does not involve the classifier at
+all: **`dot` is verified by being DARK, not by being recognised.**
+
+| cell | brightness / frame median | |
+|---|---|---|
+| **`dot`** | **0.23** (0.20-0.25) | the one unlit black disc |
+| `1` | 0.76 (0.70-0.77) | next darkest — only 0.04 of gap, not used |
+| `open` `3` `6` `5` `A` `close` | 0.87 … 1.18 | the bright metal cluster |
+
+`dark: 0.45` sits in the middle of the 0.25-0.70 gap rather than on either edge, the
+same way the 40 mm obstacle threshold sits in a wide band.
+
+**Relative, never absolute.** Those same cells scatter by ±20 grey levels frame to frame
+while the ratios hold to **0.01-0.03** — the scatter is entirely common-mode room
+lighting. An absolute threshold would inherit all of it, which is precisely how the lab
+lights going off took every class anchor to 0/N.
+
+**And it does not need the detector.** A black disc is what a button detector trained on
+bright discs misses: measured 4 of 12 frames one run, 9 of 12 another. In all four
+hardware runs below `dot` was among the cells the detector MISSED (`inferred 3 missed
+cell(s): dot, 4, 2`) — so sampling at the lattice position rather than at a detection is
+the difference between this anchor voting every time and never voting at all. That is
+not circular: the fit is made from POSITIONS, and this asks what the thing AT a position
+looks like. Shift the grid a row and the cell the layout calls `dot` is predicted onto a
+bright button; the ratio jumps 0.23 → ~1.0.
+
+### Verified on hardware, in both directions
+
+| | result |
+|---|---|
+| correct layout, run 1 | **PASS** — `A` mismatch, `open` **mismatch**, `dot` ok 0.24 |
+| correct layout, run 2 | **PASS** — `open` ok, `dot` ok 0.23 |
+| `shift_test_DO_NOT_USE` | **REFUSED** — "unshifted 1 vs shift 1 1", a tie, and a tie refuses |
+
+Run 1 is the one that matters: **both class anchors failed and `dot` alone carried the
+verification.** Before today that run would have refused. The shifted fixture is still
+refused, and note honestly WHY — its `6` cell sits where the physical black disc is, so
+the appearance anchor agreed with the wrong layout too; what saved it was the rule that
+the unshifted alignment must STRICTLY beat every shift, so a tie is a refusal.
+
+### Two mistakes of mine worth keeping
+
+- **`py_compile` passing is not evidence a patch landed.** A patch script asserted
+  part-way and Python writes the file only at the end, so the whole batch rolled back —
+  yet the module still compiled, because the missing attribute was only resolved at run
+  time. It crashed on hardware with `'Report' object has no attribute 'cells_px'`. Assert
+  on the FILE CONTENT after writing, not on the syntax.
+- **`rsync` of SOURCE silently reverted a change.** The fixed-total voting rule was made
+  on the Mac, never synced, and then overwritten by a pull from the robot after the Mac
+  lost its Desktop authorisation. Nothing warned; the docs already described it as done,
+  so CLAUDE.md and the code disagreed until a later patch's anchor text failed to match.
+
+## ▶ THE STATION IS REGISTERED, AND THE VIEWING WINDOW IS ONE-SIDED (2026-09-18)
+
+Recorded on request, before driving the robot anywhere: the arm pose, the chassis pose
+and — because those two alone cannot bring it back — the panel measured in the arm base
+frame. `configs/stations.yaml`, `mock_cabinet_press`.
+
+| | |
+|---|---|
+| arm joints | `[47.926, 69.095, -51.900, -138.643, 101.837, 162.746]` |
+| chassis pose (current SLAM map) | x **21.810**, y **-15.0075**, ori **2.8500** rad, settled |
+| panel centre, arm base frame | `[537.3, -636.7, 667.9]` mm |
+| button heights | z **580.2 - 755.7** mm |
+| panel normal | `[-0.9997, 0.0238, 0.0046]` |
+| camera distance | 584 mm |
+
+**Two numbers would not have been enough.** The chassis pose is in the CURRENT map —
+rebuild it and the number still parses and still points somewhere, just not here, and it
+carries no evidence of its own validity. The arm pose says nothing about where the panel
+is; it is a viewing pose only because the panel sits where it does relative to that
+chassis pose. The panel in the arm base frame is the physical relation the other two
+encode only indirectly, and it is what lets the station be re-found if either drifts.
+
+### The station was re-verified before anything was moved: 9 of 9 buttons
+
+Three consecutive `1 open 4` runs from the registered pose, with identity verification
+ON and the measured aim offset applied — **3/3 every time, 9/9 presses**:
+
+| run | depth (commanded -6.00 mm) | lateral | time | in-run refusals |
+|---|---|---|---|---|
+| 1 | -6.03 / -6.05 / -5.98 | 0.17 / 0.12 / 0.19 mm | 37.4 s | 0 |
+| 2 | -6.03 / -6.08 / -5.94 | 0.08 / 0.10 / 0.22 mm | 37.5 s | 1 (no anchor read) |
+| 3 | -6.04 / -6.06 / -6.13 | 0.11 / 0.13 / 0.12 mm | 36.7 s | 1 (2 of 5 frames) |
+
+Joint margins reproduced to 0.8 deg across the three (48.5-48.6 / 45.0-45.8 /
+41.0-41.2), clearance 59 mm throughout, and the approach rolls were identical except one
+button that took 285 instead of 270 on the last run.
+
+**Verification is resting on ONE anchor.** `open` read correctly in every vote (3/3, 4/4,
+4/4); `A` was wrong or unreadable in all three — `1` x3 unanimously, then `alarm`/`2`
+split, then `close`/`open` split. The runs pass because the test asks the unshifted
+alignment to STRICTLY BEAT every shift, and 1 against 0 is enough. It works, and it has
+no margin: the practical consequence is that a return to this station should be expected
+to refuse a few times before it presses, and that is the classifier, not the positioning.
+
+### The viewing pose tolerates being off in ONE direction, not both
+
+Measured by offsetting the CAMERA with a short straight arm move rather than by driving:
+for framing and detection a base offset and a camera offset are the same thing, and the
+reachable window here is only centimetres wide, so spending the station to measure the
+camera would have traded the expensive thing for the cheap one.
+
+| offset from the registered pose | buttons | verdict |
+|---|---|---|
+| **-8 cm** (further from the panel) | 8/10 | PASS |
+| -4 cm | 8/10 | PASS |
+| 0 | 7/10 | PASS |
+| **+4 cm** (closer) | — | marginal: a single frame passes, 5-frame sets did not reach 3 |
+| +8 cm | — | refused |
+| lateral ±4 cm | — | refused |
+| lateral -8 cm | — | no IK solution |
+
+Detection gets BETTER backing away (7/10 → 8/10) and falls apart approaching, so a
+reverse leg should be biased to stop SHORT of the panel rather than risk overshooting
+past it. **The mechanism is not known** — at +4 cm the buttons measure 48.3 px, inside
+the 44-50 band the classifier wants, and a single frame there fits a lattice at 1.86 px
+residual and passes. Recorded as measured rather than explained.
+
+**And this is only half the window.** It measures VIEWING. Reach pulls the other way:
+7.5 cm closer once took four buttons from 0/24 approach rolls to all solvable, and
+5.4 cm of lateral took one from 24/24 to 1/24. The usable band is the intersection, and
+the reach side has not been measured at this station — it can be, in software, by
+shifting the located button coordinates and asking the planner how many rolls survive.
+
+### Two of my own test harnesses failed in the same shape, and both are worth recording
+
+- **A settle test keyed on the VALUE changing can never pass for a still robot.** The
+  pose feed republishes the same value while stationary (measured: 0.0 mm of scatter), so
+  "wait for two fresh samples" implemented as "wait for the value to change" collects
+  exactly one sample and reports NOT settled precisely when the robot is doing what you
+  want. Key freshness on the SEQUENCE. Two identical consecutive poses are the strongest
+  agreement the feed can give — four of them came back byte-identical here.
+- **An ori tolerance of 0.5 deg is below the feed's own quantisation of 0.573 deg**, so
+  it asks two samples to agree more closely than the feed can express. Any settle
+  tolerance has to sit above the quantisation step.
+- A pre-flight guard written as `pgrep -af "press_buttons|liverun"` **matched its own
+  command line** and refused to start, the same self-match that once made `pkill -f` kill
+  its own SSH session. Use `ps -eo pid,args | awk '$2=="python3" && /pattern/'`.
+
+## ▶ THE ROBOT RAN ITSELF FLAT AGAIN, AND THE WATCHDOG FAILS THE WRONG WAY (2026-09-18)
+
+The chassis has been off the network for **49 hours** and the cloud's last report,
+66 hours old, says why:
+
+| | |
+|---|---|
+| battery | **4 %** |
+| isCharging | False |
+| isOnline | False |
+| moveState | **cancelled** |
+| last report | 2026-09-15 ~17:00, at map (21.79, −14.99) |
+
+This is the 2026-09-11 incident repeating - parked away from the dock, never charged,
+shut down at 4 %. **It needs a person to put it on the charger; nothing here can.**
+
+Ruled out on our side before concluding it: the Jetson still carries `192.168.25.46/24`
+on `eno1` with a route to the chassis, the right arm answers on the same cable, and an
+ARP sweep of `192.168.25.1-60` found **only our own address** - so the wire is fine and
+the chassis simply is not on it. None of the three AutoXing units on the WiFi subnet
+answered either, so it has not moved address.
+
+### The watchdog's battery exemption failed OPEN into "cancel"
+
+`chassis_hold.py` blocks the chassis's own `control_unit` from driving off, with an
+exemption so a genuinely low robot may still go and charge. The exemption read:
+
+```python
+pct = battery_pct()
+if pct is not None and pct < args.min_battery:   # allow
+else:                                            # CANCEL
+```
+
+**So an unreadable battery cancelled the charge move.** `battery_pct()` returns `None`
+on any failure - a websocket timeout, no `/battery_state` message inside its 6 s window,
+a missing field - and every one of those fell into the cancel branch. That is precisely
+the blanket block the module's own docstring exists to prevent, reintroduced through the
+error path, and it is the shape this project keeps meeting: **the dangerous answer
+arriving as an absence of data rather than as an error** (NaN passing every threshold
+check; an empty lidar scan reading as "nothing in the way").
+
+Whether it caused THIS outage cannot be proved - the log that would show it was in
+`/tmp` and did not survive the reboot - but the path exists, it is reachable, and it
+produces exactly the observed end state (`moveState: cancelled`, battery 4 %).
+
+Fixed to `pct is None or pct < floor`, i.e. **unreadable allows**, because the two
+mistakes are not symmetric: a wrong allow costs a trip to the dock, which is recoverable
+by repositioning; a wrong cancel costs the battery and has now cost days twice.
+
+Also fixed: the loop logged one identical `ConnectionError` per poll, **36,704 lines**
+in this run, filling `/tmp` and burying anything worth reading. A repeating fault now
+prints once and then every 10 minutes with a count, while a NEW fault still prints
+immediately.
+
+### Still open
+- **Charge the robot.** Everything below is blocked on it.
+- The arm-camera version of `mock_elevator_run.py` (reverse in → arm to the registered
+  viewing pose → verify and press → drive out) is designed but not built, because the
+  number that decides its shape needs the chassis: **how far can the base be off before
+  the FIXED viewing pose stops seeing the panel?** Wide window → a fixed reverse
+  distance is enough; narrow → the measured correction leg has to stay.
+- `--lift` must stay OFF in that flow for now: the lift moves the arm base frame, and the
+  viewing pose is a fixed joint vector, so moving both at once voids the registered pose.
+
+## ▶ A COUNT WAS STANDING IN FOR EXTRAPOLATION; PRESSED 3/3 VERIFIED (2026-09-17)
+
+The corrected aim offset pressed **3/3 with identity verification ON** — the first
+verified press this project has done — and the detection gate that kept refusing good
+frames turned out to be guarding the wrong quantity.
+
+### The occluded buttons were never the problem; the arithmetic was
+
+The plunger is bolted to the same limb as the camera, so it hides `4` and `2` from
+every frame at the registered viewing pose (measured 0/8). That looked like a reason to
+go and find another pose. It is not: those two cells are filled by the lattice, and
+both anchors sit in the OTHER column, so the occlusion costs the verification nothing.
+
+What it did cost was the threshold. `min_detected_frac` was 0.7 of the ten registered
+cells — set when the chest camera could see all ten. With only eight ever visible it
+silently became "7 of 8", i.e. 87 %, leaving ONE spare detection; a single ordinary
+miss failed the frame, which is where the run of "only 1 of 5 frames gave a usable
+geometry" refusals came from.
+
+### What the count was really protecting, measured
+
+Cells were held OUT of the lattice fit and the inferred position compared against where
+the button was actually detected:
+
+| detections kept | median | p90 | worst px | worst mm |
+|---|---|---|---|---|
+| 7 | 1.37 | 2.51 | 5.72 | 4.72 |
+| 6 | 1.71 | 5.57 | 6.27 | 5.18 |
+| **5** | 2.06 | 6.11 | **105.02** | **86.66** |
+| 4 | 2.45 | 66.13 | 157.22 | 129.74 |
+
+**And the residual gate does not catch the bad cases**: 334 of 360 five-point subsets
+fitted under the 6 px limit while placing a cell 87 mm away — a different button. With
+six unknowns (origin, row vector, column vector) a five-point fit is nearly exactly
+determined, so a low residual there is arithmetic, not evidence.
+
+The variable separating safe from catastrophic is not the count but whether a missing
+cell sits INSIDE the span of the ones that were seen. So `assign` now refuses any cell
+that would have to be extrapolated past the detected row/column range, and with that in
+place the count can be moved with evidence rather than by feel:
+
+| kept | worst without the span check | worst with it | subsets refused |
+|---|---|---|---|
+| 7 | 4.72 mm | 4.09 mm | 0 |
+| 6 | 5.18 mm | 5.18 mm | 0 |
+| 5 | **86.66 mm** | **5.56 mm** | 13 of 320 |
+| 4 | **129.74 mm** | **5.86 mm** | 61 of 320 |
+
+Good frames are untouched (0 refusals at 6 and 7) and the catastrophic tail is gone.
+`min_detected_frac` is therefore 0.5, justified by the 5.56 mm, not by convenience.
+
+### Anchors: a fixed-N vote, and a guard that was refusing for the wrong reason
+
+`assign_voted` decides the anchors by majority over a frame count fixed BEFORE any
+frame is looked at; every frame votes and the decision is taken once. That averages a
+measurement of a stationary panel rather than retrying one — the distinction matters,
+because the in-run loop deliberately refuses to retry past an alignment doubt. Geometry
+comes from the lowest-residual frame, chosen independently of how the anchors voted; a
+label wins only on a strict majority of ALL the frames asked for, so a split reads as
+nothing and nothing ties the alignments and refuses.
+
+It also exposed a real defect. The retry guard classified refusals by SUBSTRING
+(`"shift" in reason`), so "unshifted 0 vs shift 0" — nothing read at either alignment,
+i.e. NO evidence — was treated as evidence of a shift and locked the whole run. Those
+are different things: contrary evidence must never be retried, absent evidence is a
+frame-quality failure like any other. The report now carries an explicit
+`alignment_doubt` flag and callers branch on that, never on wording. Re-tested against
+the deliberately shifted fixture: refused 3 of 3, nothing pressed.
+
+### The press, and what still cannot be confirmed
+
+`1 open 4`, verification on, aim offset applied at the pose it was measured at:
+depth −5.98 to −6.07 mm against a commanded −6.00, lateral 0.11–0.18 mm, 37.5 s.
+
+**Whether the lamps lit is still unknown, and no camera here can answer it.** A
+low-exposure capture after retraction (the documented idea) shows no button emitting:
+the strongest local brightening between a before/after pair was **+3.7 grey levels, and
+off the panel entirely**. That is either "not lit" or "these lamps do not latch" — this
+faceplate is not wired to an elevator controller. `--hold` cannot settle it either: at
+the contact pose the arm camera sits ~10 cm from the panel with the plunger directly in
+front of the target button, and the chest camera cannot see this panel at all.
+
+### The lab light is a variable, and it is not brightness
+
+Anchor reads degraded through one evening from 6/8 to nothing. The cause was the room
+lights going off — frame mean **162 → 36**. Neither camera control recovers it:
+exposure plateaus at ~107 mean (the 30 fps frame period caps it) with anchors 0/N at
+every value, and gain 16 → 128 restores the mean to **170.7**, above the lit 162, with
+anchors still **0/N** and geometry never better than 3/6. **Matching the brightness
+number does not restore the reading** — the same shape as the etched-digit result, and
+a reminder that an hour of anchor measurements can be measuring the light instead.
+
+### Still open
+- **Did the buttons light?** Operator's eye is the only instrument. If not, `push_depth`
+  is the lever: correcting the aim offset's x term removed ~6.8 mm of unintended
+  over-travel, so the delivered stroke is now the commanded 6 mm rather than ~12.8.
+- **`A` is a coin flip even in good light** (alarm/`1` splits are common), so `open`
+  alone carries the verification. One dependable anchor does catch a row shift here, but
+  there is no margin.
+- **The obstacle check is still disabled** for the arm camera.
+- `A` is the alarm bell, not a floor "A"; the cell label should say so.
+
+## ▶ THE AIM BIAS IS NOT RIGID — IT BELONGS TO A VIEWING POSE (2026-09-16)
+
+Identity verification **passed live for the first time on this robot** (anchors 2/2 on
+the first frame, where every press before today used `--no-verify`), and the aiming
+patch was replaced by a measurement. The measurement then refuted the conclusion the
+first half of it supported, which is the result worth keeping.
+
+### The measurement: four hand-touched truths, from two arm poses
+
+The operator placed the plunger tip on four button centres spread over the panel
+(`A`, `6`, `open`, `2`) while the controller pose was recorded — truth that does not
+come from the camera. Settle drift 0.01-0.04 mm per touch. The four were checked
+against each other BEFORE being used: plane residual 0.16-0.32 mm, normal within
+0.3 deg of the camera-fitted one, row pitch 43.1/43.8 mm and column pitch 54.5 mm
+matching the registered layout.
+
+| arm pose the panel was viewed from | camera minus truth | total |
+|---|---|---|
+| hand-set pose | `[ 3.34 -3.08 -2.10]` mm | 3.7-5.8 mm |
+| registered viewing pose | `[ 6.75 -7.33 -8.59]` mm | 12.1-14.4 mm |
+| spread across the panel, either pose | `[0.5-1.1]` mm | — |
+
+**Within one pose it is a rigid shift; between poses it is not.** After the first pose
+alone the conclusion was "rigid offset, fold it into the calibration" — and that was
+wrong. It is a systematic error in the ARM-CAMERA chain (the rotation part of
+`gripper_T_camera`, or the arm's FK) that projects differently as the arm moves.
+Carrying the number across poses would have added a 13 mm error silently, and nothing
+downstream could have seen it: the press log compares the command against the same
+assumed geometry on both sides.
+
+That is exactly the mitigation this project wrote down before the camera was fitted —
+look from ONE registered pose, where a systematic FK error is a constant. So
+`arm.view_joints_deg` and `elevator.press.aim_offset_mm` are now a **pair**, and
+`press_buttons.py` **refuses** the offset when the joints it actually localised from
+differ from the recorded ones by more than a degree. Verified in both directions on
+hardware: refused at 2 deg off, applied at the pose itself. The fixed-camera path is
+untouched — it skips the offset with a printed reason rather than refusing, because
+a camera that does not ride the arm has no such pose and no such error.
+
+It also replaces an eyeballed `[0, 0, 8]`. Those presses lit, which proves only that a
+~7 mm aiming error still lands inside a 20 mm button.
+
+### The viewing pose had to be found before any of this could be verified
+
+Verification could not pass at the old pose **for a structural reason**: the panel's
+bottom row fell off the frame edge, taking the `open` anchor with it, and the
+**plunger is bolted to the same arm as the camera** — so it occupies a FIXED region of
+the image and backing off does not move it. The panel has to be made small enough to
+sit clear of it. Sweeping along the optical axis:
+
+| back off | buttons found | button size |
+|---|---|---|
+| 0 cm | 6 | 75.5 px |
+| 8 cm | 7 | 62.4 px |
+| 16 cm | 6 | 52.7 px |
+| **24 cm** | **7** | **44.7 px** — in the 44-50 px band the classifier needs |
+
+The three it does not see are the right-column buttons behind the plunger, which the
+lattice fills in. `arm.view_joints_deg` is now registered, and for an arm-mounted
+camera it is also the default **home** — the chest camera's home is a >150 deg
+unguarded sweep away and a much worse IK seed (2/24 and 5/24 approach rolls with 5 mm
+of clearance, against 24/24 with 56 mm from the viewing pose).
+
+Large arm moves now go through a staged, checked mover: each leg is sampled in joint
+space and every sample is checked for self-collision, for the tip's closest approach to
+the panel, and for its distance from the torso column, before anything moves. Written
+because `rm_algo_safety_robot_self_collision_detection` covers the arm's own links and
+not the room.
+
+### Still open — and the first one blocks pressing
+
+- **Anchor reads are not reliable enough, and the panel is the reason.** Measured over
+  8 localised frames at the registered pose: `open` **8/8**, `A` **6/8**, and *every
+  other cell is noise* — `5`, `3` and `1` all read `2`, `6` reads nothing. So there are
+  only two usable anchors, and when `A` misreads, `open` alone leaves shift 4 a tie and
+  the run is correctly refused. Two consecutive press attempts were refused this way
+  (`A` read `2` at 0.38, then `1` at 0.65 — worse than the 6/8 measured an hour
+  earlier, so the room light is drifting). **Re-running until it passes is the same
+  dice-roll the in-run guard exists to prevent, so it was not done.** The principled
+  fix is a majority vote over a FIXED number of frames decided in advance — the panel
+  is static, so this averages a measurement rather than retrying one. Not built.
+- **The press has NOT been re-validated with the corrected offset** — planning is
+  clean (margins 41-48 deg, clearance 59 mm, 24/24 and 17/24 rolls) but no button has
+  been pressed since the offset changed, and the lamps are the only signal that sees an
+  aiming error at all.
+- **Effective push depth changes with the x correction.** The camera placed the panel
+  ~6.8 mm too far away, so a commanded 6 mm push was delivering ~12.8 mm past the real
+  button face. Corrected, the delivered stroke is the commanded one. If a button stops
+  lighting, `push_depth` is the lever — not restoring an aiming error to buy stroke.
+- **The obstacle check is still disabled** for the arm camera (`--no-obstacle-check`).
+- `A` is the alarm bell, not a floor "A"; the cell label should say so.
+
 ## ▶ THE ARM CAMERA PRESSES REAL BUTTONS (2026-09-15)
 
 `1`, `open` and `4` pressed and lit from the arm-mounted camera, four consecutive runs

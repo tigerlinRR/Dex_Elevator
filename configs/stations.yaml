@@ -1,0 +1,94 @@
+# Registered STATIONS — where the robot stood when a panel was pressed from it.
+#
+# Recorded on request so a station can be returned to after the robot is driven away.
+# Nothing reads this file yet: it is a registration, and the arm-camera run harness will
+# read it when that is built. Written here rather than in a note because a station is a
+# machine coordinate, and the one thing worse than not recording it is recording it
+# somewhere that drifts out of step with the code.
+#
+# WHY THREE THINGS AND NOT TWO. The operator asked for the arm pose and the chassis
+# pose. Those two alone cannot bring the robot back:
+#   * the chassis pose is in the CURRENT SLAM map. Rebuild or relocalise the map and the
+#     number still parses and still points somewhere — just not here. It carries no
+#     evidence of its own validity.
+#   * the arm pose says nothing about where the panel is. It is only a viewing pose
+#     BECAUSE the panel happens to sit where it does relative to this chassis pose.
+# So the PANEL measured in the arm base frame is recorded too. That is the physical
+# relation the other two only encode indirectly: if the map changes it is what lets the
+# station be re-found, and if the panel or the robot moves it is what shows that it did.
+
+stations:
+  - id: mock_cabinet_press
+    panel: mock_cabinet
+    recorded: "2026-09-18 11:21"
+
+    # The arm's registered viewing pose (same vector as arm.view_joints_deg in
+    # pipeline.yaml — repeated here so a station is self-contained). Reproduced to
+    # better than 0.01 deg across three separate reads today.
+    arm_joints_deg: [47.926, 69.095, -51.900, -138.643, 101.837, 162.746]
+    arm_tcp_xyz_mm: [50.2, -638.3, 718.4]
+
+    # Chassis pose in the current SLAM map. SETTLED: four consecutive fresh samples came
+    # back byte-identical, which is the strongest agreement this 1 Hz feed can give.
+    # (Note for anyone writing a settle test: key freshness on the SEQUENCE, never on the
+    # value changing. A perfectly still robot republishes the same pose, so a
+    # "value changed" test never gets a second sample precisely when the robot is doing
+    # what you want. That mistake cost two runs here before it was spotted.)
+    chassis_serial: "1352512k06960Og"
+    chassis_pose: {x: 21.810, y: -15.0075, ori: 2.8500}   # metres, radians
+    chassis_pose_settled: true
+
+    # The panel as the arm camera measured it from the arm pose above, in the ARM BASE
+    # frame. From the localisation run at 11:19 — the 11:21 run refused on anchors and
+    # nothing moved in between, so this is the same station, measured two minutes apart.
+    # These are points on the FITTED FACEPLATE PLANE and are NOT bias-corrected: the
+    # button faces stand ~2.3 mm proud of it toward the robot, and the camera places
+    # this panel ~6.8 mm too far away (see elevator.press.aim_offset_mm). Hand-touched
+    # truth put the button faces at x ~= 530 mm, which is these numbers minus both.
+    panel_centre_base_mm: [537.3, -636.7, 667.9]
+    panel_button_z_mm: [580.2, 755.7]
+    panel_normal_base: [-0.9997, 0.0238, 0.0046]
+    camera_distance_mm: 584
+
+    # WHERE THE ROBOT WAITS before driving in, registered 2026-09-18 on request. It is
+    # a chassis pose only — no arm pose, because the arm is tucked in its travel posture
+    # here and no panel is in view.
+    # RECOMPUTED 2026-09-18: the station translated 1.50 m BACK along its OWN
+    # heading, so a straight drive-in lands on it by construction. The first
+    # registration was simply where the operator parked, and it was never on that
+    # line: even stopping exactly on it left the station **+6.4 cm LATERAL**, which
+    # a straight leg cannot fix and which the 2.22 deg aim angle could not turn out
+    # either (below the chassis's ~3 deg resolution). Two cycles passed anyway —
+    # the first because the leg drifted 41 mm in the cancelling direction, the
+    # second because the accumulated heading drift happened to point the right way.
+    # Both were luck, and the third measured 16 cm and would have been refused.
+    approach_pose: {x: 23.2467, y: -15.4387, ori: 2.8500}
+    # Driving from there to the station is a STRAIGHT leg of +1.502 m along the robot's
+    # own heading — no turn. Two things measured on the first run, and the second one is
+    # the one to watch:
+    #   * the leg landed 12 mm short along the heading and 19 mm off laterally, ending
+    #     23 mm from the station with 1.15 deg of heading difference. The arm then
+    #     returned to the registered viewing pose to 0.003 deg, and the press planned
+    #     with 24/24, 20/24 and 24/24 rolls — so this approach point works.
+    #   * BUT the station sits 58 mm LATERAL to the robot's heading at this approach
+    #     pose, and the aim angle that would correct it is 2.22 deg — BELOW the ~3 deg
+    #     the chassis can resolve, so it cannot be turned out. The leg happened to drift
+    #     41 mm laterally in the direction that cancelled most of it. That is a
+    #     coincidence until it repeats, not a property. If a later run lands badly
+    #     laterally, move this approach pose ~6 cm rather than trying to steer.
+    # Measured tolerance of THIS viewing pose to being off position (2026-09-18), by
+    # offsetting the camera with a short straight arm move — for framing and detection a
+    # base offset and a camera offset are the same thing, and doing it with the arm does
+    # not spend the station. The window is ONE-SIDED:
+    #     -8 cm (further from the panel)  8/10 buttons  PASS
+    #     -4 cm                            8/10          PASS
+    #      0                               7/10          PASS
+    #     +4 cm (closer)                   marginal - a single frame passes, but 5-frame
+    #                                      sets did not reach the 3 they need
+    #     +8 cm                            refused
+    #     lateral +-4 cm                   refused;  -8 cm has no IK solution
+    # So a reverse leg should be biased to stop SHORT of the panel rather than risk
+    # overshooting past it. NOTE this measures VIEWING only. Reach pulls the other way —
+    # 7.5 cm closer once took four buttons from 0/24 approach rolls to all solvable, and
+    # 5.4 cm of lateral took one from 24/24 to 1/24 — so the usable band is the
+    # intersection of the two, and the reach side has not been measured at this station.

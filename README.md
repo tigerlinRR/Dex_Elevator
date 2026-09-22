@@ -52,7 +52,7 @@ the vision only needs to give a reliable button pixel and its floor label.
 | Compute | NVIDIA Jetson AGX Orin (`ssh dex5-wired`) | JetPack 6.2 / CUDA 12.6; runs the SDKs + inference |
 | Detection | Ultralytics YOLO11m | multi-class (per floor: `1`,`2`,`B1`,`G`…) — detects AND identifies; trained from CC BY data (`yolo/`, `DATASETS.md`) |
 | Inference | **TensorRT FP16** on the Orin's GPU | 43 ms/frame (23 FPS) via `yolo/trt_detector.py`; the machine's torch is CPU-only and is deliberately left alone |
-| Calibration | intrinsics + eye-to-hand (ChArUco) | once per camera, shared (`calibration/`); an eye-**in**-hand path exists for a future arm-mounted camera, not yet used |
+| Calibration | intrinsics + eye-to-hand (ChArUco) | once per camera, shared (`calibration/`). The ARM-MOUNTED camera is calibrated eye-**in**-hand and presses buttons today; because `base_T_camera` is then rebuilt from the live arm pose, its residual error depends on where the arm stands — so the viewing pose is registered and the measured aim offset is bound to it |
 | Press geometry | ray ∩ panel-plane | pure geometry, no learned model (`core/press.py`) |
 
 ## Repository layout
@@ -71,8 +71,10 @@ Dex_Elevator/
 ├── yolo/                   # TensorRT GPU detector, panel-layout matcher, dataset prep & training
 ├── calibration/            # one-time intrinsics + eye-to-hand base_T_camera (ChArUco);
 │                           #   eye-in-hand gripper_T_camera for an arm-mounted camera
-├── initialization/         # bring-up check, calibration + eval scripts, and press_buttons.py (the presser)
-├── configs/                # cameras.yaml, pipeline.yaml, panels.yaml
+├── initialization/         # bring-up check, calibration + eval scripts, press_buttons.py (the
+│                           #   presser), round_trip.py (the whole cycle), move_arm_staged.py
+│                           #   (checked large arm moves), goto_pose.py, park_hand.py
+├── configs/                # cameras.yaml, pipeline.yaml, panels.yaml, stations.yaml
 ├── elevator_runner/        # drive-to-the-panel tool (AutoXing cloud API + press)
 └── data/                   # weights/, calibration/ (gitignored)
 ```
@@ -167,7 +169,17 @@ python3 initialization/press_buttons.py 1 4 2 5            # plan only, no motio
 python3 initialization/press_buttons.py 1 4 2 5 --go       # press the sequence
 python3 initialization/press_buttons.py 1 4 2 5 --go --lift  # let the torso track the panel
 python3 initialization/press_buttons.py 1 --go --push=2    # override push depth (mm)
+python3 initialization/press_buttons.py 1 --go --speed=0.5 --press-speed=0.15
 ```
+
+**Speed is two knobs plus a cap.** `arm.max_speed_pct` in `configs/pipeline.yaml` only
+LOWERS what a caller asks for (`v = clip(round(speed*100), 1, max_speed_pct)`), so raising
+it alone changes nothing. `--speed` (default 0.50) drives the free-air joint moves;
+`--press-speed` (0.15) drives the straight line INTO the button and is left slow on
+purpose, because that is the one segment where speed becomes impact force;
+`--retract-speed` defaults to `--speed` because the retract is 60 mm of free air away from
+the panel with nothing to hit. Measured: one button 13.2 s at 20 % against **9.0 s at
+50 %**, with depth and lateral error unchanged.
 
 Each press is `home → standoff (50 mm) → linear approach through contact → retract → home`,
 with the joint-interpolated path checked for panel clearance beforehand. The panel plane and
@@ -183,6 +195,48 @@ With `--lift`, the torso goes to each button's **best-margin height** rather tha
 (`arm.lift.objective: margin`). The body visibly tracks the panel row by row, and the heights
 it picks carry the largest joint margins available. Both objectives choose only from poses that
 already passed the joint-limit, wrist, self-collision and clearance checks.
+
+## Usage — the arm-camera round trip
+
+`round_trip.py` runs the whole cycle the operator asked for — drive in from a registered
+`approach_pose`, extend the arm to the registered viewing pose, verify the panel's
+identity, press, retract, drive back — and MEASURES at every stage rather than assuming.
+It calls the existing tools (`drive_straight.py`, `move_arm_staged.py`,
+`press_buttons.py`) rather than reimplementing them, so it owns only the order and the
+gates.
+
+```bash
+python3 initialization/round_trip.py --cycles 1 --floors "1"
+python3 initialization/round_trip.py --dry                      # plan and measure, never move
+python3 initialization/round_trip.py --floors "1" --press-speed 0.20,0.50   # A/B in one visit
+```
+
+Two gates matter: the arm must be at the travel pose before any drive, and after landing
+the base must be within `--land-tol` (6 cm) of the station in BOTH axes before the arm
+extends. The press keeps its own refusals — identity verification, the aim-offset pose
+check and the obstacle flag are its business, not the harness's.
+
+The press is **pre-warmed under the drive**: ~7.5 s of its startup (python import, arm
+connect, closing the hand, the TensorRT engine, opening the camera) does not depend on
+where the robot is standing, so it runs while the base moves and is released only once
+both gates pass. That took a one-button press from **22.8 s to 10.9 s**. Nothing about
+the arrival decision moves into the press — letting it infer arrival from the camera is
+what drove the arm into the panel once.
+
+## Usage — returning to a registered pose
+
+```bash
+python3 initialization/goto_pose.py --station approach     # chassis's own planner, then measure
+```
+
+**The chassis closes metres well and centimetres not at all.** Its `standard` move has an
+arrival **dead zone of roughly 7 cm**: inside it the planner declares success and issues
+nothing, so neither repeating the move nor aiming past the target converges (both were
+tried and measured — three moves from 35 mm left the pose identical to the millimetre).
+Outside the dead zone it is good: two consecutive moves from ~0.6 m landed **12 mm and
+14 mm**. So when the robot is stuck a few centimetres from a registered pose, **back off
+past the dead zone and come in again** rather than nudging in place — nudging made it
+worse, taking a lateral error from −6 mm to +78 mm.
 
 ## Usage — driving the base in a straight line
 
@@ -283,9 +337,9 @@ Measured, not assumed:
 | quantity | value |
 |---|---|
 | button protrusion above the faceplate | 2.3 mm (from depth) |
-| push depth | 3 mm (1 and 2 mm failed to light the button; 3 mm lit it repeatably) |
+| push depth | **9 mm** (2026-09-18). 3 mm belonged to the chest-camera era; once the aim offset stopped placing the panel ~6.8 mm too far away, the commanded depth became the delivered stroke, and 6 mm failed to light while 10 mm lit but felt hard. **The lamps are the only instrument that sees this — not the log.** |
 | usable standoff | ≤50 mm — beyond that the target falls inside the arm's unreachable inner region |
-| plunger TCP | `[26.0, −1.9, 24.7] mm`, two independent methods agreeing to 0.7 mm |
+| plunger TCP | **`[11.64, −22.67, 36.66] mm`** (re-measured 2026-09-15 with the chest camera). The old `[26.0, −1.9, 24.7]` was **24.3 mm out**, and since the column pitch is 55.1 mm every press landed almost exactly half a pitch off, between the two columns, with nothing lighting. The press log reported lateral errors of 0.15–0.81 mm throughout, because it compares the command against the same assumed offset on both sides. |
 
 **Driving and pressing, end to end (2026-08-27).** `elevator_runner/` drives the robot to the
 elevator point and presses. Two things that used to make it look broken are fixed, both

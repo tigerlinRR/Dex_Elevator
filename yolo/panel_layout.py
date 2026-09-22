@@ -43,6 +43,18 @@ class Cell:
 
     label: str                      # what a caller asks for ("3", "open")
     expect: Optional[str] = None    # model class used to verify alignment (anchor)
+    # An APPEARANCE anchor: this cell must be darker than `dark` times the median
+    # brightness of the cells in the SAME frame. For a cell whose distinguishing feature
+    # is not a marking to be read — here the unlit black disc among nine bright metal
+    # discs — this verifies alignment without the classifier being involved at all.
+    # Relative, never absolute: an absolute threshold inherits every change the room
+    # lighting makes, which is exactly what took anchor reads from 6/8 to nothing when
+    # the lab lights went off. Measured 2026-09-18 over 12 frames at the registered
+    # viewing pose: `dot` 0.23 (range 0.20-0.25) against a next-darkest cell at 0.76
+    # (0.70-0.77) and a bright cluster at 0.87-1.18 — a factor of three with no overlap,
+    # while the ABSOLUTE brightnesses of those same cells scattered by +-20 grey levels
+    # frame to frame. The scatter was entirely common-mode.
+    dark: Optional[float] = None
 
 
 @dataclass
@@ -67,8 +79,9 @@ class PanelLayout:
 
     @property
     def anchors(self) -> list[tuple[int, int, Cell]]:
+        """Cells that can testify about alignment — by class OR by appearance."""
         return [(i, j, c) for i, row in enumerate(self.grid)
-                for j, c in enumerate(row) if c.expect]
+                for j, c in enumerate(row) if c.expect or c.dark is not None]
 
 
 def load_panel(panel_id: str, path=PANELS_FILE) -> PanelLayout:
@@ -77,8 +90,9 @@ def load_panel(panel_id: str, path=PANELS_FILE) -> PanelLayout:
     for entry in cfg.get("panels", []):
         if entry.get("id") != panel_id:
             continue
-        grid = [[Cell(label=str(c["label"]), expect=c.get("expect")) for c in row]
-                for row in entry["grid"]]
+        grid = [[Cell(label=str(c["label"]), expect=c.get("expect"),
+                      dark=(None if c.get("dark") is None else float(c["dark"])))
+                 for c in row] for row in entry["grid"]]
         v = entry.get("verify", {}) or {}
         return PanelLayout(id=panel_id, grid=grid,
                            min_anchors=int(v.get("min_anchors", 2)),
@@ -302,14 +316,44 @@ class Report:
     found: list = field(default_factory=list)   # the raw detections, for tight_roi()
     inferred: list[str] = field(default_factory=list)  # cells filled from the lattice
     residual: float = 0.0                       # worst lattice fit error, px
+    # (row, col) -> the detection occupying that cell. Exposed so a caller can classify
+    # the same cell across several frames and vote, which one frame cannot do.
+    detected_cell: dict = field(default_factory=dict)
+    # (row, col) -> the FITTED pixel centre of every cell, detected or inferred. Exposed
+    # so a caller can sample an appearance anchor across several frames and vote it.
+    cells_px: dict = field(default_factory=dict)
+    votes: list[str] = field(default_factory=list)   # how a voted read was decided
+    # True only when anchors were actually READ and the evidence still fails to put the
+    # unshifted alignment ahead - i.e. something points at a shift. A refusal with NO
+    # anchor read either way is a different thing entirely (no evidence, not contrary
+    # evidence) and leaves this False. Callers must branch on this flag, never on the
+    # wording of `reason`: a safety decision taken by substring match is one rewording
+    # away from silently inverting.
+    alignment_doubt: bool = False
+    # Mean grey level of the frame this report came from. Recorded because "0 buttons
+    # detected" has two completely different causes that read identically in a log: the
+    # detector failing, and THE ROOM LIGHT being off. Measured 2026-09-16, lights off
+    # took the frame mean 162 -> 36 and every anchor to 0/N, and neither exposure nor
+    # gain recovers it — so the first question after a detection failure is what the
+    # brightness was, and a log that cannot answer it sends the next hour into the
+    # classifier instead. Two runs on 2026-09-18 died with 0 buttons on all 15 frames
+    # from the best-positioned landing of the session, and this number was missing.
+    frame_mean: float = 0.0
 
     def lines(self) -> list[str]:
         out = [f"detected {self.detected} buttons"]
+        if self.detected == 0 and self.frame_mean:
+            out[0] += (f"  [frame mean {self.frame_mean:.0f}/255 — "
+                       + ("LOW: suspect the room light, not the classifier"
+                          if self.frame_mean < 80 else
+                          "brightness is normal, so this is not the light")
+                       + "]")
         if self.residual:
             out[0] += f", lattice residual {self.residual:.1f} px"
         if self.inferred:
             out.append(f"inferred {len(self.inferred)} missed cell(s) from the lattice: "
                        + ", ".join(self.inferred))
+        out.extend(self.votes)
         if self.anchors_total:
             out.append(f"anchors {self.anchors_ok}/{self.anchors_total} agree")
             out.extend(f"    {d}" for d in self.anchor_detail)
@@ -423,10 +467,184 @@ def tight_roi(found: Sequence[Found], shape: tuple[int, int],
             min(W, int(u.max() + pad_u)), min(H, int(v.max() + pad_v)))
 
 
+def cell_brightness(bgr, cells_px: dict, button_px: float) -> dict:
+    """Relative brightness of each grid cell: its own mean over the frame's median.
+
+    Sampled at the LATTICE position, so a cell counts whether or not the detector found
+    it. That matters here: the black disc is exactly the thing a button detector trained
+    on bright discs tends to miss (measured 4 of 12 frames one run, 9 of 12 another), and
+    an anchor that is usually absent cannot testify.
+
+    Is it circular to verify the lattice using positions the lattice predicted? No, and
+    the distinction is worth being precise about. The fit is made from POSITIONS; this
+    asks what the thing AT a position looks like. Shift the grid by a row and the cell
+    the layout calls `dot` is predicted onto a bright metal button, and the ratio jumps
+    from ~0.23 to ~1.0 — so it still separates the alignments, which is the whole job.
+    What it cannot catch on its own is a fit with the wrong PITCH, where the patch could
+    land between buttons; the residual gate and the extrapolation check guard that.
+
+    Returns {(row, col): ratio}; cells whose patch falls outside the image are omitted,
+    which reads downstream as "no evidence here" rather than as a pass.
+    """
+    import numpy as _np
+
+    h, w = bgr.shape[:2]
+    r = max(3, int(button_px * 0.35))
+    vals, raw = {}, {}
+    for k, (u, v) in cells_px.items():
+        u, v = int(round(u)), int(round(v))
+        if u - r < 0 or v - r < 0 or u + r >= w or v + r >= h:
+            continue
+        raw[k] = float(bgr[v - r:v + r, u - r:u + r].mean())
+    if len(raw) < 4:
+        return {}
+    med = float(_np.median(list(raw.values())))
+    if med <= 1.0:
+        return {}
+    for k, val in raw.items():
+        vals[k] = val / med
+    return vals
+
+
+def assign_voted(bgrs: list[np.ndarray], detector: Detector, layout: PanelLayout,
+                 min_good: int = 3, min_conf: float | None = None,
+                 max_residual: float | None = None,
+                 min_detected_frac: float | None = None,
+                 ) -> tuple[dict[str, tuple[float, float]], Report, int]:
+    """Decide the anchors by MAJORITY over a fixed set of frames, not from one frame.
+
+    Returns ``(mapping, report, index)`` where ``index`` says which of ``bgrs`` the
+    geometry came from, so the caller can pair it with that frame's depth.
+
+    **Why this is not "retry until it passes".** The number of frames is fixed before
+    any of them is looked at, every one of them votes, and the decision is taken once.
+    Retrying is drawing again after seeing a result you did not like; this is averaging
+    a measurement of something that is not moving. The distinction matters because the
+    in-run retry loop deliberately refuses to retry past an alignment doubt, and this
+    must not become a way around that.
+
+    It exists because one frame is not enough on this panel. Measured 2026-09-16 at the
+    registered viewing pose, over 8 localised frames: `open` read correctly 8/8 but `A`
+    only 6/8, and every other cell is noise. Two usable anchors means that when `A`
+    misreads, `open` alone leaves a 4-row shift a tie and the whole run is refused —
+    which is correct, but happened on two consecutive attempts.
+
+    Rules, all conservative:
+    * geometry comes from the frame with the LOWEST lattice residual, chosen on the
+      fit alone and therefore independently of how the anchors voted;
+    * a cell counts as OBSERVED only if it was detected in a strict majority of the
+      good frames, and a label wins only on a strict majority of ALL the frames asked
+      for — so a split reads as nothing, nothing ties the alignments, and a tie refuses.
+      Counting against the fixed total rather than the survivors stops a run with fewer
+      usable frames from reaching a verdict a full set could not;
+    * fewer than ``min_good`` frames with a usable geometry is a refusal, not a vote
+      among whatever survived.
+    """
+    # ONE source of truth for the per-frame thresholds. These used to be repeated here
+    # as defaults, and when `assign`'s `min_detected_frac` was lowered from 0.7 to 0.5 on
+    # the evidence of the hold-out measurement, this copy stayed at 0.7 and SHADOWED it —
+    # every frame that came through the voting path was still being asked for 7 of 10
+    # detections. It presented as "the panel cannot be localised from this station":
+    # `assign` called directly accepted 5 and 6 of 6 live frames while `assign_voted`
+    # accepted 0 of 5 of the same scene, minutes apart. A duplicated default is a second
+    # place to change, and the one that is forgotten fails silently.
+    kw = {k: v for k, v in (("min_conf", min_conf),
+                            ("max_residual", max_residual),
+                            ("min_detected_frac", min_detected_frac)) if v is not None}
+
+    n = len(bgrs)
+    geom: list[tuple[int, tuple[int, int, int, int], Report]] = []
+    for idx, bgr in enumerate(bgrs):
+        roi = panel_roi(bgr, detector, shape=layout.shape, verbose=False)
+        if roi is None:
+            continue
+        _, rep = assign(bgr, roi, detector, layout, verify=False, **kw)
+        if rep.ok:
+            geom.append((idx, roi, rep))
+
+    if len(geom) < min_good:
+        bad = Report(ok=False, detected=0)
+        # Carry the brightness up to the refusal the caller actually sees: without it
+        # a voted refusal reports "0 of 5 frames" and says nothing about whether the
+        # lights were on, which is the first thing worth knowing.
+        if bgrs:
+            bad.frame_mean = float(np.mean(bgrs[0]))
+        bad.reason = (f"only {len(geom)} of {n} frames gave a usable panel geometry "
+                      f"(need {min_good}) — there is not enough evidence to vote on, "
+                      f"and voting among whichever frames happened to survive is the "
+                      f"retry-until-it-passes this is meant to avoid")
+        return {}, bad, -1
+
+    # Only the cells the shift test can ever reference: each anchor's own cell and the
+    # cell every shift would put in its place. Classifying all ten would cost four
+    # times as much for evidence nothing looks at.
+    rows = layout.rows
+    need = {((i + sh) % rows, j) for i, j, _ in layout.anchors for sh in range(rows)}
+    seen_n = {k: 0 for k in need}
+    tally: dict[tuple[int, int], dict[str, list[float]]] = {k: {} for k in need}
+    for idx, _roi, rep in geom:
+        for k in need:
+            f = rep.detected_cell.get(k)
+            if f is None:
+                continue
+            seen_n[k] += 1
+            lbl, conf = classify_solo(bgrs[idx], f, detector)
+            if conf >= layout.min_conf:
+                tally[k].setdefault(lbl, []).append(conf)
+
+    # Appearance evidence, voted the way the classes are: the MEDIAN ratio across the
+    # good frames. A median because one frame with a glint in the patch should not drag
+    # the verdict, and because the quantity is already very stable once normalised
+    # (spread 0.01-0.03 against +-20 grey levels before normalising).
+    rel_votes: dict = {}
+    for idx_g, _roi_g, rep_g in geom:
+        bw = (float(np.median([max(f.w, f.h) for f in rep_g.found]))
+              if rep_g.found else 40.0)
+        for k, v in cell_brightness(bgrs[idx_g], rep_g.cells_px, bw).items():
+            rel_votes.setdefault(k, []).append(v)
+    voted_rel = {k: float(np.median(v)) for k, v in rel_votes.items()
+                 if len(v) > len(geom) / 2.0}
+
+    # A label wins only on a strict majority of the FIXED frame count, not of however
+    # many frames happened to survive. Tying it to the survivors would let a run where
+    # two frames failed reach a verdict on two votes that a full set could not — fewer
+    # observations making a decision EASIER, which is the same hazard the anchor scoring
+    # was fixed for. `observed` still keys on the good frames, because a cell cannot be
+    # seen in a frame that produced no geometry at all.
+    half_all, half_good = n / 2.0, len(geom) / 2.0
+    observed = {k for k in need if seen_n[k] > half_good}
+    reads: dict[tuple[int, int], tuple[str, float]] = {}
+    for k in observed:
+        best = max(tally[k].items(), key=lambda kv: len(kv[1]), default=None)
+        reads[k] = ((best[0], float(np.mean(best[1]))) if best and len(best[1]) > half_all
+                    else ("", 0.0))
+
+    idx, roi, _ = min(geom, key=lambda g: g[2].residual)
+    mapping, rep = assign(bgrs[idx], roi, detector, layout, verify=True,
+                          reads=reads, observed=observed, rel=voted_rel, **kw)
+    rep.votes.append(f"anchors voted over {len(geom)} of {n} frames "
+                     f"(geometry from the cleanest, residual {rep.residual:.1f} px)")
+    for i, j, c in layout.anchors:
+        k = (i, j)
+        if c.dark is not None:
+            vs = rel_votes.get(k, [])
+            shown = ("%.2f over %d frames (%.2f-%.2f)"
+                     % (np.median(vs), len(vs), min(vs), max(vs))) if vs else "none"
+            rep.votes.append(f"    {c.label:<6} brightness vs frame median: {shown}")
+            continue
+        counts = ", ".join(f"{lbl or '-'} x{len(v)}" for lbl, v in
+                           sorted(tally[k].items(), key=lambda kv: -len(kv[1]))) or "none"
+        rep.votes.append(f"    {c.label:<6} seen {seen_n[k]}/{len(geom)}  votes: {counts}")
+    return mapping, rep, idx
+
+
 def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
            layout: PanelLayout, min_conf: float = 0.25, verify: bool = True,
            max_residual: float = 6.0,
-           min_detected_frac: float = 0.7) -> tuple[dict[str, tuple[float, float]], Report]:
+           min_detected_frac: float = 0.5,
+           reads: dict | None = None,
+           observed: set | None = None,
+           rel: dict | None = None) -> tuple[dict[str, tuple[float, float]], Report]:
     """Map each registered label to a pixel, verifying the geometry first.
 
     Returns ``({label: (u, v)}, report)``. On failure the mapping is EMPTY and
@@ -442,6 +660,13 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
     come from the registered layout and a missing row cannot be fitted without the
     residual blowing up.
 
+    ``reads`` and ``observed`` let a caller supply the anchor classifications from
+    somewhere other than this one frame — see `assign_voted`, which votes them over a
+    fixed number of frames. They are always supplied together: ``reads`` says what each
+    cell was read as, ``observed`` says which cells there is evidence about at all, and
+    the shift test needs both (absence of evidence must not acquit a shift). With
+    neither, the classification and the evidence both come from this frame, as before.
+
     Anchors are kept, but only as a check against a SHIFT rather than as a confidence
     test on the classifier. They were an absolute test ("2 of 4 must read correctly"),
     and that refused a correct grid outright once the buttons shrank from 50 to 44 px —
@@ -453,7 +678,20 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
     n_cells = sum(len(r) for r in layout.grid)
     rep = Report(ok=False, detected=len(found))
     rep.found = found
+    rep.frame_mean = float(np.mean(bgr))
 
+    # 0.5, not the 0.7 this carried while the chest camera could see all ten. On the
+    # arm the plunger is bolted to the SAME limb as the lens, so it hides two cells from
+    # every frame at the registered viewing pose (`4` and `2`, measured 0/8) — 0.7 of ten
+    # then demands 7 of the 8 that are ever visible, i.e. 87 %, and one ordinary missed
+    # detection fails the frame. The threshold tightened when the camera moved, and
+    # nobody changed it.
+    #
+    # Lowering it is only safe because the EXTRAPOLATION check below now guards the
+    # thing this count was standing in for. Measured with that check in place, over
+    # random held-out subsets: five detections give a worst inferred-cell error of
+    # 5.56 mm against a 20 mm button (86.66 mm without it). Without the check this
+    # number could not be moved.
     if len(found) < min_detected_frac * n_cells:
         rep.reason = (f"only {len(found)} of {n_cells} buttons detected "
                       f"(need {min_detected_frac:.0%}); the panel is not clearly enough "
@@ -491,8 +729,44 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
                       "different panel")
         return {}, rep
 
-    # Cell -> detection, and the cells that have to be inferred.
+    # An inferred cell must be INTERPOLATED, never extrapolated. Measured 2026-09-17 by
+    # holding cells out of the fit and comparing the inferred position against where the
+    # button was actually detected:
+    #
+    #   kept   median   p90    worst px   worst mm
+    #     7     1.37    2.51     5.72       4.72
+    #     6     1.71    5.57     6.27       5.18
+    #     5     2.06    6.11   105.02      86.66   <- a different button entirely
+    #     4     2.45   66.13   157.22     129.74
+    #
+    # and — the part that matters — **the residual gate does not catch it**: 334 of 360
+    # five-point subsets fitted under the 6 px limit while placing a cell 87 mm away.
+    # With six unknowns (origin, row vector, column vector) a five-point fit is nearly
+    # exactly determined, so a low residual there is arithmetic, not evidence.
+    #
+    # What separates the safe cases from the catastrophic ones is not the COUNT but
+    # whether the missing cells sit inside the span of the ones that were seen. A cell
+    # between detected rows and columns is interpolated and lands within a few mm; one
+    # beyond the last detected row is extrapolated along a lever arm and can land on a
+    # different button. So the test is the extrapolation itself, which is the thing the
+    # count was standing in for.
     at = lat["assigned"]
+    if at:
+        det_rows = {i for i, _ in at}
+        det_cols = {j for _, j in at}
+        r_lo, r_hi, c_lo, c_hi = (min(det_rows), max(det_rows),
+                                  min(det_cols), max(det_cols))
+        outside = [f"{layout.grid[i][j].label}"
+                   for i, row in enumerate(layout.grid) for j, _ in enumerate(row)
+                   if (i, j) not in at and not (r_lo <= i <= r_hi and c_lo <= j <= c_hi)]
+        if outside:
+            rep.reason = (f"{len(outside)} cell(s) would have to be EXTRAPOLATED past "
+                          f"the detections ({', '.join(outside)}): rows "
+                          f"{r_lo}-{r_hi} and columns {c_lo}-{c_hi} were seen, and a "
+                          f"cell outside that span is not pinned by anything. Measured, "
+                          f"such a cell can land 87 mm out while the lattice residual "
+                          f"still passes, so the residual cannot be relied on here")
+            return {}, rep
     mapping: dict[str, tuple[float, float]] = {}
     detected_cell: dict[tuple[int, int], Found] = {}
     for i, row in enumerate(layout.grid):
@@ -505,6 +779,14 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
             else:
                 mapping[cell.label] = lat["cells"][k]
                 rep.inferred.append(cell.label)
+    rep.detected_cell = detected_cell
+    rep.cells_px = lat["cells"]
+
+    # Appearance evidence for every cell, sampled at the lattice positions. Computed
+    # here when the caller did not vote it across frames.
+    if rel is None:
+        bw = float(np.median([max(f.w, f.h) for f in found])) if found else 40.0
+        rel = cell_brightness(bgr, lat["cells"], bw)
 
     # Anchors: does the unshifted alignment explain the classes better than a shift?
     # Only REAL detections may vote — scoring inferred cells would be circular.
@@ -526,6 +808,8 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
         solo: dict[tuple[int, int], tuple[str, float]] = {}
 
         def _read(k: tuple[int, int]) -> tuple[str, float]:
+            if reads is not None:
+                return reads.get(k, ("", 0.0))
             f = detected_cell.get(k)
             if f is None:
                 return ("", 0.0)
@@ -533,17 +817,38 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
                 solo[k] = classify_solo(bgr, f, detector)
             return solo[k]
 
+        def seen(cell: "Cell", k: tuple[int, int]) -> bool:
+            """Is there evidence about this cell, OF THE KIND this anchor needs?
+
+            Not "did it read correctly" — a cell that was looked at and could not be
+            read confidently still counts as evidence, and contributes 0 to every
+            alignment, which makes them tie and therefore refuses. That is the
+            conservative direction and it is deliberate.
+
+            The kind matters. A CLASS anchor needs the detector to have found the cell,
+            because only then can it be classified. An APPEARANCE anchor needs only a
+            patch of image, which is why it can testify on frames where the detector
+            missed the button entirely.
+            """
+            if cell.dark is not None:
+                return k in rel
+            return k in observed if observed is not None else k in detected_cell
+
+        def hit(cell: "Cell", k: tuple[int, int]) -> bool:
+            """Does what is AT k match what this anchor expects to be there?"""
+            if cell.dark is not None:
+                r = rel.get(k)
+                return r is not None and r <= cell.dark
+            got, conf = _read(k)
+            return got == cell.expect and conf >= layout.min_conf
+
         def comparable(shift: int) -> list[tuple[int, int, "Cell"]]:
             """Anchors observed at BOTH alignments — the only fair basis to compare."""
             return [(i, j, c) for i, j, c in anchors
-                    if (i, j) in detected_cell and ((i + shift) % rows, j) in detected_cell]
+                    if seen(c, (i, j)) and seen(c, ((i + shift) % rows, j))]
 
         def score_over(shift: int, over) -> int:
-            hits = 0
-            for i, j, c in over:
-                got, conf = _read(((i + shift) % rows, j))
-                hits += got == c.expect and conf >= layout.min_conf
-            return hits
+            return sum(1 for i, j, c in over if hit(c, ((i + shift) % rows, j)))
 
         def score(shift: int) -> int:
             return score_over(shift, anchors if shift == 0 else comparable(shift))
@@ -551,14 +856,18 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
         base = score(0)
         rep.anchors_ok = base
         for i, j, c in anchors:
-            f = detected_cell.get((i, j))
-            got, conf = solo.get((i, j), ("", 0.0))
-            state = ("inferred cell" if f is None else
-                     ("ok" if (got == c.expect and conf >= layout.min_conf)
-                      else "mismatch"))
-            rep.anchor_detail.append(
-                f"{c.label:<6} expect {c.expect:<6} got {(got or '-'):<8} "
-                f"{conf:.2f}  {state}")
+            state = ("not observed" if not seen(c, (i, j)) else
+                     ("ok" if hit(c, (i, j)) else "mismatch"))
+            if c.dark is not None:
+                r = rel.get((i, j))
+                rep.anchor_detail.append(
+                    f"{c.label:<6} expect dark<{c.dark:.2f} got "
+                    f"{('%.2f' % r) if r is not None else '-':<8} {state}")
+            else:
+                got, conf = _read((i, j))
+                rep.anchor_detail.append(
+                    f"{c.label:<6} expect {c.expect:<6} got {(got or '-'):<8} "
+                    f"{conf:.2f}  {state}")
         worst = None
         for sh in range(1, rows):
             common = comparable(sh)
@@ -573,15 +882,27 @@ def assign(bgr: np.ndarray, roi: tuple[int, int, int, int], detector: Detector,
             if worst is None or o - b > worst[1] - worst[2]:
                 worst = (sh, o, b)
             if b <= o:
-                rep.reason = (f"a shifted alignment explains the anchors at least as well "
+                # Both zero means nothing was read at either alignment: no evidence, not
+                # contrary evidence. Still a refusal - an unverified layout is never
+                # pressed - but it is about THIS attempt reads, so it may be retried
+                # like any other frame-quality failure. Any non-zero score means the
+                # classifier did read something and the shift survived it anyway, which
+                # is the silent-wrong-floor case and must end the run.
+                rep.alignment_doubt = (b > 0 or o > 0)
+                how = ("explains the anchors at least as well"
+                       if rep.alignment_doubt else
+                       "cannot be ruled out - NO anchor was read confidently at either "
+                       "alignment, so there is no evidence to separate them")
+                rep.reason = (f"a shifted alignment {how} "
                               f"(unshifted {b} vs shift {sh} {o}, compared over the "
                               f"{len(common)} anchor(s) observed at both); refusing "
                               "rather than risk pressing the wrong floor")
                 return {}, rep
-        if base == 0 and not any(others):
-            rep.anchor_detail.append(
-                "no anchor read confidently either way — accepted on the lattice fit "
-                f"alone (residual {lat['residual']:.1f} px)")
+        # (A branch here used to claim a frame could be accepted on the lattice alone
+        # when no anchor read either way. It referenced an undefined name and was
+        # unreachable — base == 0 means every shift scored at least as well, so the
+        # loop above has already refused. Removed rather than left as a latent
+        # NameError sitting inside a safety check.)
 
     rep.ok = True
     return mapping, rep

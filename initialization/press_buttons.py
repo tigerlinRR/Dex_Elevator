@@ -37,6 +37,19 @@ if REPO not in sys.path:
 
 import cv2  # noqa: E402
 
+_T0 = time.time()
+
+
+def _tick(what: str) -> None:
+    """Elapsed since process start, for the startup/perception phases.
+
+    The motion half has been instrumented since the speed work; this half had not,
+    and it turned out to be the LARGER of the two (~12 s against 9 s of motion at
+    50 %). An optimisation argument needs both numbers or it optimises the wrong one.
+    """
+    print(f"    [t+{time.time() - _T0:5.2f}s] {what}", flush=True)
+
+
 from core.camera.manager import CameraManager  # noqa: E402
 from core.config import load_pipeline  # noqa: E402
 from core.press import (  # noqa: E402
@@ -45,7 +58,7 @@ from core.press import (  # noqa: E402
 from core.robot.realman import RealmanArm  # noqa: E402
 from core.transforms import make_transform, matrix_to_rpy, rpy_to_matrix  # noqa: E402
 from yolo.button_circles import detect_buttons  # noqa: E402
-from yolo.panel_layout import assign, load_panel, panel_roi, tight_roi  # noqa: E402
+from yolo.panel_layout import assign, assign_voted, load_panel, panel_roi, tight_roi  # noqa: E402
 
 # Fallback layout for --circles (Hough circles cannot read labels, so the mapping
 # has to be supplied). The detector path gets its layout from configs/panels.yaml.
@@ -106,6 +119,15 @@ def main() -> int:
                          "the lens: the home pose was chosen to keep the arm OUT of the "
                          "chest camera's view, which is the opposite of what an arm "
                          "camera needs. Defaults to arm.view_joints_deg in pipeline.yaml")
+    ap.add_argument("--vote-frames", type=int, default=5, metavar="N",
+                    help="decide the anchors by MAJORITY over N frames instead of from "
+                         "one (default 5; 1 restores the single-frame behaviour). The "
+                         "count is fixed before any frame is looked at and every frame "
+                         "votes, so this averages a measurement of a panel that is not "
+                         "moving — it is not a way to retry past a refusal. Measured on "
+                         "this panel: `open` reads correctly 8/8 but `A` only 6/8, and "
+                         "with just two usable anchors one bad read on `A` refuses the "
+                         "whole run")
     ap.add_argument("--no-obstacle-check", action="store_true",
                     help="proceed even when no fixed camera can watch the path. This "
                          "removes the only sensor that sees the arm's workspace — the "
@@ -119,6 +141,26 @@ def main() -> int:
                     help="watch until the panel is visible AND has stopped moving, "
                          "then press the sequence ONCE and exit. Re-running is the "
                          "manual re-trigger; it never re-arms itself.")
+    # Speed is a FRACTION 0..1 mapped to the controller's 1..100 %, then capped by
+    # arm.max_speed_pct. Two knobs on purpose: the free-air joint moves and the
+    # straight-line move that ENDS IN CONTACT with the panel are not the same risk.
+    # Raising the contact one turns speed directly into impact force, so it is left
+    # where it was measured good until there is a reason and a measurement.
+    # 50 %, measured 2026-09-18 against 20 % at the same station minutes apart:
+    # one button 13.2 s -> 9.0 s with depth -9.93 vs -9.92 mm and lateral 0.19 vs
+    # 0.27 mm, i.e. no accuracy cost. Scaling is near-linear once the 0.35 s
+    # per-move settle is taken out (moving part 4.09 -> 1.98 s, a factor 2.07
+    # against the 2.5 commanded; the rest is the acceleration ramp).
+    ap.add_argument("--speed", type=float, default=0.50, metavar="FRAC",
+                    help="free-air joint moves (home<->standoff). 0.50 = 50%%")
+    ap.add_argument("--press-speed", type=float, default=0.15, metavar="FRAC",
+                    help="straight-line move INTO the button. 0.15 = 15%%")
+    # The two straight-line segments are not the same risk and were wrongly sharing a
+    # speed. The inbound one ENDS ON THE BUTTON, where speed becomes impact force. The
+    # retract is 60 mm of free air AWAY from the panel with nothing to hit, and it was
+    # costing 2.0 s at 15 % for no reason. Defaults to the free-air speed.
+    ap.add_argument("--retract-speed", type=float, default=None, metavar="FRAC",
+                    help="straight-line retract; defaults to --speed (it is free air)")
     ap.add_argument("--settle-frames", type=int, default=5,
                     help="consecutive stable frames required by --auto (default 5)")
     ap.add_argument("--settle-mm", type=float, default=2.0,
@@ -180,10 +222,21 @@ def main() -> int:
     if args.home_joints:
         home = [float(v) for v in args.home_joints.split(",")]
         print(f"home overridden to {['%.1f' % v for v in home]}")
+    # `home` is resolved against the CAMERA MOUNT further down, once the handle exists:
+    # for an arm-mounted camera the registered viewing pose is the right home, and the
+    # chest camera's home is both a long unguarded sweep away from it and a poor IK seed.
     LIM = cfg["arm"]["limits"]
 
-    arm = RealmanArm(side=cfg["arm"]["side"])
+    # max_speed_pct MUST come from the config. It did not until 2026-09-18, so this
+    # file alone fell back to the class default of 20 while every other script in the
+    # repo passed it — raising the cap in pipeline.yaml then changed nothing HERE, and
+    # a 20-vs-50 comparison came back 13.79 s against 13.80 s. That null reads exactly
+    # like "speed does not help" and is really "the speed never changed"; the only
+    # thing that gave it away was the cap being printed next to the request.
+    arm = RealmanArm(side=cfg["arm"]["side"],
+                     max_speed_pct=cfg["arm"].get("max_speed_pct", 20))
     arm.connect()
+    _tick("arm connected")
     sdk = arm._require()
 
     # ---- close the hand BEFORE anything moves -----------------------------
@@ -225,6 +278,7 @@ def main() -> int:
                 arm.disconnect()
                 return 1
             print(f"hand: fist confirmed {joints}")
+            _tick("hand closed")
         except Exception as e:  # noqa: BLE001
             print(f"!! could not close the hand ({type(e).__name__}: {e}) — refusing "
                   "to move. Pass --no-fist only if no hand is fitted.")
@@ -232,6 +286,18 @@ def main() -> int:
             return 1
     manager = CameraManager().build()
     handle = manager.get(args.camera)
+    if not args.home_joints and handle.mount == "arm" and cfg["arm"].get("view_joints_deg"):
+        # The default home is the CHEST camera's: a pose chosen so the arm sits outside
+        # that camera's view. From an arm-camera viewing pose it is a >150 deg sweep,
+        # and the only check a movej gets is self-collision, which covers the arm's own
+        # links and not the room — that combination is what took the arm at a wall on
+        # 2026-09-15. The viewing pose is a place the arm is already known to occupy
+        # safely, and it is a far better IK seed for the press: on the same panel the
+        # chest home gave 2/24 and 5/24 approach rolls with 5 mm of clearance, the
+        # viewing pose 24/24 with 56 mm.
+        home = [float(v) for v in cfg["arm"]["view_joints_deg"]]
+        print(f"home = the registered viewing pose {['%.1f' % v for v in home]} "
+              f"(camera rides the arm; --home-joints overrides)")
     cam = handle.camera
 
     # base_T_camera is a CONSTANT only for a torso-mounted camera. With the camera on
@@ -405,6 +471,7 @@ def main() -> int:
         print(f"panel {layout.id!r}: {layout.shape} grid, "
               f"{len(layout.anchors)} anchors, engine {detector.engine_path.name}")
     cam.start()
+    _tick("camera streaming (TensorRT engine + camera open)")
 
     if args.wait_go is not None:
         # Warm the GPU before releasing the barrier, not after. The Orin idles its
@@ -427,6 +494,12 @@ def main() -> int:
             time.sleep(0.1)
         go.unlink()
         print(f"go signal received after {time.time() - _t0:.1f} s of waiting")
+        # Restart the stopwatch: from here on the milestones should measure the
+        # reaction the CALLER still pays after arrival, not how long the child sat
+        # blocked. Without this a pre-warmed run reports "reaction 31 s", which is
+        # true of the process and useless as a budget.
+        global _T0
+        _T0 = time.time()
 
     # Set by locate() when a refusal was about the LAYOUT rather than the frame; read
     # by the retry loop, which must not retry past it.
@@ -471,11 +544,14 @@ def main() -> int:
                 for line in rep.lines():
                     print(f"{tag}{line}")
             if not rep.ok:
-                # Classify the refusal: an alignment doubt is about WHICH BUTTON IS
-                # WHICH and must not be retried away; everything else is about this
-                # frame and may be.
-                r = (rep.reason or "").lower()
-                if "shift" in r or "anchor" in r:
+                # Branch on the STRUCTURED flag, not on the wording of the reason.
+                # A doubt means anchors were READ and a shifted alignment still explained
+                # them at least as well - that is the silent-wrong-floor case and must
+                # end the run. A refusal with nothing read at either alignment is an
+                # evidence-quality failure about this attempt, retryable like a frame
+                # that lost half its buttons. getattr keeps the conservative default if
+                # a report ever arrives without the field.
+                if getattr(rep, "alignment_doubt", True):
                     _last_reason["alignment"] = True
                 return None
             roi = tight_roi(rep.found, bgr.shape[:2])
@@ -489,6 +565,40 @@ def main() -> int:
 
         org, nrm = fit
         pts = {name: ray_plane_intersection(px, frame.intrinsics, base_T_cam,
+                                            org + protrusion * nrm, nrm)
+               for name, px in grid.items()}
+        return pts, (org, nrm)
+
+
+    def locate_voted(tag=""):
+        """Locate the panel with the anchors decided by a vote over several frames.
+
+        The frame count is fixed before any frame is looked at, so this averages a
+        measurement rather than retrying one — the panel is not moving. See
+        `assign_voted`; the distinction matters because the retry loop below
+        deliberately refuses to retry past an alignment doubt.
+        """
+        frames = [cam.capture() for _ in range(args.vote_frames)]
+        # ONE pose read for the whole set: the arm is stationary at the viewing pose,
+        # so the camera pose is the same for every frame. Reading it per frame would
+        # only add the pose feed's own noise to frames that share a pose.
+        base_T_cam = cam_pose()
+        bgrs = [cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR) for f in frames]
+        grid, rep, idx = assign_voted(bgrs, detector, layout)
+        for line in rep.lines():
+            print(f"{tag}{line}")
+        if not rep.ok:
+            if getattr(rep, "alignment_doubt", True):
+                _last_reason["alignment"] = True
+            return None
+        roi = tight_roi(rep.found, bgrs[idx].shape[:2])
+        fit = fit_panel_plane_from_depth(frames[idx], base_T_cam, roi=roi)
+        if fit is None:
+            print(f"{tag}plane fit failed in ROI {roi}")
+            return None
+        print(f"{tag}plane fitted in {roi} (frame {idx + 1} of {len(bgrs)})")
+        org, nrm = fit
+        pts = {name: ray_plane_intersection(px, frames[idx].intrinsics, base_T_cam,
                                             org + protrusion * nrm, nrm)
                for name, px in grid.items()}
         return pts, (org, nrm)
@@ -614,6 +724,10 @@ def main() -> int:
         return None
 
 
+    # None means "not localised from a registered arm pose", which is the correct
+    # reading for the fixed-camera path and for --auto: both of them look from wherever
+    # the arm happens to be, and an offset measured at one arm pose says nothing there.
+    located_from = None
     if args.auto:
         print(f"AUTO: waiting for the panel to be visible and still "
               f"({args.settle_frames} frames within {args.settle_mm} mm), then pressing "
@@ -647,6 +761,10 @@ def main() -> int:
                   "arm happens to be, which is unlikely to see the panel.")
 
         buttons3d = plane = None
+        # The pose the panel is actually localised FROM, read rather than assumed: the
+        # aim offset below is only valid at the pose it was measured at, and "we asked
+        # the arm to go there" is not the same fact as "the arm is there".
+        located_from = list(arm.get_joint_angles())
         # 15 attempts, not 6. Localisation succeeds on roughly a quarter of frames at a
         # re-docked distance (the detector drops a button or two and the lattice needs
         # 70 % of them), and three consecutive runs used attempts 4, 1 and 5 of 6 — one
@@ -661,8 +779,15 @@ def main() -> int:
         # into "refuse only if fifteen frames in a row refuse". An alignment contradicted
         # once in a run stays contradicted: later frames cannot un-see it.
         contradicted = False
-        for attempt in range(15):
-            got = locate(tag=f"  [{attempt + 1}/15] ")
+        # One attempt now costs `--vote-frames` frames, so the budget is divided rather
+        # than multiplied: the point of the retries is to survive a bad FRAME, and a
+        # vote already spends several frames on exactly that. Voting is skipped when
+        # verification is off (there are no anchors to vote on) and when N is 1.
+        voting = args.vote_frames > 1 and not args.no_verify
+        tries = max(1, 15 // args.vote_frames) if voting else 15
+        for attempt in range(tries):
+            tag = f"  [{attempt + 1}/{tries}] "
+            got = locate_voted(tag=tag) if voting else locate(tag=tag)
             if _last_reason.get("alignment"):
                 contradicted = True
             if got is not None:
@@ -678,14 +803,52 @@ def main() -> int:
                   "view, or is this a different panel than the registered layout?")
             return 1
     aim_mm = cfg["elevator"]["press"].get("aim_offset_mm")
+    aim_at = cfg["elevator"]["press"].get("aim_offset_measured_at_joints_deg")
     if args.aim_offset:
-        aim_mm = [float(v) for v in args.aim_offset.split(",")]
+        aim_mm, aim_at = [float(v) for v in args.aim_offset.split(",")], None
+    if aim_mm and any(abs(float(v)) > 1e-9 for v in aim_mm):
+        # An aim offset is only valid where it was measured. Which of the three
+        # branches below applies is decided by the camera MOUNT, not by convenience.
+        if aim_at is not None and handle.mount != "arm":
+            # The fixed-camera path is deliberately untouched by all of this. The offset
+            # was measured on the arm camera at an arm pose; a camera that does not ride
+            # the arm has no such pose and no such error. Skip it and say so — refusing
+            # here would break a path that works (chest camera: 0.9 mm end to end).
+            print(f"aim offset skipped: it was measured on an arm-mounted camera at a "
+                  f"specific arm pose, and {args.camera} is mount={handle.mount}")
+            aim_mm = None
+        elif aim_at is not None and located_from is None:
+            print("!! an aim offset measured at a registered arm pose is configured, but "
+                  "this run localised from wherever the arm happened to be (--auto). The "
+                  "offset does not transfer between arm poses, so it cannot be applied "
+                  "and the press would be ~13 mm off without it. Use the registered "
+                  "viewing pose instead of --auto with an arm-mounted camera.")
+            return 1
+        elif aim_at is not None:
+            # The binding is CHECKED, not documented. Measured 2026-09-16 on this robot:
+            # the same four hand-touched truths give [3.3, -3.1, -2.1] mm from one arm
+            # pose and [6.8, -7.3, -8.6] mm from another. It is a systematic error in the
+            # arm-camera chain, so it projects differently as the arm moves; carrying the
+            # number across poses ADDS an error the size of the one it removes, and
+            # nothing downstream can see that (the press log compares the command against
+            # the same assumed geometry on both sides). So: refuse, do not warn.
+            gap = max(abs(a - b) for a, b in zip(located_from, aim_at))
+            if gap > 1.0:
+                print(f"!! the aim offset was measured at joints "
+                      f"{['%.1f' % v for v in aim_at]} but the panel was localised from "
+                      f"{['%.1f' % v for v in located_from]} — {gap:.1f} deg apart on the "
+                      f"worst joint. This offset does not transfer between arm poses "
+                      f"(measured: 3.7 mm at one pose, 13 mm at another), so applying it "
+                      f"here would be worse than applying nothing. Re-measure it at this "
+                      f"pose, or go to the registered one.")
+                return 1
     if aim_mm and any(abs(float(v)) > 1e-9 for v in aim_mm):
         off = np.array(aim_mm, dtype=float) / 1000.0
         buttons3d = {k: np.asarray(v, dtype=float) + off for k, v in buttons3d.items()}
         src = "--aim-offset" if args.aim_offset else "elevator.press.aim_offset_mm"
+        where = "at the pose it was measured at" if aim_at is not None else "UNVERIFIED pose"
         print(f"aim offset applied: {[round(float(v), 1) for v in aim_mm]} mm in the base "
-              f"frame (from {src}) — this is a recorded bias patch, not a calibration")
+              f"frame (from {src}, {where})")
 
     origin, normal = plane
     inward = -normal
@@ -824,7 +987,12 @@ def main() -> int:
     # lift is NOT returned to it between buttons, so "how far would this move the
     # torso" has to be measured from here, not from L0.
     L_now = L0
-    print(f"sequence {' -> '.join(args.buttons)}   push={push * 1000:.1f} mm")
+    print(f"sequence {' -> '.join(args.buttons)}   push={push * 1000:.1f} mm   "
+          f"speed: free-air {args.speed * 100:.0f}% / contact {args.press_speed * 100:.0f}% "
+          f"/ retract {(args.retract_speed if args.retract_speed is not None else args.speed) * 100:.0f}% "
+          f"(cap {arm.max_speed_pct}%)")
+    _tick("localised + verified — everything before this is REACTION, not motion")
+    phase_times = []
     started = time.time()
     for name in args.buttons:
         print(f">>> {name}")
@@ -839,7 +1007,7 @@ def main() -> int:
         # start from the pose the arm will actually depart from.
         seed = list(arm.get_joint_angles())
         if max(abs(a - b) for a, b in zip(seed, home)) > 3.0:
-            if not arm.move_joints_sync(home):
+            if not arm.move_joints_sync(home, speed=args.speed):
                 print("    cannot return home, aborting")
                 results.append((name, False))
                 break
@@ -905,13 +1073,18 @@ def main() -> int:
             results.append((name, False))
             continue
 
-        if not arm.move_joints_sync(goal):
+        _t = time.time()
+        if not arm.move_joints_sync(goal, speed=args.speed):
             print("    failed to reach standoff")
             results.append((name, False))
             continue
+        t_out = time.time() - _t
         R = arm.get_tcp_pose()[:3, :3]
+        _t = time.time()
         pressed = arm.move_line_sync(make_transform(R, button - normal * push)
-                                     @ make_transform(np.eye(3), -tcp))
+                                     @ make_transform(np.eye(3), -tcp),
+                                     speed=args.press_speed)
+        t_in = time.time() - _t
         tip = (arm.get_tcp_pose() @ np.append(tcp, 1.0))[:3]
         delta = button - tip
         along = float(delta @ inward) * 1000
@@ -920,9 +1093,23 @@ def main() -> int:
             print(f"    holding at contact for {args.hold:.0f} s — photograph the tip now",
                   flush=True)
             time.sleep(args.hold)
+        _t = time.time()
         arm.move_line_sync(make_transform(R, button + normal * STANDOFF)
-                           @ make_transform(np.eye(3), -tcp))
-        went_home = arm.move_joints_sync(home)
+                           @ make_transform(np.eye(3), -tcp),
+                           speed=(args.retract_speed if args.retract_speed is not None
+                                  else args.speed))
+        t_back = time.time() - _t
+        _t = time.time()
+        went_home = arm.move_joints_sync(home, speed=args.speed)
+        t_home = time.time() - _t
+        # Per-phase timing. Recorded because "how fast can the press go" cannot be
+        # answered from the total: `speed` only scales the MOVING part, while the
+        # four 0.35 s settles and the 0.15 s arrival polling are fixed costs that no
+        # speed percentage touches. Measure before raising max_speed_pct.
+        phase_times.append((name, t_out, t_in, t_back, t_home))
+        print(f"    motion: home->standoff {t_out:.2f}s  press {t_in:.2f}s  "
+              f"retract {t_back:.2f}s  ->home {t_home:.2f}s  "
+              f"(total {t_out + t_in + t_back + t_home:.2f}s)")
         if pressed:
             print(f"    pressed {along:+.2f} mm, lateral {lateral:.2f} mm"
                   + ("" if went_home else "  [home NOT confirmed]"))
@@ -939,7 +1126,17 @@ def main() -> int:
     arm.disconnect()
     if args.go:
         ok = sum(1 for _, r in results if r)
-        print(f"=== {ok}/{len(results)} pressed in {time.time() - started:.1f} s ===")
+        total = time.time() - started
+        if phase_times:
+            # Split the sequence into what a speed increase CAN shorten and what it
+            # cannot. Each button pays 4 x `settle` (0.35 s) plus up to 4 x the
+            # 0.15 s arrival-poll granularity, none of which scales with speed.
+            moving = sum(a + b + c + d for _, a, b, c, d in phase_times)
+            fixed = len(phase_times) * 4 * 0.35
+            print(f"--- motion {moving:.1f} s of {total:.1f} s "
+                  f"({len(phase_times)} buttons); of the motion, ~{fixed:.1f} s is "
+                  f"settle+poll overhead that speed does NOT scale ---")
+        print(f"=== {ok}/{len(results)} pressed in {total:.1f} s ===")
         return 0 if ok == len(results) else 1
     print("=== plan only; pass --go to execute ===")
     return 0

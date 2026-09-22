@@ -112,6 +112,7 @@ def main() -> int:
     print(f"holding the chassis still (cancelling control_unit moves) — "
           f"battery floor {args.min_battery:.0f}%", flush=True)
     cancels, allowed, last_state = 0, 0, None
+    warn_key, warn_at, warn_n = None, 0.0, 0
     while time.time() < deadline:
         try:
             r = requests.get(f"http://{HOST}:{API}/chassis/moves/current", timeout=4)
@@ -122,11 +123,28 @@ def main() -> int:
                     pass                                  # never fight our own navigation
                 elif creator == "control_unit":
                     pct = battery_pct()
-                    if pct is not None and pct < args.min_battery:
+                    # AN UNREADABLE BATTERY MUST ALLOW, NOT CANCEL. This read
+                    # `pct is not None and pct < floor`, so every failure of
+                    # `battery_pct()` — a websocket timeout, no /battery_state message
+                    # inside its 6 s window, a missing field — fell through to the
+                    # cancel branch and BLOCKED the robot from going to charge. That is
+                    # exactly the blanket block this module's docstring exists to
+                    # prevent, and it is the shape of failure this project keeps
+                    # meeting: the dangerous answer arriving as an absence of data
+                    # rather than as an error.
+                    #
+                    # The two mistakes are not symmetric. A wrong ALLOW costs a trip to
+                    # the dock, recoverable by repositioning. A wrong CANCEL costs the
+                    # battery: the robot shut down at 4 % on 2026-09-11 (three days
+                    # lost), and was found at 4 %, offline and `moveState: cancelled`
+                    # again on 2026-09-18.
+                    if pct is None or pct < args.min_battery:
+                        why = ("battery UNREADABLE — allowing the move rather than risk "
+                               "blocking a charge" if pct is None else
+                               f"battery {pct:.0f}% < {args.min_battery:.0f}% — "
+                               f"ALLOWING it to charge")
                         if last_state != "allow":
-                            print(f"{time.strftime('%H:%M:%S')}  battery {pct:.0f}% < "
-                                  f"{args.min_battery:.0f}% — ALLOWING it to charge",
-                                  flush=True)
+                            print(f"{time.strftime('%H:%M:%S')}  {why}", flush=True)
                             last_state = "allow"
                         allowed += 1
                     else:
@@ -139,7 +157,20 @@ def main() -> int:
                               f"{'?' if pct is None else f'{pct:.0f}%'}, total {cancels})",
                               flush=True)
         except Exception as e:
-            print(f"{time.strftime('%H:%M:%S')}  warn: {type(e).__name__}: {e}", flush=True)
+            # Throttle a REPEATING fault. With the chassis powered off this loop logs
+            # the same ConnectionError every poll: measured 36,704 identical lines in
+            # one run, which fills /tmp and buries anything worth reading. The first
+            # occurrence still prints immediately — a watchdog that goes quiet about a
+            # new fault is worse than a noisy one — and a continuing one repeats every
+            # 10 minutes with a count, so "how long has this been broken" stays legible.
+            key = type(e).__name__
+            now = time.time()
+            if key != warn_key or now - warn_at >= 600:
+                extra = (f" (same fault, {warn_n} more since)" if key == warn_key else "")
+                print(f"{time.strftime('%H:%M:%S')}  warn: {key}: {e}{extra}", flush=True)
+                warn_key, warn_at, warn_n = key, now, 0
+            else:
+                warn_n += 1
         time.sleep(args.poll)
     print(f"done — cancelled {cancels}, allowed {allowed} while low", flush=True)
     return 0

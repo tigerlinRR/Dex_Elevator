@@ -31,6 +31,27 @@ arm:
   # Both hands are closed into a fist at rest. Close the hand BEFORE moving the arm:
   # an open hand puts the fingers out where they are the first thing to catch on
   # something during a large swing.
+  # VIEWING POSE for the ARM-MOUNTED camera (`mount: arm`). A fixed camera ignores
+  # this entirely. Found by initialization/find_viewing_pose.py on 2026-09-16 and
+  # verified live: anchors 2/2 on the FIRST frame, which is the first time identity
+  # verification has passed on this robot at all.
+  #
+  # Two things make it a registered constant rather than something to search at run
+  # time: the panel does not move, and the dock repeats to 1.5-2.3 cm, which at this
+  # range is ~2 deg of bearing against an 85 deg field of view.
+  #
+  # What it had to solve, and neither is fixable by tuning: the PLUNGER IS BOLTED TO
+  # THE SAME ARM AS THE CAMERA, so it occupies a FIXED region of the image and backing
+  # off does not move it — the panel has to be made small enough to sit clear of it.
+  # And at the previous pose the bottom row (`open`/`close`) fell off the frame edge,
+  # taking one of the two anchors with it, so verification could not pass there no
+  # matter how good the detector was. Scored over a sweep along the optical axis:
+  #     back  0 cm  6 buttons  75.5 px      back 16 cm  6 buttons  52.7 px
+  #     back  8 cm  7 buttons  62.4 px      back 24 cm  7 buttons  44.7 px  <- chosen
+  # 44.7 px lands in the 44-50 px band where the classifier reads labels correctly
+  # (measured: 28 px scores 2-3 of 10). The three buttons it does NOT see are the
+  # right-column ones behind the plunger, which the lattice fills in.
+  view_joints_deg: [47.927, 69.093, -51.903, -138.644, 101.840, 162.746]
   home_joints_deg_left: [-39.76, -100.13, -79.28, 131.63, 117.0, -68.12]
   # BOUNDARIES for choosing a press pose. These say what is NOT allowed; the
   # approach roll itself is still searched, never hard-coded.
@@ -141,7 +162,14 @@ arm:
   side: right              # the button-pressing arm (192.168.11.33 on the Orin unit)
   ip: "192.168.11.33"      # left/right VERIFIED 2026-08-14 (hand-push test)
   port: 8080
-  max_speed_pct: 20        # SAFETY cap during bring-up; raise once motion is validated
+  # SAFETY CAP, not a setpoint: every move computes
+  # v = clip(round(speed * 100), 1, max_speed_pct), so raising this ALONE changes
+  # nothing — the callers' own `speed` has to rise too, or the run silently
+  # reproduces the old timing and reads as "speed makes no difference".
+  # 20 was the bring-up value; motion has since been validated over dozens of
+  # presses, so the ceiling is 50 and the actual speed is chosen per call site
+  # (press_buttons.py --speed / --press-speed).
+  max_speed_pct: 50
 
 # LinkerHand O6 on the right arm's tool connector (core/hand/linkerhand.py).
 # Verified on hardware 2026-08-14. The arm is a GEN-3 controller, so the hand is
@@ -242,23 +270,54 @@ elevator:
   # already overpress by 2.3 mm; the target is
   #     plane_point + (button_protrusion - push_depth) * outward_normal
   press:
-    # AIM BIAS CORRECTION — a patch, not a fix, and it is recorded as one.
-    # Measured 2026-09-15 with the arm-mounted camera: every press landed low on the
-    # button by roughly half a button radius, CONSISTENTLY, while the approach roll
-    # varied (240 / 240 / 255 deg) between them. That distinction is the diagnosis: a
-    # tcp_offset error rotates with the roll, so a bias that stays in the same WORLD
-    # direction across different rolls cannot come from the tip — it comes from where
-    # the buttons are computed to be, i.e. the hand-eye calibration or the button-centre
-    # pixel. +8 mm along base +z brought the presses onto the buttons.
+    # AIM BIAS CORRECTION — MEASURED, and BOUND TO ONE VIEWING POSE. Read that second
+    # part before reusing the number: it is not a property of the panel or the robot,
+    # it is a property of where the arm stands when it looks.
     #
-    # It is a patch because it corrects the symptom at one station rather than the
-    # calibration that causes it, and it will not necessarily hold at a different
-    # viewing pose. The root fix is a hand-eye solve validated against an INDEPENDENT
-    # truth: the 2026-09-14 evaluation could not have caught this, because its
-    # reference was the mean of the same calibration samples — a bias shifts the
-    # reference along with the measurements and hides itself completely.
-    # Set to [0, 0, 0] and re-measure after any re-calibration.
-    aim_offset_mm: [0.0, 0.0, 8.0]
+    # How it was measured (2026-09-16): the operator hand-placed the plunger tip on
+    # four button centres spread over the panel (`A`, `6`, `open`, `2`) while the
+    # controller pose was recorded, giving four truths that do not come from the
+    # camera. Settle drift 0.01-0.04 mm per touch. The four were checked for
+    # self-consistency BEFORE being used as truth — plane residual 0.16-0.32 mm,
+    # normal within 0.3 deg of the camera-fitted one, row pitch 43.1/43.8 mm and
+    # column pitch 54.5 mm both matching the recorded layout.
+    #
+    # THE RESULT THAT MATTERS: the same four truths, measured from two different arm
+    # poses, give completely different biases.
+    #     hand-set pose  [47.9 ...]  ->  [ 3.34 -3.08 -2.10] mm,  3.7-5.8 mm total
+    #     registered pose            ->  [ 6.75 -7.33 -8.59] mm, 12.1-14.4 mm total
+    # So this is NOT a rigid world-frame offset that can be folded into the hand-eye
+    # calibration. It is a systematic error in the arm-camera chain (the rotation part
+    # of `gripper_T_camera`, or the arm's FK) that PROJECTS DIFFERENTLY depending on
+    # where the arm is. A first reading of the hand-set pose alone said "rigid, fold it
+    # into the calibration"; the second pose refuted that, and it would have been a
+    # silent 13 mm error had the offset simply been carried over.
+    #
+    # Within ONE pose it is extremely stable — spread across the whole panel is only
+    # 0.8-1.1 mm — which is exactly the mitigation this project wrote down before the
+    # camera was fitted: look from ONE registered pose, where a systematic FK error is
+    # a constant and can be absorbed. That is why `view_joints_deg` and this number are
+    # a PAIR, and why `press_buttons.py` REFUSES to apply the offset when the arm is
+    # not at the pose it was measured at. Applying it elsewhere is worse than applying
+    # nothing, because the error it adds is as large as the one it removes.
+    #
+    # This also replaces an earlier [0, 0, 8] that was set by eye from press
+    # photographs. Those presses lit, which proves only that a ~7 mm aiming error still
+    # lands inside a 20 mm button — the lamps confirm the button was hit, never that it
+    # was hit centrally.
+    #
+    # NOTE the x term changes the PRESS DEPTH: the camera places the panel ~6.8 mm
+    # further away than it is, so a commanded 6 mm push was delivering ~12.8 mm past the
+    # real button face. With x corrected the delivered stroke becomes the commanded one.
+    # If a button stops lighting, `push_depth` is the lever to raise — do NOT restore an
+    # aiming error to buy stroke back.
+    # Re-measure (touch four spread-out buttons, compare) after ANY re-calibration or
+    # any change to the viewing pose. Set to [0, 0, 0] to disable.
+    aim_offset_mm: [-6.75, 7.33, 8.59]
+    # The arm pose the offset above was measured at. The press compares the joints it
+    # actually localised from against these and refuses the offset if they disagree by
+    # more than a degree — fail closed, because a stale offset is invisible otherwise.
+    aim_offset_measured_at_joints_deg: [47.927, 69.093, -51.903, -138.644, 101.840, 162.746]
 
     # Refuse to move the arm if anything is between the robot and the panel. The
     # chest camera is the ONLY sensor that looks there: the base's own obstacle
@@ -302,5 +361,33 @@ elevator:
     # leaves buttons unlit, more depth is the wrong lever — fit a stiffer spring. Deeper
     # travel past that point only compresses the spring further; the force at the button
     # stops rising with it.
-    push_depth: 0.006
+    # 10 mm, raised from 6 on 2026-09-18 because a press landed on a button and did
+    # NOT light — the operator saw it, which is the only instrument that can.
+    #
+    # This is a consequence of fixing the aim offset, and it was predicted. The camera
+    # placed this panel ~6.8 mm too far away, so a commanded 6 mm was delivering about
+    # **12.8 mm** past the real button face; correcting the offset's x term made the
+    # delivered stroke equal the commanded one. 12.8 mm lit 9 of 9 presses; 6.0 mm is
+    # marginal. So the geometry got better and the actuation got worse, and the fix is
+    # to ask for the travel that was previously arriving by accident.
+    #
+    # NOTE this CONTRADICTS the note that used to sit here, that past ~5 mm the
+    # suspicion should move from stroke to a spring too soft to transmit force. On this
+    # tool that is not yet true: same plunger, same panel, 12.8 mm reliable and 6.0 mm
+    # not, which is stroke behaving like a lever and not like a saturated spring.
+    # ~12.8 mm has also been survived across 9+ presses with no damage.
+    #
+    # 10 rather than 12.8, deliberately: the presses that needed 12.8 were also landing
+    # off centre, and a centred press needs LESS stroke ("2 mm on the chamfer does
+    # nothing, 2 mm on the centre nearly works"). If a button still fails to light, 12.0
+    # is the known-good value to fall back to — and only if THAT fails is the spring the
+    # suspect. Verify by the lamps; the press log cannot see this class of error at all.
+    # 9.0 mm. Walked DOWN from 10.0 on 2026-09-18: at 10 mm every button lit, but
+    # with the free-air speed raised to 50 % the operator judged the press slightly
+    # too hard and asked for 1-2 mm less. 9.0 is the -1: 6.0 mm is KNOWN not to light
+    # reliably, so the usable window is narrow and stepping toward the failing end has
+    # to be done one millimetre at a time, with the lamps as the instrument. Measured
+    # at 9.0: -9.05 mm delivered, button lit. 8.0 has NOT been tested — the attempt
+    # was refused when the detector found 0 buttons.
+    push_depth: 0.009
     up_hint: [0.0, 0.0, 1.0]

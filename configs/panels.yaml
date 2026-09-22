@@ -28,7 +28,7 @@ panels:
       dark disc (the model correctly calls it `empty` — there is nothing to read).
     # Rows top -> bottom, each row left -> right, as seen by the chest camera.
     grid:
-      - [{label: A,     expect: alarm}, {label: dot}]
+      - [{label: A,     expect: alarm}, {label: dot,  dark: 0.45}]
       - [{label: "5"},                  {label: "6"}]
       - [{label: "3"},                  {label: "4"}]
       - [{label: "1"},                  {label: "2"}]
@@ -47,6 +47,27 @@ panels:
       #
       # `1` is this model's fallback guess for any brushed-steel disc whose marking it
       # cannot read, which is why three separate cells come back as `1`.
+      #
+      # `dot` ANCHORS BY APPEARANCE, NOT BY CLASS (2026-09-18). It is the one unlit black
+      # disc among nine bright metal ones, so it can be verified by measuring it instead
+      # of reading it — which matters because the classifier reads it as `1` every time,
+      # and because the etched digits are unreadable here for a physical reason that a
+      # real lobby's ceiling lighting makes worse, not better.
+      # Measured over 12 frames, each cell's mean brightness over the MEDIAN of the cells
+      # in the SAME frame:
+      #
+      #     dot  0.23  (0.20-0.25)      <- the anchor
+      #     1    0.76  (0.70-0.77)      next darkest; only 0.04 of gap, not used
+      #     open 0.87   3 0.98   6 1.00   5 1.03   A 1.08   close 1.18
+      #
+      # `dark: 0.45` sits in the middle of the 0.25-0.70 gap rather than on either edge.
+      # RELATIVE, never absolute: those same cells scattered by +-20 grey levels frame to
+      # frame while the ratios held to 0.01-0.03, so the scatter was entirely the room,
+      # and an absolute threshold would inherit every bit of it — which is how the lights
+      # going off took every class anchor to 0/N.
+      # It also does not need the DETECTOR to find the cell: a black disc is exactly what
+      # a button detector trained on bright ones misses (4 of 12 frames one run, 9 of 12
+      # another), and the lattice already says where the cell is.
       #
       # `dot` and `close` were anchors and are NOT any more. They could never agree —
       # `dot` reads `1` at every exposure swept, `close` is behind the plunger and is
@@ -106,7 +127,7 @@ panels:
     description: >
       Test fixture for the anchor check: mock_cabinet with the rows shifted by one.
     grid:
-      - [{label: "5",   expect: alarm}, {label: "6"}]
+      - [{label: "5",   expect: alarm}, {label: "6",  dark: 0.45}]
       - [{label: "3"},                  {label: "4"}]
       - [{label: "1"},                  {label: "2"}]
       - [{label: open,  expect: open},  {label: close}]
