@@ -2740,26 +2740,26 @@ rsync -az --exclude='.git/' --exclude='__pycache__/' --exclude='*.pyc' --exclude
 sudo sh ~/pyorbbecsdk/install/lib/pyorbbecsdk/shared/install_udev_rules.sh
 sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# RESTORE THE JETSON'S INTERNET (diagnosed 2026-09-28). Both of its connections are
-# pinned to STATIC addresses whose gateways no longer exist — the AP itself is fine, it
-# hands the dev Mac a working 192.168.40.x lease on the same link.
-# 1. let the WiFi take a real DHCP lease instead of the obsolete static address
-#    (192.222.10.133, gateway 192.222.10.1, which does not even answer ARP).
-sudo nmcli con mod "Brother HL-L3275" ipv4.method auto \
-     ipv4.addresses "" ipv4.gateway "" ipv4.dns ""
-sudo nmcli con up "Brother HL-L3275"
-# 2. stop the DEAD wired gateway from being a default route. This keeps BOTH static
-#    addresses (192.168.11.31 for the arms, 192.168.25.46 for the chassis) and removes
-#    only the default route, so nothing on the robot's own wired network changes.
-sudo nmcli con mod "Wired connection 1" ipv4.never-default yes
-sudo nmcli con up "Wired connection 1"
-# 3. Tailscale says "You are logged out", so a restart is not enough once the internet is
-#    back. It prints a login URL that a person has to open. The node belongs to tony.h@.
-sudo tailscale up
-# 4. with DNS working again, fix the clock — it ran 5 days behind, which makes every
-#    robot-side log timestamp wrong and can break TLS.
-sudo timedatectl set-ntp true
+# RESTORING THE JETSON'S INTERNET NEEDS AN ADMINISTRATOR — nobody on this project has
+# root, on either machine. Diagnosed 2026-09-28: both of the robot's connections are
+# ipv4.method: manual and both static gateways are gone (the WiFi's 192.222.10.1 does
+# not answer ARP; the wired 192.168.11.1 was already documented dead). The AP itself is
+# FINE — it hands the dev Mac a working 192.168.40.x lease on the same link.
 #
-# Check after each step over the link-local route, which none of this affects:
-#   ssh dex5-ll 'ip route show default; ping -c2 8.8.8.8; curl -sI https://pypi.org | head -1; date'
+# The commands below are what SOMEONE WITH ROOT should run. Do not attempt them
+# otherwise; `sudo` is refused for us on both the Mac and the Jetson.
+#   sudo nmcli con mod "Brother HL-L3275" ipv4.method auto \
+#        ipv4.addresses "" ipv4.gateway "" ipv4.dns ""
+#   sudo nmcli con up "Brother HL-L3275"
+#   # keeps both static addresses (arms 192.168.11.31, chassis 192.168.25.46),
+#   # removes only the dead default route:
+#   sudo nmcli con mod "Wired connection 1" ipv4.never-default yes
+#   sudo nmcli con up "Wired connection 1"
+#   sudo tailscale up            # it reports "You are logged out"; prints a login URL
+#   sudo timedatectl set-ntp true  # the clock ran 5 days behind with no NTP
+#
+# UNTIL THEN, what works with no root at all:
+#   ssh dex5-ll                          # IPv6 link-local, in-lab only
+#   ssh -f -N -R 1080 dex5-ll            # gives the robot internet via the Mac (verified)
+#   ssh dex5-ll 'curl -x socks5h://127.0.0.1:1080 https://pypi.org'
 ```

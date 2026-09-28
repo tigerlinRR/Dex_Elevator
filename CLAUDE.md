@@ -83,10 +83,32 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
     reachable at all. Test with an actual connection, not a route lookup — and for Tailscale
     check the peer's actual endpoint (`tailscale ping`), since it will happily use the LAN
     path when the cable IS plugged in and then look cable-independent when it is not.
-- **`sudo` requires a password**, so any root step has to be handed to the user.
-  On the DEV MAC there is no sudo at all — `tiger.l is not in the sudoers file` — so a
-  fix that needs `ifconfig`/`route` on the Mac is not available, and reaching for one
-  wastes the operator's time.
+- **THERE IS NO ROOT ANYWHERE — not on the Mac, not on the robot.** `tiger.l is not in
+  the sudoers file` on the dev Mac, and the operator has no sudo on the Jetson either.
+  An earlier line here said root steps could be "handed to the user"; that is WRONG and
+  cost a round of proposing `nmcli`/`tailscale up`/`timedatectl` fixes that can never be
+  run. Anything needing `sudo`, `ifconfig`, `route`, or macOS Remote Login (which is OFF
+  and needs an admin to enable) is **not an option** — design around it or escalate to
+  whoever does have admin.
+- **GIVE THE ROBOT INTERNET WITHOUT ROOT, with a reverse SOCKS tunnel from the Mac**
+  (verified 2026-09-28: `pypi.org` and `github.com` both returned **HTTP 200** from the
+  robot, which has no working gateway of its own):
+
+  ```bash
+  ssh -f -N -R 1080 dex5-ll                      # on the Mac; remote dynamic forward
+  ssh dex5-ll 'curl -x socks5h://127.0.0.1:1080 https://pypi.org'
+  pkill -f "ssh -f -N -R 1080"                   # when done
+  ```
+
+  Use `socks5h` (not `socks5`) so DNS is resolved at the Mac end — the robot has no
+  working resolver. This restores `pip install` and any proxy-aware tool. It does NOT
+  restore Tailscale: `tailscaled` needs root to reconfigure, and a user-level userspace
+  instance was tried and abandoned (it starts, but its control-plane connection through
+  the SOCKS proxy fails, and it would in any case only be up while the Mac's tunnel is).
+- **The Mac cannot be used as a jump host**: macOS Remote Login is OFF (`localhost:22`
+  refused) and enabling it needs an administrator. So there is currently NO route to the
+  robot from outside the lab; `ssh dex5-ll` from the in-lab Mac is the whole story until
+  someone with admin fixes the robot's network.
 - **WHEN TAILSCALE IS DOWN, REACH THE ROBOT BY IPv6 LINK-LOCAL** (2026-09-28). This
   needs no internet, no DNS, no sudo, no matching IP subnet and no Ethernet cable — only
   that the Mac and the Jetson sit on the same Wi-Fi AP:
