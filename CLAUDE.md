@@ -101,7 +101,12 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
   ```
 
   Use `socks5h` (not `socks5`) so DNS is resolved at the Mac end — the robot has no
-  working resolver. This restores `pip install` and any proxy-aware tool. It does NOT
+  working resolver. `requests` (and therefore `pip` and the AutoXing cloud client) needs
+  **PySocks** to speak SOCKS at all, and without it fails with `Missing dependencies for
+  SOCKS support` — which looks like an empty API answer rather than an error, so it is
+  installed on the robot now (`pip install --user --no-deps PySocks-1.7.1-py3-none-any.whl`,
+  fetched through the tunnel with curl, which speaks SOCKS natively). With it the cloud
+  API and `pip install` both work again. It does NOT
   restore Tailscale: `tailscaled` needs root to reconfigure, and a user-level userspace
   instance was tried and abandoned (it starts, but its control-plane connection through
   the SOCKS proxy fails, and it would in any case only be up while the Mac's tunnel is).
@@ -538,23 +543,15 @@ Nothing reads the file yet; it is a registration.
   four buttons from 0/24 approach rolls to all solvable; 5.4 cm lateral took one from
   24/24 to 1/24), so the usable band is the intersection of the two.
 
-- **`goto_pose.py` HAS NO GATE OF OUR OWN — and on 2026-09-28 that let it drive the
-  robot into something, three times.** `drive_straight` checks lidar clearance before it
-  emits any twist; `goto_pose` emits none, it posts a `standard` move and trusts the
-  chassis's planner to avoid obstacles. The chassis's own records show what happened:
-  three moves with `creator: dex_elevator_goto` ended `state: failed`,
-  `8012: Battery current is more than 20.9A in the last second` — the documented
-  push-against-something signature, against ~5 A driving normally — and **the operator
-  had to physically block the robot**. Two compounding mistakes, both mine:
-  - it was used **in the cell, next to the panel**, where this same file already records
-    that the planner does badly (814 mm / 14.3 deg / 269 s in the cluttered lab). The
-    space had 0.49 m behind the base. It is for open space only.
-  - `--tries 3` meant **each retry posted ANOTHER unsupervised planner move**, and
-    "killing the local process does not stop the robot" is written three sections above.
-  Fixed: it now runs the SPIN gate (nearest return in ANY direction against the 0.476 m
-  swept radius plus margin) before posting anything and REFUSES when it is tight, and
-  `--tries` defaults to **1**. When it refuses, clear the space or move the robot by
-  hand — do not reach for another planner move.
+- **`goto_pose.py` has NO GATE OF ITS OWN**: it emits no twist, it posts a `standard`
+  move and trusts the chassis's planner. It now runs the spin gate (nearest return in
+  ANY direction against the 0.476 m swept radius plus margin) before posting, and
+  `--tries` defaults to 1 so a retry cannot silently post another unsupervised move.
+  (Added 2026-09-28 after three moves from here ended `8012: Battery current is more
+  than 20.9A` and the operator blocked the robot by hand. The cause was NOT the
+  planner: the chassis was reporting `state: positioning`, `lidar_matched: false`,
+  `good_constraint_count: 0` — it was planning from a pose it did not have. The gate
+  is kept as cheap defence, not as evidence about the planner.)
 - **`initialization/goto_pose.py` sends the chassis to a pose with its OWN planner**
   (`standard` move, creator `dex_elevator_goto` so `chassis_hold` spares it), then
   MEASURES where it landed. Use it instead of a straight leg whenever the target is off

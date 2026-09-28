@@ -853,6 +853,58 @@ def main() -> int:
     origin, normal = plane
     inward = -normal
 
+    # WHERE THE PANEL PHYSICALLY IS, in the arm base frame. Printed on every run
+    # because it is the only panel number that does NOT pass through the SLAM map,
+    # and on 2026-09-28 a whole afternoon went into arguing about a lateral offset
+    # derived from a map record instead of from this. `configs/stations.yaml`
+    # records the same quantity at registration time, so the two can be differenced
+    # directly: that difference IS the physical correction, in millimetres, with no
+    # localisation in the loop.
+    # PITCH IS THE CHECK THE ANCHORS CANNOT MAKE. A lattice fitted onto too few rows
+    # can come back with half the true pitch at an excellent residual — the residual
+    # only says the points lie ON the lattice, not that the lattice has the right
+    # spacing. This panel's pitches are physical constants (row 43.4 mm, column
+    # 55.1 mm measured 2026-08), so printing them turns a silent wrong-grid into an
+    # obvious one.
+    try:
+        _lay = {c.label: (r_i, c_i) for r_i, _row in enumerate(layout.grid)
+                for c_i, c in enumerate(_row)}
+        _rp, _cp = [], []
+        for _a, _pa in buttons3d.items():
+            for _b, _pb in buttons3d.items():
+                if _a not in _lay or _b not in _lay:
+                    continue
+                (ra, ca), (rb, cb) = _lay[_a], _lay[_b]
+                _d = float(np.linalg.norm(np.asarray(_pa) - np.asarray(_pb))) * 1000
+                if ca == cb and rb - ra == 1:
+                    _rp.append(_d)
+                if ra == rb and cb - ca == 1:
+                    _cp.append(_d)
+        if _rp or _cp:
+            print(f"panel PITCH measured: row {np.mean(_rp) if _rp else float('nan'):.1f} mm "
+                  f"(expect ~43.4), column {np.mean(_cp) if _cp else float('nan'):.1f} mm "
+                  f"(expect ~55.1)")
+    except Exception as _e:
+        print(f"  (pitch check unavailable: {type(_e).__name__}: {_e})")
+
+    _c = np.mean(np.stack(list(buttons3d.values())), axis=0)
+    _z = [float(v[2]) for v in buttons3d.values()]
+    print(f"panel MEASURED in the arm base frame: centre "
+          f"[{_c[0] * 1000:.1f}, {_c[1] * 1000:.1f}, {_c[2] * 1000:.1f}] mm, "
+          f"button z {min(_z) * 1000:.1f}..{max(_z) * 1000:.1f} mm, "
+          f"normal [{normal[0]:.4f}, {normal[1]:.4f}, {normal[2]:.4f}]")
+    try:
+        import yaml as _y
+        _st = _y.safe_load(open(REPO + "/configs/stations.yaml"))["stations"][0]
+        _r = _st.get("panel_centre_base_mm")
+        if _r:
+            _d = [_c[i] * 1000 - float(_r[i]) for i in range(3)]
+            print(f"  vs REGISTERED {[round(float(v), 1) for v in _r]} mm  ->  "
+                  f"panel has moved [{_d[0]:+.1f}, {_d[1]:+.1f}, {_d[2]:+.1f}] mm "
+                  f"in the arm base frame")
+    except Exception as _e:
+        print(f"  (no registered panel to compare with: {type(_e).__name__})")
+
     # roll basis about the approach axis
     e1 = np.cross(inward, np.array([0.0, 0.0, 1.0]))
     e1 /= np.linalg.norm(e1)

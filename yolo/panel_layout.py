@@ -343,10 +343,21 @@ class Report:
     def lines(self) -> list[str]:
         out = [f"detected {self.detected} buttons"]
         if self.detected == 0 and self.frame_mean:
-            out[0] += (f"  [frame mean {self.frame_mean:.0f}/255 — "
-                       + ("LOW: suspect the room light, not the classifier"
-                          if self.frame_mean < 80 else
-                          "brightness is normal, so this is not the light")
+            # TWO-SIDED. The first version only tested the LOW side and told the
+            # operator "brightness is normal, so this is not the light" at a mean of
+            # 155 — but this faceplate ALSO fails when it is blown out (measured: at
+            # 223 the Hough stand-in fell to 1/20). A one-sided test on a two-sided
+            # failure is worse than none: it actively points away from the cause.
+            # Band from measurements: 36 dark = fail, 48 marginal, 162-199 good,
+            # 223 blown = fail.
+            _m = self.frame_mean
+            out[0] += (f"  [frame mean {_m:.0f}/255 — "
+                       + ("LOW: suspect the room light, not the classifier" if _m < 80
+                          else "HIGH: the faceplate may be blown out — this panel also "
+                               "fails bright, not only dark" if _m > 200
+                          else "inside the 80-200 band that has worked, so brightness "
+                               "alone does not explain it; check the LIGHT DIRECTION "
+                               "and whether anything is in front of the panel")
                        + "]")
         if self.residual:
             out[0] += f", lattice residual {self.residual:.1f} px"

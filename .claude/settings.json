@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "allow": [
+      "Bash(./initialization/drive_remote.sh:*)",
+      "Bash(bash initialization/drive_remote.sh:*)"
+    ]
+  }
+}
