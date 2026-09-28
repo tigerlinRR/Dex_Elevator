@@ -538,6 +538,23 @@ Nothing reads the file yet; it is a registration.
   four buttons from 0/24 approach rolls to all solvable; 5.4 cm lateral took one from
   24/24 to 1/24), so the usable band is the intersection of the two.
 
+- **`goto_pose.py` HAS NO GATE OF OUR OWN — and on 2026-09-28 that let it drive the
+  robot into something, three times.** `drive_straight` checks lidar clearance before it
+  emits any twist; `goto_pose` emits none, it posts a `standard` move and trusts the
+  chassis's planner to avoid obstacles. The chassis's own records show what happened:
+  three moves with `creator: dex_elevator_goto` ended `state: failed`,
+  `8012: Battery current is more than 20.9A in the last second` — the documented
+  push-against-something signature, against ~5 A driving normally — and **the operator
+  had to physically block the robot**. Two compounding mistakes, both mine:
+  - it was used **in the cell, next to the panel**, where this same file already records
+    that the planner does badly (814 mm / 14.3 deg / 269 s in the cluttered lab). The
+    space had 0.49 m behind the base. It is for open space only.
+  - `--tries 3` meant **each retry posted ANOTHER unsupervised planner move**, and
+    "killing the local process does not stop the robot" is written three sections above.
+  Fixed: it now runs the SPIN gate (nearest return in ANY direction against the 0.476 m
+  swept radius plus margin) before posting anything and REFUSES when it is tight, and
+  `--tries` defaults to **1**. When it refuses, clear the space or move the robot by
+  hand — do not reach for another planner move.
 - **`initialization/goto_pose.py` sends the chassis to a pose with its OWN planner**
   (`standard` move, creator `dex_elevator_goto` so `chassis_hold` spares it), then
   MEASURES where it landed. Use it instead of a straight leg whenever the target is off

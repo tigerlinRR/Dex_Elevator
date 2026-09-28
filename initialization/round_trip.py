@@ -141,6 +141,37 @@ class Prewarm:
                 pass
 
 
+_STAGE: list[list] = []
+_T_STAGE = [0.0]
+
+
+def stage(name: str) -> None:
+    """Close the previous stage and open `name`; `stage("")` closes the last one.
+
+    The whole-cycle budget was never measured — only the press was — so every plan to
+    "make it faster" has been working from estimates. The press taught the lesson: the
+    half assumed to be small (startup, 9.6 s) turned out LARGER than the half being
+    optimised (motion, 8.5 s), and the 7.4 s that came out came from the unmeasured
+    half. Print the stages before touching any of them.
+    """
+    now = time.time()
+    if _T_STAGE[0] and _STAGE:
+        _STAGE[-1][1] = now - _T_STAGE[0]
+    if name:
+        _STAGE.append([name, 0.0])
+    _T_STAGE[0] = now
+
+
+def stage_report() -> None:
+    if not _STAGE:
+        return
+    total = sum(d for _, d in _STAGE)
+    print("\n" + "=" * 64 + f"\nTIME BUDGET  (total {total:.1f} s)\n" + "=" * 64)
+    for n, d in _STAGE:
+        bar = "#" * max(1, int(round(d / max(total, 1e-9) * 40)))
+        print(f"  {n:<32} {d:6.1f} s  {d / total * 100:4.1f}%  {bar}")
+
+
 def busy() -> str | None:
     """Another of our tools already driving or moving the arm? Name it, do not guess.
 
@@ -292,6 +323,7 @@ def main() -> int:
         print(f"\n{'=' * 64}\nCYCLE {n} of {args.cycles}\n{'=' * 64}")
         rec = {"cycle": n}
 
+        stage("retract check + retract")
         q = arm_joints()
         print(f"[1] arm is {worst(q, travel):.3f} deg from the travel pose")
         if worst(q, travel) > 1.0:
@@ -303,6 +335,7 @@ def main() -> int:
                        "--go", "--speed", str(args.arm_speed)])[0] != 0:
                     print("!! retract failed"); return 1
 
+        stage("settle + measure pose")
         pose, ok = settled_pose()
         if pose is None:
             print("!! no chassis pose"); return 1
@@ -330,6 +363,7 @@ def main() -> int:
             warm = Prewarm(args.floors.split(), runs[0][0],
                            args.press_contact_speed, runs[0][1])
 
+        stage("DRIVE IN")
         print(f"[3] driving in {fwd:+.3f} m")
         if sh([PY, "initialization/drive_straight.py", "move", "--speed", str(args.speed),
                "--tol", "0.03", "--corrections", "2", "--", f"{fwd:.3f}"])[0] != 0:
@@ -362,6 +396,7 @@ def main() -> int:
                 warm.kill()
                 warm = None
 
+        stage("ARM EXTEND")
         print("[5] extending the arm to the viewing pose")
         if sh([PY, "initialization/move_arm_staged.py", f"--to={vs}",
                "--go", "--speed", str(args.arm_speed)])[0] != 0:
@@ -374,6 +409,7 @@ def main() -> int:
               f"-> aim offset {'APPLIES' if d <= 1.0 else 'WILL BE REFUSED'}")
         rec["view_err_deg"] = d
 
+        stage("PRESS (localise+verify+motion)")
         rec["pressed"], rec["press_ok"] = 0, False
         for i, (sp, pu) in enumerate(runs, 1):
             print(f"[6.{i}] pressing {args.floors} at free-air {sp * 100:.0f}% / "
@@ -400,6 +436,7 @@ def main() -> int:
             rec["pressed"] += len(pressed)
             rec["press_ok"] = rec["press_ok"] or ("pressed in" in out)
 
+        stage("ARM RETRACT")
         print("[7] retracting")
         if sh([PY, "initialization/move_arm_staged.py", f"--to={ts}",
                "--go", "--speed", str(args.arm_speed)])[0] != 0:
@@ -407,6 +444,7 @@ def main() -> int:
 
         pose, ok = settled_pose()
         back, blat, bdori = in_robot_frame(st["approach_pose"], pose)
+        stage("DRIVE BACK")
         print(f"[8] driving back {back:+.3f} m to the approach pose")
         if sh([PY, "initialization/drive_straight.py", "move", "--speed", str(args.speed),
                "--tol", "0.03", "--corrections", "2", "--", f"{back:.3f}"])[0] != 0:
@@ -418,6 +456,8 @@ def main() -> int:
         rec["back_mm"], rec["back_heading_deg"] = math.hypot(f3, l3) * 1000, d3
         results.append(rec)
 
+    stage("")
+    stage_report()
     print(f"\n{'=' * 64}\nSUMMARY\n{'=' * 64}")
     print("  cyc | lat in | landed (along/lat) | view err | pressed | back | heading")
     for r in results:

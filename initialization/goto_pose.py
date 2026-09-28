@@ -63,6 +63,38 @@ def _drive_to(tgt: dict, args) -> tuple[float, float, float, float, float] | Non
     "it landed badly" (retryable) apart from "it did not run" (not).
     """
     from initialization.round_trip import settled_pose
+    # LIDAR GATE BEFORE POSTING. `drive_straight` checks clearance before it sends any
+    # twist; this file used to send nothing of its own and simply trusted the chassis's
+    # planner to avoid things. On 2026-09-28 it did not: three moves posted from here
+    # ended with the chassis's own overcurrent protection firing
+    # ("8012: Battery current is more than 20.9A in the last second", against ~5 A
+    # driving normally), i.e. the robot was pushing against something, and the operator
+    # had to physically block it. A `standard` move can rotate in place and take any
+    # path it likes, so the gate is the SPIN gate — nearest return in ANY direction —
+    # not the corridor test that only covers a straight leg.
+    from initialization.drive_straight import Chassis as _Ch, TURN_RADIUS_M, TURN_MARGIN_M
+
+    _g = _Ch()
+    _g.open_stream()
+    try:
+        _g.pump(1.5)
+        near = _g.nearest()
+        need = TURN_RADIUS_M + TURN_MARGIN_M
+        print(f"    lidar: nearest return {near:.2f} m in any direction; "
+              f"a planner move needs {need:.2f} m (swept radius + margin)")
+        if near < need:
+            print(f"!! REFUSING to post a move: {near:.2f} m of clearance is less than "
+                  f"{need:.2f} m. The chassis planner is free to rotate and to pick its "
+                  f"own path, and nothing here can gate it once it starts — killing this "
+                  f"process does NOT stop the robot. Clear the space, or move it by hand.")
+            return None
+    finally:
+        try:
+            if _g._ws is not None:
+                _g._ws.close()
+        except Exception:
+            pass
+
     body = {"creator": CREATOR, "type": "standard",
             "target_x": float(tgt["x"]), "target_y": float(tgt["y"]),
             "target_ori": float(tgt["ori"])}
@@ -145,7 +177,11 @@ def main() -> int:
     ap.add_argument("--ori", type=float)
     ap.add_argument("--tol-mm", type=float, default=25.0, metavar="MM",
                     help="retry until the robot lands within this of the target")
-    ap.add_argument("--tries", type=int, default=3)
+    # DEFAULT 1. Each retry is a NEW unsupervised planner move, and on 2026-09-28 a
+    # three-try loop posted three of them while the robot was pushing against an
+    # obstacle. More than one attempt has to be asked for deliberately, with eyes on it.
+    ap.add_argument("--tries", type=int, default=1,
+                    help="each extra try posts ANOTHER unsupervised planner move")
     ap.add_argument("--stall", type=float, default=45.0, metavar="S",
                     help="cancel only after this long with NO MOTION (default 45). A "
                          "budget measured from dispatch conflates 'slower than usual' "
