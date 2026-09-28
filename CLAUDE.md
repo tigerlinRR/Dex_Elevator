@@ -51,11 +51,25 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
   LinkerHand gripper endurance). Touch only `~/Dex_Elevator`, `~/pyorbbecsdk`, `~/.local`.
 - **The Jetson HAS internet, and is reachable without the cable — both were wrong in earlier
   notes.** Re-verified 2026-08-21:
-  - Its WiFi is associated with `Brother HL-L3275` (`192.222.10.133/24`) — an access point
-    named after a printer, which nonetheless **routes to the internet** (`curl https://pypi.org`
-    returns 200, and it is the default route at metric 600, beating the dead wired gateway
-    `192.168.11.1` at 20100). So **`pip install` works directly on the robot**; the old
-    "download on the dev Mac and rsync it over" workaround is obsolete.
+  - Its WiFi is associated with `Brother HL-L3275` — an access point named after a printer.
+    It USED to route to the internet (default route at metric 600, beating the dead wired
+    gateway `192.168.11.1` at 20100), so `pip install` worked directly on the robot.
+    **That stopped being true, and 2026-09-28 found out why: BOTH connections are
+    `ipv4.method: manual`, and BOTH static gateways are now dead.**
+
+    | connection | method | address | gateway | state |
+    |---|---|---|---|---|
+    | `Brother HL-L3275` | manual | `192.222.10.133/24` | `192.222.10.1` | **ARP FAILED — no such device on the link** |
+    | `Wired connection 1` | manual | `192.168.11.31`, `192.168.25.46` | `192.168.11.1` | dead, still injecting a default route at metric 20100 |
+
+    **The AP is FINE** — it hands the dev Mac `192.168.40.117/24` with a working gateway
+    `192.168.40.1` on that same link. The robot is pinned to an obsolete subnet whose router
+    is gone, so it has **no internet, no DNS and no NTP** (hence a 5-day clock skew), and
+    Tailscale reports `failed to resolve controlplane.tailscale.com` and `You are logged out`.
+    **Do not diagnose this as "the printer AP is down"** — forcing traffic out the WiFi
+    (`ping -I wlP1p1s0 192.222.10.1`) fails too, which is what separates "wrong route metric"
+    from "the gateway does not exist". Repair steps are in PROGRESS's sudo section;
+    `ssh dex5-ll` is unaffected and is the safety net while they are applied.
   - **Tailscale is up and has been all along** (`100.122.187.11`, node `ubuntu`, key valid to
     2026-12-27). The "offline, last seen 199d" lines in `tailscale status` belong to OTHER
     people's nodes — misreading them is what produced the "Tailscale is offline" claim.
