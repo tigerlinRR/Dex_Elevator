@@ -3,6 +3,55 @@
 Build status of Dex_Elevator. Read with `CLAUDE.md` (which explains how the code
 works) to pick up where we are. Engineering status only — keep it current; not a work log.
 
+## ▶ WHERE WE ARE, AND WHAT TO DO FIRST (updated 2026-09-22)
+
+Read this block, then the dated sections below for the reasoning behind any number.
+
+**Working, measured, reproduced:** the arm-camera round trip runs as one command
+(`initialization/round_trip.py`) — drive in from the registered `approach_pose`, extend,
+verify the panel's identity, press, retract, drive back. A one-button press is **10.9 s
+from arrival to done** (was 22.8 s), depth within 0.1 mm of command and lateral 0.09-0.14 mm.
+
+**FIRST THING IN A NEW SESSION — check the robot before planning anything.** It has run
+itself flat twice (2026-09-11, 2026-09-15), both times parked away from the dock, and
+each cost days. Read-only:
+
+```bash
+ssh dex5-ts 'cd Dex_Elevator && python3 -c "
+import sys; sys.path.insert(0,\".\")
+from initialization.chassis_hold import battery_pct
+from initialization.round_trip import settled_pose, station, in_robot_frame
+print(\"battery\", battery_pct()); p,ok = settled_pose(); print(\"pose\", p, ok)
+print(in_robot_frame(station()[\"approach_pose\"], p))"'
+python3 initialization/drive_straight.py state     # control_mode must be `auto`, e-stop clear
+```
+
+**Two things are committed but NOT yet run on hardware**, and the next cycle is their
+first test:
+1. **`round_trip.py --arm-speed` 0.20 → 0.50** — the staged extend/retract legs. Worth
+   ~6 s. Raised on the operator's explicit call; the reason it was held back has not
+   stopped being true (a ~264 deg sweep ACROSS THE ROOM, and `move_arm_staged` has no
+   model of the room), so watch the first one.
+2. Nothing else. Everything below this line has been run.
+
+**Agreed and waiting:** re-run `initialization/calibrate_legs.py` so the chassis speed can
+go 0.18 → ~0.30 m/s. That is the single biggest remaining block of a cycle (~27 s of
+driving), worth 12-14 s, and it needs its own session because the per-direction leg model
+(`LEG_K_FWD/BACK`) was fitted at one speed and the lidar clearance margin must grow with
+the braking distance. The operator deferred it on 2026-09-21.
+
+**Before any cycle, expect to reposition.** The heading on the straight legs is fully open
+loop and drifts ~4 deg per cycle, so the robot usually does not start on the approach
+pose's line. Predict the landing first (lateral at the station + `tan(heading) * distance`
+against the 60 mm gate); if it will not pass, use the dead-zone recipe — one `standard`
+move 0.6 m out along the line, then one back — which lands 12-19 mm repeatably. Do NOT try
+to nudge in place or steer it with a small turn; both were measured and both make it worse.
+
+**Known to be unconfirmable here:** whether a button lit. This faceplate is not wired to a
+controller, the plunger occludes the button during the press, and a low-exposure capture
+after retracting shows nothing. **The operator's eye is the only instrument** — ask, and
+report a press as unconfirmed until they answer.
+
 ## ▶ TWO RUNS LOST TO "0 BUTTONS", AND THE LOG COULD NOT SAY WHY (2026-09-18)
 
 Two attempts on the same evening died with the detector finding **0 buttons on all 15
