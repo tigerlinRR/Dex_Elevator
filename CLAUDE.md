@@ -70,6 +70,46 @@ not reuse its calibration artifacts. Hardware, verified on the device — do NOT
     check the peer's actual endpoint (`tailscale ping`), since it will happily use the LAN
     path when the cable IS plugged in and then look cable-independent when it is not.
 - **`sudo` requires a password**, so any root step has to be handed to the user.
+  On the DEV MAC there is no sudo at all — `tiger.l is not in the sudoers file` — so a
+  fix that needs `ifconfig`/`route` on the Mac is not available, and reaching for one
+  wastes the operator's time.
+- **WHEN TAILSCALE IS DOWN, REACH THE ROBOT BY IPv6 LINK-LOCAL** (2026-09-28). This
+  needs no internet, no DNS, no sudo, no matching IP subnet and no Ethernet cable — only
+  that the Mac and the Jetson sit on the same Wi-Fi AP:
+
+  ```bash
+  dns-sd -G v6 ubuntu.local          # -> FE80::B45C:6023:EBB4:F2B8%en1  (live mDNS)
+  ssh dex5-ll                        # alias added to the Mac's ~/.ssh/config
+  ```
+
+  The alias exists because **rsync cannot parse an IPv6 link-local destination** (the
+  `%en1` scope and the colons defeat its host:path split), and because ssh_config
+  percent-expands `%e` — the scope has to be written **`%%en1`** in `HostName` or ssh
+  dies with `unknown key %e`. With the alias both `ssh dex5-ll` and
+  `rsync ... dex5-ll:Dex_Elevator/` work normally.
+
+  **Why the obvious route fails, and why it is NOT evidence the robot is down.** The
+  Brother AP hands the Mac `192.168.40.x/24` while the Jetson's Wi-Fi holds
+  `192.222.10.133/24`. Same layer-2 link, different layer-3 subnets — so the Mac sends
+  anything for `192.222.10.133` to its default gateway, which has never heard of that
+  subnet, and the ping dies there. On 2026-09-28 that was misread as "the robot may have
+  run itself flat again" and cost the operator a reboot and a round of Wi-Fi fiddling.
+  The robot was up the whole time. **A failed ping across mismatched subnets says
+  nothing about the host; an mDNS reply says the host is alive**, because the reply is
+  link-local multicast and arrives without any routing at all.
+- **NO INTERNET ON THE AP MEANS NO TAILSCALE *AND* NO CLOCK.** Measured 2026-09-28:
+  `curl https://pypi.org` returned HTTP **000** and tailscale reported *"failed to
+  resolve controlplane.tailscale.com: no DNS fallback candidates remain"* plus
+  **"You are logged out"** — so the node showed `offline, last seen 5d ago` from the
+  outside while the robot was healthy inside. Restoring remote access therefore needs
+  the AP's internet back, and possibly a `tailscale up` (root, on the robot).
+  **The second consequence is the one that misleads you**: with no internet there is no
+  NTP, so the Jetson's clock stays where it was — it read **2026-09-23 while the real
+  date was 2026-09-28**. Every timestamp on the robot is then wrong by that amount, and
+  a log line dated five days ago can be from a minute ago. That is exactly how
+  `/tmp/park_hand.log` dated "Sep 23 09:31" was read as "the boot job did not run this
+  time" when it had in fact just run. **Check `date` on the robot before drawing any
+  conclusion from a robot-side timestamp.**
 - **The arm and the chest camera face 180 degrees away from the base's front.** The
   base drives with its own front (green light, obstacle sensors, face camera) pointing
   directly AWAY from the panel the arm reaches for. Two consequences that are easy to
